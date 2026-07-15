@@ -26,3 +26,9 @@ SERVO_MAX_US = 2000
 # ---- Safety ----
 DEADMAN_RESEND_S = 0.3              # re-send drive command at least this often
 TELEMETRY_STALE_S = 0.5             # telemetry older than this = link unhealthy
+
+# ---- Pi dashboard (pi/webapp) ----
+DASHBOARD_PORT = 80                 # systemd grants CAP_NET_BIND_SERVICE
+WS_PUSH_S = 0.1                     # merged telemetry push period (~10 Hz)
+CAM_POLL_S = 1.0                    # CAM /status poll period
+LIDAR_WS_POINTS = 240               # max LiDAR points per WS frame

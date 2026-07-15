@@ -15,6 +15,7 @@ power live in `../Hardware Architecture - Pi Integration Phase.md`.
 | `gimbal.py` | pan/tilt servos via pigpio | — |
 | `smoke/` | one standalone test per subsystem | — |
 | `main.py` | orchestrator skeleton (status loop + safety) | `.ino` |
+| `webapp/` | FastAPI dashboard: main car UI on port 80 | `WebUI.h` |
 
 ## One-time Pi setup
 
@@ -63,6 +64,35 @@ python smoke/gimbal_sweep.py  # 6. servos move (clear the gimbal first!)
 ```
 
 All green → `python main.py` for the combined status loop.
+
+## Dashboard (pi/webapp)
+
+The Pi serves the car's main UI — one dark phone page with e-stop, arm,
+hold-to-drive D-pad, per-wheel PWM/RPM, IMU, embedded CAM stream, gimbal
+sliders and a LiDAR polar plot, all fed by one merged WebSocket at 10 Hz.
+Sensors that are missing just show as offline; the rest keeps working.
+
+Try it by hand first:
+
+```bash
+cd ~/car/pi && source .venv/bin/activate
+sudo .venv/bin/python -m uvicorn webapp.server:app --host 0.0.0.0 --port 80
+```
+
+then browse to `http://192.168.4.1/` (or the Pi's home-WiFi IP while testing
+off the car). Install it as a boot service:
+
+```bash
+sudo cp ~/car/pi/webapp/car-dashboard.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now car-dashboard
+journalctl -u car-dashboard -f     # logs
+```
+
+The unit runs as user `pi` with `CAP_NET_BIND_SERVICE` (no root, still
+port 80) and assumes the repo at `/home/pi/car` — edit the paths in the
+unit file if yours differ. The ESP32's own UI stays available at
+`http://<ESP32_HOST>` as a debug fallback.
 
 ## Safety rules for any script that drives
 

@@ -1,0 +1,270 @@
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RC Car · Pi Dashboard</title>
+<style>
+/* Same dark system as the ESP32 fallback UI (CarTestBench/WebUI.h). */
+:root{--bg:#0f1115;--panel:#1a1d24;--panel2:#232733;--line:#2e3340;
+--text:#e6e8ee;--muted:#8b91a0;--accent:#4d8dff;--good:#28c98b;
+--warn:#f5b342;--bad:#ff5c6c;--radius:12px}
+*{box-sizing:border-box}
+body{margin:0;font-family:'Segoe UI',system-ui,Roboto,sans-serif;
+background:var(--bg);color:var(--text);-webkit-tap-highlight-color:transparent}
+nav{display:flex;gap:4px;align-items:center;padding:10px 14px;background:var(--panel);
+border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10;flex-wrap:wrap}
+nav .brand{font-weight:700;margin-right:12px;font-size:16px}
+nav a{color:var(--muted);text-decoration:none;padding:8px 12px;border-radius:8px;font-size:14px;font-weight:600}
+nav a:hover{color:var(--text);background:var(--panel2)}
+#conn{margin-left:auto;font-size:12px;font-weight:600;padding:5px 10px;border-radius:20px;
+background:var(--panel2);color:var(--bad)}
+#conn.ok{color:var(--good)}
+main{max-width:880px;margin:0 auto;padding:18px 14px 48px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px}
+.card h2{margin:0 0 12px;font-size:15px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+.tag{font-size:11px;font-weight:700;padding:3px 8px;border-radius:20px;background:var(--panel2);color:var(--muted)}
+.tag.good{color:var(--good)} .tag.bad{color:var(--bad)} .tag.warn{color:var(--warn)}
+.metric{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:28px;font-weight:700}
+.metric.good{color:var(--good)} .metric.accent{color:var(--accent)}
+.unit{font-size:13px;color:var(--muted);font-weight:500}
+.row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid var(--line)}
+.row:last-child{border-bottom:none}
+.row .k{color:var(--muted);font-size:14px}
+button{font-family:inherit;font-weight:600;font-size:14px;border:none;border-radius:9px;
+padding:11px 14px;cursor:pointer;background:var(--panel2);color:var(--text)}
+button:active{transform:translateY(1px)}
+button.pri{background:var(--accent);color:#fff}
+button.good{background:var(--good);color:#06231a}
+button.bad{background:var(--bad);color:#2a0608}
+button.wide{width:100%}
+.btns{display:flex;gap:8px;flex-wrap:wrap}
+.estop{width:100%;padding:18px;font-size:18px;font-weight:800;letter-spacing:.5px;
+background:var(--bad);color:#2a0608;border-radius:var(--radius);margin-bottom:12px}
+input[type=range]{width:100%;accent-color:var(--accent);height:30px}
+label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:9px 6px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.4px}
+td.num{font-family:ui-monospace,monospace;text-align:right}
+.hint{color:var(--muted);font-size:13px;line-height:1.5}
+.bar{height:8px;background:var(--panel2);border-radius:6px;overflow:hidden;margin-top:5px}
+.bar > span{display:block;height:100%;background:var(--good);width:0}
+.dpad{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;max-width:340px;margin:0 auto}
+.dpad button{padding:24px 0;font-size:20px;user-select:none;-webkit-user-select:none;touch-action:none}
+.dpad button.hold{background:var(--accent);color:#fff}
+#camImg{width:100%;border-radius:8px;background:#000;min-height:180px}
+#lidarCv{width:100%;aspect-ratio:1;background:#0b0d11;border-radius:8px;border:1px solid var(--line)}
+</style></head><body>
+
+<nav><span class="brand">RC Car · Pi Dashboard</span>
+  <a id="lnkEsp" href="#" target="_blank">ESP32 fallback UI</a>
+  <a id="lnkCam" href="#" target="_blank">CAM</a>
+  <span id="conn">offline</span>
+</nav>
+
+<main>
+<button class="estop" onclick="estop()">EMERGENCY STOP</button>
+
+<div class="grid">
+
+  <div class="card"><h2>Safety &amp; Arm
+      <span><span id="tEsp" class="tag bad">ESP32 OFFLINE</span>
+      <span id="tArm" class="tag bad">0/4</span></span></h2>
+    <div class="btns">
+      <button class="good" onclick="post('/api/motor?ch=all&arm=1')">ARM ALL</button>
+      <button class="bad" onclick="post('/api/motor?ch=all&arm=0')">Disarm all</button>
+      <button onclick="post('/api/estop/clear')">Clear E-Stop</button>
+    </div>
+  </div>
+
+  <div class="card"><h2>Drive <span class="tag" id="tDrv">idle</span></h2>
+    <label>Speed PWM <span id="spdLbl">120</span> (0..255)</label>
+    <input type="range" id="spd" min="0" max="255" value="120" step="5"
+           oninput="document.getElementById('spdLbl').textContent=this.value">
+    <div class="dpad" style="margin-top:10px">
+      <span></span><button id="bFwd">&#9650;</button><span></span>
+      <button id="bLeft">&#9664;</button><button class="bad" onclick="stopCar()">STOP</button><button id="bRight">&#9654;</button>
+      <span></span><button id="bRev">&#9660;</button><span></span>
+    </div>
+    <p class="hint" style="margin-bottom:0">Hold to drive — release stops. The firmware
+    also auto-stops 0.5&nbsp;s after commands stop arriving.</p>
+  </div>
+
+  <div class="card"><h2>Wheels</h2>
+    <table><thead><tr><th>Wheel</th><th style="text-align:right">PWM</th><th style="text-align:right">RPM</th></tr></thead>
+    <tbody id="wBody"></tbody></table>
+  </div>
+
+  <div class="card"><h2>Camera <span class="tag" id="tCam">connecting</span></h2>
+    <img id="camImg" alt="">
+    <div class="row" style="margin-top:8px"><span class="k">FPS</span><span class="metric good" id="cFps">--</span></div>
+    <div class="row"><span class="k">Bitrate</span><span><span class="metric accent" id="cKbps">--</span> <span class="unit">kbit/s</span></span></div>
+    <div class="row"><span class="k">Avg frame</span><span><span class="metric" id="cKb">--</span> <span class="unit">KB</span></span></div>
+    <button class="wide" style="margin-top:10px" onclick="camReload()">Reconnect stream</button>
+  </div>
+
+  <div class="card"><h2>IMU <span class="tag" id="tImu">--</span></h2>
+    <div class="row"><span class="k">Heading</span><span><span class="metric accent" id="iH">--</span> <span class="unit">deg</span></span></div>
+    <div class="row"><span class="k">Roll</span><span class="metric" id="iR" style="font-size:20px">--</span></div>
+    <div class="row"><span class="k">Pitch</span><span class="metric" id="iP" style="font-size:20px">--</span></div>
+    <label style="margin-top:12px">Calibration (sys / gyro / accel / mag)</label>
+    <div class="bar"><span id="cal0"></span></div>
+    <div class="bar"><span id="cal1"></span></div>
+    <div class="bar"><span id="cal2"></span></div>
+    <div class="bar"><span id="cal3"></span></div>
+  </div>
+
+  <div class="card"><h2>Gimbal <span class="tag" id="tGim">--</span></h2>
+    <label>Pan <span id="panLbl">90</span>&deg;</label>
+    <input type="range" id="pan" min="0" max="180" value="90"
+           oninput="gimbal('pan',this.value)">
+    <label>Tilt <span id="tiltLbl">90</span>&deg;</label>
+    <input type="range" id="tilt" min="0" max="180" value="90"
+           oninput="gimbal('tilt',this.value)">
+    <button class="wide" style="margin-top:10px" onclick="gimbalCenter()">Center</button>
+  </div>
+
+  <div class="card"><h2>LiDAR <span class="tag" id="tLid">stopped</span></h2>
+    <canvas id="lidarCv" width="400" height="400"></canvas>
+    <div class="btns" style="margin-top:10px">
+      <button class="pri" onclick="post('/api/lidar/start')">Start scan</button>
+      <button onclick="post('/api/lidar/stop')">Stop</button>
+    </div>
+    <p class="hint" style="margin-bottom:0">Rings every 1&nbsp;m, 4&nbsp;m full scale. Car faces up.</p>
+  </div>
+
+</div>
+</main>
+
+<script>
+const $=id=>document.getElementById(id);
+function post(url){return fetch(url,{method:'POST'});}
+
+// Addresses come from the server so pi/config.py stays the single source.
+let CAM='';
+fetch('/api/config').then(r=>r.json()).then(c=>{
+  CAM='http://'+c.cam;
+  $('lnkEsp').href='http://'+c.esp32;
+  $('lnkCam').href=CAM;
+  camReload();
+});
+function camReload(){if(CAM)$('camImg').src=CAM+':81/stream?t='+Date.now();}
+$('camImg').addEventListener('error',()=>setTimeout(camReload,4000));
+
+// ------------------------------------------------------------- driving
+// Hold-to-drive with a client deadman: while held, re-send every 300 ms so
+// the firmware's 500 ms auto-stop keeps trusting us.
+let driving=null,tick=null;
+function send(dir){post('/api/drive?dir='+dir+'&pwm='+$('spd').value);}
+function startDrive(btn,dir){
+  driving=dir;btn.classList.add('hold');send(dir);
+  $('tDrv').textContent=dir;$('tDrv').className='tag good';
+  clearInterval(tick);
+  tick=setInterval(()=>{if(driving)send(driving);},300);
+}
+function stopCar(){
+  driving=null;clearInterval(tick);tick=null;
+  document.querySelectorAll('.dpad .hold').forEach(b=>b.classList.remove('hold'));
+  $('tDrv').textContent='idle';$('tDrv').className='tag';
+  post('/api/drive?dir=stop');
+}
+function estop(){stopCar();post('/api/estop');}
+[['bFwd','fwd'],['bRev','rev'],['bLeft','left'],['bRight','right']].forEach(([id,dir])=>{
+  const b=$(id);
+  b.addEventListener('pointerdown',e=>{e.preventDefault();startDrive(b,dir);});
+  ['pointerup','pointerleave','pointercancel'].forEach(ev=>
+    b.addEventListener(ev,()=>{if(driving)stopCar();}));
+  b.addEventListener('contextmenu',e=>e.preventDefault());
+});
+
+// -------------------------------------------------------------- gimbal
+// Throttle slider spam to one POST per 100 ms, last value wins.
+let gimQ={},gimT=null;
+function gimbal(axis,v){
+  $(axis+'Lbl').textContent=v;gimQ[axis]=v;
+  if(!gimT)gimT=setTimeout(()=>{
+    const q=Object.entries(gimQ).map(([k,v])=>k+'='+v).join('&');
+    gimQ={};gimT=null;post('/api/gimbal?'+q);
+  },100);
+}
+function gimbalCenter(){
+  $('pan').value=90;$('tilt').value=90;
+  $('panLbl').textContent=90;$('tiltLbl').textContent=90;
+  post('/api/gimbal?pan=90&tilt=90');
+}
+
+// --------------------------------------------------------------- LiDAR
+const cv=$('lidarCv'),ctx=cv.getContext('2d');
+function drawLidar(pts){
+  const W=cv.width,H=cv.height,cx=W/2,cy=H/2,R=Math.min(cx,cy)-6,MAX=4000;
+  ctx.clearRect(0,0,W,H);
+  ctx.strokeStyle='#2e3340';ctx.fillStyle='#5a606e';ctx.font='10px monospace';
+  for(let m=1;m<=4;m++){
+    ctx.beginPath();ctx.arc(cx,cy,R*m/4,0,2*Math.PI);ctx.stroke();
+    ctx.fillText(m+'m',cx+3,cy-R*m/4+11);
+  }
+  ctx.beginPath();ctx.moveTo(cx,cy-R);ctx.lineTo(cx,cy+R);ctx.moveTo(cx-R,cy);ctx.lineTo(cx+R,cy);ctx.stroke();
+  ctx.fillStyle='#4d8dff';
+  for(const [a,d] of pts){
+    if(d>MAX)continue;
+    const r=R*d/MAX,rad=a*Math.PI/180;
+    ctx.fillRect(cx+Math.sin(rad)*r-1.5,cy-Math.cos(rad)*r-1.5,3,3);
+  }
+  ctx.fillStyle='#28c98b';ctx.beginPath();ctx.arc(cx,cy,4,0,2*Math.PI);ctx.fill();
+}
+drawLidar([]);
+
+// ----------------------------------------------------- merged telemetry
+const WHEELS=['Left-Front','Left-Rear','Right-Front','Right-Rear'];
+WHEELS.forEach((n,i)=>$('wBody').insertAdjacentHTML('beforeend',
+  '<tr><td>'+n+'</td><td class="num" id="wP'+i+'">0</td><td class="num" id="wR'+i+'">0</td></tr>'));
+function tag(id,txt,cls){const t=$(id);t.textContent=txt;t.className='tag '+(cls||'');}
+
+let ws;
+function connect(){
+  ws=new WebSocket('ws://'+location.host+'/ws');
+  ws.onopen =()=>{$('conn').className='ok';$('conn').textContent='connected';};
+  ws.onclose=()=>{$('conn').className='';$('conn').textContent='offline';setTimeout(connect,1500);};
+  ws.onmessage=e=>{try{render(JSON.parse(e.data));}catch(_){}};
+}
+window.addEventListener('load',connect);
+
+function render(d){
+  // ESP32 (may be null when the DevKit is off the network)
+  const t=d.esp32;
+  if(t){
+    if(t.estop)tag('tEsp','E-STOPPED','bad');
+    else tag('tEsp','LIVE','good');
+    const n=t.a.filter(x=>x).length;
+    tag('tArm',n+'/4 armed',n===4?'good':n?'warn':'bad');
+    t.m.forEach((v,i)=>{$('wP'+i).textContent=v;$('wR'+i).textContent=t.enc[i].r.toFixed(0);});
+  }else{
+    tag('tEsp','ESP32 OFFLINE','bad');tag('tArm','--','');
+  }
+  // IMU
+  if(d.imu&&d.imu.ok){
+    tag('tImu','live','good');
+    $('iH').textContent=d.imu.h.toFixed(1);
+    $('iR').textContent=d.imu.r==null?'--':d.imu.r.toFixed(1);
+    $('iP').textContent=d.imu.p==null?'--':d.imu.p.toFixed(1);
+    (d.imu.cal||[]).forEach((v,i)=>$('cal'+i).style.width=(v/3*100)+'%');
+  }else{
+    tag('tImu','offline','warn');$('iH').textContent='--';$('iR').textContent='--';$('iP').textContent='--';
+  }
+  // Camera stats (stream itself is pulled straight from the CAM)
+  if(d.cam&&d.cam.ok){
+    tag('tCam','LIVE','good');
+    $('cFps').textContent=d.cam.fps!=null?d.cam.fps:'--';
+    $('cKbps').textContent=d.cam.kbps!=null?d.cam.kbps:'--';
+    $('cKb').textContent=d.cam.kb!=null?d.cam.kb:'--';
+  }else{
+    tag('tCam','offline','bad');$('cFps').textContent='--';$('cKbps').textContent='--';$('cKb').textContent='--';
+  }
+  // Gimbal
+  tag('tGim',d.gimbal&&d.gimbal.ok?'ready':'offline',d.gimbal&&d.gimbal.ok?'good':'warn');
+  // LiDAR
+  if(d.lidar&&d.lidar.running){tag('tLid','scanning','good');drawLidar(d.lidar.pts||[]);}
+  else tag('tLid',d.lidar&&d.lidar.err?'error':'stopped',d.lidar&&d.lidar.err?'bad':'');
+}
+</script>
+</body></html>
