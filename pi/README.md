@@ -40,6 +40,23 @@ python3 -m venv --system-site-packages .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
+## Making the Pi the car's access point (phase B)
+
+The Pi hosts the WiFi network (same SSID/PSK the ESP32 used, so the CAM
+just follows). One-time:
+
+```bash
+cd ~/car/pi
+bash setup_ap.sh
+```
+
+The script creates a NetworkManager AP profile (`car-ap`) at 192.168.4.1
+with DHCP for phones at .100-.200, and turns off autoconnect on the old
+`car` station profile. **Only after** the AP is up and the CAM reappears
+at 192.168.4.10, flash the DevKit with `WIFI_STATION_MODE 1` — it joins
+at 192.168.4.5. While the AP profile is active the Pi has no internet;
+`sudo nmcli c up <home-profile>` swaps wlan0 back when you need updates.
+
 ## Deploying code to the Pi
 
 From the Windows machine (both on the same network as the Pi):

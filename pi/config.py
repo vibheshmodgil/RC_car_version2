@@ -4,8 +4,9 @@ Network values must match CarTestBench/config.h (AP_SSID/CAM_HOST) and the
 static IPs in 'Hardware Architecture - Pi Integration Phase.md'.
 """
 
-# ---- Network (car AP: RC_Car_TestBench) ----
-ESP32_HOST = "192.168.4.1"          # DevKit: REST control + WS telemetry
+# ---- Network (car AP: RC_Car_TestBench, hosted by THIS Pi at .1) ----
+# IP plan: Pi .1 (AP + dashboard), DevKit .5, CAM .10, phones DHCP .100+.
+ESP32_HOST = "192.168.4.5"          # DevKit: REST control + WS telemetry
 CAM_HOST = "192.168.4.10"           # ESP32-CAM
 CAM_STREAM_URL = f"http://{CAM_HOST}:81/stream"
 CAM_CAPTURE_URL = f"http://{CAM_HOST}/capture"

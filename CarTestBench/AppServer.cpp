@@ -11,12 +11,28 @@ AppServer::AppServer(MotorChannel* const (&motors)[NUM_MOTORS], EncoderReader& e
 }
 
 void AppServer::begin() {
+#if WIFI_STATION_MODE
+    // Pi-centric phase: join the Pi's AP as a station with a static IP.
+    // Non-blocking — the HTTP server starts immediately and answers as
+    // soon as the association completes.
+    WiFi.mode(WIFI_STA);
+    IPAddress ip, gw, sn;
+    ip.fromString(STA_STATIC_IP);
+    gw.fromString(STA_GATEWAY);
+    sn.fromString(STA_SUBNET);
+    WiFi.config(ip, gw, sn);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(AP_SSID, AP_PASS);
+    Serial.printf("STA mode: joining '%s' as %s (fallback UI stays at that IP)\n",
+                  AP_SSID, STA_STATIC_IP);
+#else
     WiFi.mode(WIFI_AP);
     WiFi.softAP(AP_SSID, AP_PASS);
     Serial.print("AP started. Connect to '");
     Serial.print(AP_SSID);
     Serial.print("' then browse to http://");
     Serial.println(WiFi.softAPIP());
+#endif
 
     // Restore saved CPR and per-wheel direction-invert flags.
     _prefs.begin("bench", true);
@@ -220,6 +236,24 @@ void AppServer::broadcast() {
 
 void AppServer::loop() {
     uint32_t now = millis();
+
+#if WIFI_STATION_MODE
+    // Auto-reconnect watchdog. setAutoReconnect() covers momentary drops;
+    // this poll also recovers the boot-order case where the Pi's AP was
+    // not up yet when WiFi.begin() first ran.
+    if (now - _lastWifiCheck >= STA_RECONNECT_MS) {
+        _lastWifiCheck = now;
+        bool up = WiFi.status() == WL_CONNECTED;
+        if (up && !_wifiWasUp)
+            Serial.printf("WiFi connected: http://%s\n", WiFi.localIP().toString().c_str());
+        if (!up) {
+            Serial.println("WiFi down, retrying...");
+            WiFi.reconnect();
+        }
+        _wifiWasUp = up;
+    }
+#endif
+
     if (now - _lastBroadcast >= WS_BROADCAST_MS) {
         _lastBroadcast = now;
         _ws.cleanupClients();

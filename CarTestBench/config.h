@@ -132,10 +132,24 @@ constexpr uint32_t RPM_CALC_INTERVAL_MS = 50;     // 20 Hz RPM recompute
 constexpr uint32_t WS_BROADCAST_MS      = 100;    // 10 Hz telemetry push
 
 // ---------------------------------------------------------------------
-//  WiFi - Access-Point mode (phone connects directly to the ESP32)
+//  WiFi - Pi-centric phase: the Raspberry Pi runs the access point at
+//  192.168.4.1 (same SSID/PSK as the old ESP32 AP, so the CAM firmware
+//  needs zero changes) and this DevKit joins as a station with a static
+//  IP, still serving its own UI there as a debug fallback.
+//
+//  WIFI_STATION_MODE 1 = station on the Pi's AP (Pi-centric phase).
+//                    0 = legacy self-hosted AP (escape hatch: flash this
+//                        if the Pi AP is down and you need the old rig).
 // ---------------------------------------------------------------------
+#define WIFI_STATION_MODE 1
+
 constexpr char AP_SSID[] = "RC_Car_TestBench";
 constexpr char AP_PASS[] = "carbench123";     // >= 8 chars, change as needed
+
+constexpr char STA_STATIC_IP[] = "192.168.4.5";   // this DevKit; pi/config.py ESP32_HOST must match
+constexpr char STA_GATEWAY[]   = "192.168.4.1";   // the Pi's AP
+constexpr char STA_SUBNET[]    = "255.255.255.0";
+constexpr uint32_t STA_RECONNECT_MS = 5000;       // retry poll while the AP is unreachable
 
 // ---------------------------------------------------------------------
 //  Camera - separate ESP32-CAM board (CamStreamer sketch) that joins this

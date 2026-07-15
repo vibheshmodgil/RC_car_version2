@@ -33,4 +33,6 @@ private:
     AsyncWebSocket _ws{"/ws"};
     Preferences    _prefs;
     uint32_t       _lastBroadcast = 0;
+    uint32_t       _lastWifiCheck = 0;   // STA reconnect watchdog
+    bool           _wifiWasUp     = false;
 };
