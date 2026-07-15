@@ -35,4 +35,5 @@ private:
     uint32_t       _lastBroadcast = 0;
     uint32_t       _lastWifiCheck = 0;   // STA reconnect watchdog
     bool           _wifiWasUp     = false;
+    uint32_t       _lastMoveCmdMs = 0;   // drive deadman: last pwm/drive command
 };

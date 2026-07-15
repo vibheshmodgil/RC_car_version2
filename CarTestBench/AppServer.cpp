@@ -109,7 +109,10 @@ void AppServer::routes() {
                 if (r->getParam("arm")->value().toInt() == 1) m->arm();
                 else                                          m->disarm();
             }
-            else if (r->hasParam("pwm")) m->setPWM(r->getParam("pwm")->value().toInt());
+            else if (r->hasParam("pwm")) {
+                m->setPWM(r->getParam("pwm")->value().toInt());
+                _lastMoveCmdMs = millis();   // feeds the drive deadman
+            }
             else if (r->hasParam("inv")) m->setInverted(r->getParam("inv")->value().toInt() == 1);
             else if (r->hasParam("mode")) {
                 String mode = r->getParam("mode")->value();
@@ -154,6 +157,7 @@ void AppServer::routes() {
         _m[1]->setPWM(left  * pwm);
         _m[2]->setPWM(right * pwm);
         _m[3]->setPWM(right * pwm);
+        _lastMoveCmdMs = millis();   // feeds the drive deadman
         r->send(200, "text/plain", "OK");
     });
 
@@ -253,6 +257,20 @@ void AppServer::loop() {
         _wifiWasUp = up;
     }
 #endif
+
+    // Drive deadman: a wheel may only keep spinning while pwm/drive commands
+    // keep arriving (both UIs re-send every 300 ms while held). Covers a
+    // crashed browser, a dead Pi, or a dropped WiFi link mid-drive. Coast
+    // only — wheels stay armed, so the next command drives again.
+    if (now - _lastMoveCmdMs > DRIVE_DEADMAN_MS) {
+        bool moving = false;
+        for (auto* m : _m) moving |= m->currentPWM() != 0;
+        if (moving) {
+            for (auto* m : _m) m->coast();
+            Serial.printf("DEADMAN: no drive command for %lu ms, coasting all wheels\n",
+                          (unsigned long)(now - _lastMoveCmdMs));
+        }
+    }
 
     if (now - _lastBroadcast >= WS_BROADCAST_MS) {
         _lastBroadcast = now;

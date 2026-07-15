@@ -120,6 +120,12 @@ constexpr uint32_t DIR_CHANGE_DEADTIME_MS = 50;   // brake before reversing
 // direction line is open, IN1=IN2=HIGH can turn into full-speed drive.
 constexpr bool MOTOR_ACTIVE_BRAKE_ENABLED = false;
 
+// Drive deadman: if any wheel is moving (nonzero PWM) and no /api/drive or
+// /api/motor pwm command has arrived for this long, coast all wheels. Both
+// UIs re-send the held command every 300 ms, so a healthy client never
+// trips it; a dead browser/Pi/WiFi link does.
+constexpr uint32_t DRIVE_DEADMAN_MS = 500;
+
 // ---------------------------------------------------------------------
 //  Encoder / telemetry settings
 // ---------------------------------------------------------------------

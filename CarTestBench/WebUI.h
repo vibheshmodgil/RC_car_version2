@@ -190,6 +190,8 @@ inline const char* MOTORS_BODY() { return R"html(
 <h1>Motor Test</h1>
 <p class='sub'>4WD with one TB6612FNG channel per wheel — each slider drives one motor independently.
 A wheel does nothing until you <b>ARM</b> it; E-STOP and Disarm cut the drivers.
+This page keeps a held slider alive automatically — if it stops (tab closed,
+WiFi drop), the firmware deadman coasts the wheels within 0.5&nbsp;s.
 &#9888; TB6612 = 1.2&nbsp;A/channel: ramp up gently and never hold a stalled wheel.</p>
 <button class='estop' onclick="estop()">EMERGENCY STOP</button>
 <div class='card' style='margin-bottom:14px'><h2>All wheels</h2>
@@ -227,6 +229,12 @@ M.forEach(({k,n})=>{
     "<div class='row'><span class='k'>RPM</span><span class='metric good' id='"+k+"Rpm'>0</span></div></div>");
 });
 function drive(k,v){document.getElementById(k+'Lbl').textContent=v;post('/api/motor?ch='+k+'&pwm='+v);}
+// Deadman keep-alive: the firmware coasts any wheel left unrefreshed for
+// DRIVE_DEADMAN_MS, so re-send every nonzero slider while it is held.
+setInterval(()=>{M.forEach(({k})=>{
+  const v=parseInt(document.getElementById(k+'Slide').value);
+  if(v)post('/api/motor?ch='+k+'&pwm='+v);
+});},300);
 function quick(k,v){document.getElementById(k+'Slide').value=v;drive(k,v);}
 function mode(k,m){resetSlider(k);post('/api/motor?ch='+k+'&mode='+m);}
 function toggleArm(k){post('/api/motor?ch='+k+'&arm='+(armed[k]?0:1));resetSlider(k);}
