@@ -1,0 +1,13 @@
+# Python (pi/)
+__pycache__/
+*.pyc
+.venv/
+
+# Arduino build artifacts
+build/
+*.bin
+*.elf
+
+# OS noise
+Thumbs.db
+.DS_Store
