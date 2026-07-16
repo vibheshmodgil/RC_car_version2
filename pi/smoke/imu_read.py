@@ -6,7 +6,11 @@ from imu import Imu
 
 imu = Imu()
 for _ in range(20):
-    h, r, p = imu.euler or (None, None, None)
-    print(f"heading={h} roll={r} pitch={p}  cal(sys,gyro,acc,mag)={imu.calibration}")
+    r = imu.reading
+    if r.get("ok"):
+        print(f"heading={r['h']:.1f} roll={r['r']:.1f} pitch={r['p']:.1f}  "
+              f"cal(sys,gyro,acc,mag)={r['cal']}")
+    else:
+        print("waiting for a valid reading...")
     time.sleep(0.5)
 print("OK — rotate the sensor and watch heading follow.")

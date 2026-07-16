@@ -42,15 +42,14 @@ class Hub:
             self.gimbal.center()
 
         # Latest cached state per device, replaced (never mutated) by the
-        # worker threads so snapshot() can read without locks.
-        self.imu_state = {"ok": False}
+        # worker threads so snapshot() can read without locks. IMU owns its
+        # own background thread (see imu.py); the rest are driven here.
         self.cam_state = {"ok": False}
         self.lidar_state = {"running": False, "pts": []}
 
         self._lidar = None
         self._lidar_stop = threading.Event()
 
-        threading.Thread(target=self._imu_loop, daemon=True).start()
         threading.Thread(target=self._cam_loop, daemon=True).start()
 
     # ------------------------------------------------------------- ESP32
@@ -58,7 +57,7 @@ class Hub:
         """One merged telemetry frame for the browser WebSocket."""
         return {
             "esp32": self.link.telemetry if self.link.telemetry_fresh() else None,
-            "imu": self.imu_state,
+            "imu": self.imu.reading if self.imu else {"ok": False},
             "cam": self.cam_state,
             "lidar": self.lidar_state,
             "gimbal": {"ok": self.gimbal is not None, **self.gimbal_pos},
@@ -97,12 +96,10 @@ class Hub:
 
     def _lidar_loop(self):
         try:
-            for scan in self._lidar.scans():
+            for pts in self._lidar.scans():   # one rotation: [(angle_deg, dist_mm), ...]
                 if self._lidar_stop.is_set():
                     break
-                # scan = [(quality, angle_deg, dist_mm), ...]; drop no-return
-                # points and downsample so a WS frame stays small.
-                pts = [(round(a, 1), int(d)) for _, a, d in scan if d > 0]
+                # Downsample so a WS frame stays small.
                 step = max(1, len(pts) // LIDAR_WS_POINTS)
                 self.lidar_state = {"running": True, "pts": pts[::step]}
         except Exception as e:
@@ -115,22 +112,6 @@ class Hub:
             self._lidar = None
             if self.lidar_state.get("running"):
                 self.lidar_state = {"running": False, "pts": []}
-
-    # --------------------------------------------------------------- IMU
-    def _imu_loop(self):
-        while True:
-            if self.imu:
-                try:
-                    h, r, p = self.imu.euler or (None, None, None)
-                    cal = self.imu.calibration
-                    self.imu_state = {
-                        "ok": h is not None,
-                        "h": h, "r": r, "p": p,
-                        "cal": list(cal) if cal else [0, 0, 0, 0],
-                    }
-                except Exception as e:
-                    self.imu_state = {"ok": False, "err": str(e)}
-            time.sleep(0.1)
 
     # ------------------------------------------------------------ camera
     # Poll the CAM's cumulative counters and rate the deltas — same maths

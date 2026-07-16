@@ -1,8 +1,8 @@
 # pip installs (opencv and pigpio come from apt — see README.md)
 requests
 websocket-client
-adafruit-circuitpython-bno055
-rplidar-roboticia
+pyserial                # YDLIDAR X2 (pi/lidar.py)
+smbus2                  # BNO055 IMU, raw registers (pi/imu.py)
 # dashboard (pi/webapp)
 fastapi
 uvicorn

@@ -39,7 +39,7 @@ def main():
             else:
                 line = "esp32 TELEMETRY STALE"
             if imu:
-                h = (imu.euler or (None,))[0]
+                h = imu.reading.get("h") if imu.reading.get("ok") else None
                 line += f" | heading={h}"
             print(line)
             time.sleep(1.0)

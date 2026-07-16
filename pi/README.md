@@ -1,7 +1,9 @@
 # pi/ — Raspberry Pi 4 car brain
 
-Everything in this folder runs on the Pi, not the ESP32s. Wiring, IPs and
-power live in `../Hardware Architecture - Pi Integration Phase.md`.
+Everything in this folder runs on the Pi, not the ESP32s. Topology, IPs and
+the AP/deadman design live in `../Hardware Architecture - Pi Centric.md`;
+sensor wiring and power sizing are still in
+`../Hardware Architecture - Pi Integration Phase.md`.
 
 ## Layout
 
@@ -10,8 +12,8 @@ power live in `../Hardware Architecture - Pi Integration Phase.md`.
 | `config.py` | constants: IPs, ports, servo pins/limits | `config.h` |
 | `esp32_link.py` | REST control + WS telemetry client | `AppServer` |
 | `camera.py` | ESP32-CAM MJPEG frames via OpenCV | `CamStreamer` |
-| `imu.py` | BNO055 over I2C1 | — |
-| `lidar.py` | RPLidar A1/C1 over USB | — |
+| `imu.py` | BNO055 over I2C1, raw smbus2 registers (no Adafruit/CircuitPython) | — |
+| `lidar.py` | YDLIDAR X2 over USB, raw serial packet parser (no vendor SDK) | — |
 | `gimbal.py` | pan/tilt servos via pigpio | — |
 | `smoke/` | one standalone test per subsystem | — |
 | `main.py` | orchestrator skeleton (status loop + safety) | `.ino` |
@@ -23,7 +25,7 @@ Do this on home WiFi (internet), before switching to the car AP:
 
 ```bash
 sudo apt update
-sudo apt install -y python3-pip python3-venv python3-opencv python3-pigpio i2c-tools pigpio
+sudo apt install -y python3-pip python3-venv python3-opencv python3-pigpio python3-smbus i2c-tools pigpio
 sudo systemctl enable --now pigpiod
 sudo raspi-config nonint do_i2c 0        # enable I2C
 

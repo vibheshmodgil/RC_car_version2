@@ -6,11 +6,9 @@ from lidar import Lidar
 
 lidar = Lidar()
 try:
-    info, health = lidar.info()
-    print(f"model={info} health={health}")
-    for i, scan in enumerate(lidar.scans()):
-        dists = [d for _q, _a, d in scan if d > 0]
-        print(f"scan {i}: {len(scan)} pts, nearest {min(dists)/1000:.2f} m"
+    for i, pts in enumerate(lidar.scans()):   # pts = [(angle_deg, dist_mm), ...]
+        dists = [d for _a, d in pts]
+        print(f"scan {i}: {len(pts)} pts, nearest {min(dists) / 1000:.2f} m"
               if dists else f"scan {i}: no returns")
         if i >= 4:
             break

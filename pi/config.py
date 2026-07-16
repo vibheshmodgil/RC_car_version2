@@ -1,7 +1,7 @@
 """Single source of truth for the Pi-side constants — the config.h of the Pi.
 
-Network values must match CarTestBench/config.h (AP_SSID/CAM_HOST) and the
-static IPs in 'Hardware Architecture - Pi Integration Phase.md'.
+Network values must match CarTestBench/config.h (AP_SSID/STA_STATIC_IP/
+CAM_HOST) and the IP plan in 'Hardware Architecture - Pi Centric.md'.
 """
 
 # ---- Network (car AP: RC_Car_TestBench, hosted by THIS Pi at .1) ----
@@ -12,9 +12,13 @@ CAM_STREAM_URL = f"http://{CAM_HOST}:81/stream"
 CAM_CAPTURE_URL = f"http://{CAM_HOST}/capture"
 CAM_STATUS_URL = f"http://{CAM_HOST}/status"
 
-# ---- RPLidar (USB serial) ----
+# ---- YDLIDAR X2 (USB serial, raw packet parser — no vendor SDK) ----
 LIDAR_PORT = "/dev/ttyUSB0"
-LIDAR_BAUD = 115200                 # A1 = 115200, C1 = 460800
+LIDAR_BAUD = 115200
+
+# ---- BNO055 IMU (I2C, raw smbus2 registers — no Adafruit/CircuitPython) ----
+IMU_I2C_BUS = 1                     # /dev/i2c-1 (SDA1/SCL1, pins 3/5)
+IMU_I2C_ADDR = 0x28                 # ADR pin low/open
 
 # ---- Gimbal servos (Pi hardware PWM via pigpio) ----
 GIMBAL_PAN_GPIO = 18                # physical pin 12
