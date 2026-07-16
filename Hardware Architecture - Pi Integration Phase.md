@@ -1,8 +1,10 @@
 # Hardware Architecture - Raspberry Pi Integration Phase
 
-Status: planning/wiring reference for the Pi 4 + BNO055 + RPLidar + gimbal
-phase. The ESP32 drive firmware (`CarTestBench/`) and ESP32-CAM streamer
-(`CamStreamer/`) are unchanged by this phase.
+Status: **superseded by `Hardware Architecture - Pi Centric.md`** (the Pi
+now hosts the AP at 192.168.4.1 and the main dashboard; the DevKit is a
+station at 192.168.4.5). The BNO055/gimbal/power wiring sections below
+remain valid; the network topology does not, and the LiDAR section below
+has been corrected to the actual hardware (YDLIDAR X2, not RPLidar).
 
 ## System Topology
 
@@ -19,7 +21,7 @@ Three compute boards, one WiFi network, no new wires between boards.
                REST + WS telemetry                        |
                                                 +---------+---------+
                                                 |         |         |
-                                             BNO055    RPLidar   2x gimbal
+                                             BNO055    YDLIDAR   2x gimbal
                                              (I2C)     (USB)     servos (PWM)
 ```
 
@@ -91,19 +93,20 @@ Note the axis orientation you mount it in - it goes into the fusion config.
 - GPIO12 (pin 32) and GPIO13 (pin 33) are the alternate hardware PWM pins
   if 18/19 are ever needed for something else.
 
-### RPLidar A1 / C1 - USB
+### YDLIDAR X2 - USB
 
 | Item | Value |
 |---|---|
-| Connection | bundled USB-serial adapter -> any Pi USB-A port |
+| Connection | onboard USB-serial adapter -> any Pi USB-A port |
 | Device | `/dev/ttyUSB0` |
-| Baud | A1: 115200, C1: 460800 |
-| Power | from the USB adapter (5 V, ~0.5 A incl. spin motor) |
+| Baud | 115200 |
+| Power | from the USB adapter (5 V, roughly 0.3-0.5 A incl. spin motor — check your unit) |
 
-No GPIO used. The Pi 4's USB ports supply 1.2 A total across all ports -
-enough for the LiDAR, but power the Pi itself properly (below). Give the
-LiDAR an unobstructed 360 degree view; mount it as the highest thing on
-the chassis.
+No GPIO used; `pi/lidar.py` talks to it as a raw serial packet stream
+(sync header `0xAA 0x55`), no vendor SDK required. The Pi 4's USB ports
+supply 1.2 A total across all ports - enough for the LiDAR, but power the
+Pi itself properly (below). Give the LiDAR an unobstructed 360 degree
+view; mount it as the highest thing on the chassis.
 
 ### Pi pins left free
 
@@ -115,7 +118,7 @@ I2C0 (27/28), all SPI pins, UART0 (8/10), and everything else on the
 | Rail | Source | Feeds | Sizing |
 |---|---|---|---|
 | Drive battery | main pack | TB6612 VM (motors) | existing |
-| 5 V #1 | buck/UBEC >= 3 A (5 A ideal) | Pi 4 via USB-C | Pi 4 wants 3 A; LiDAR adds ~0.5 A through Pi USB |
+| 5 V #1 | buck/UBEC >= 3 A (5 A ideal) | Pi 4 via USB-C | Pi 4 wants 3 A; LiDAR adds ~0.3-0.5 A through Pi USB |
 | 5 V #2 | UBEC >= 3 A | both gimbal servos | stall spikes, keep separate from Pi |
 | 5 V #3 | existing supply | ESP32 DevKit + ESP32-CAM | CAM needs solid 2 A headroom |
 | 3.3 V | Pi's own pin 1 | BNO055 only | mA-level |
@@ -134,8 +137,8 @@ and Pi in any order - both retry until the AP appears.
 | ESP32 DevKit | WiFi HTTP | `POST /api/drive?dir=..&pwm=..`, `POST /api/motor...`, `POST /api/estop` |
 | ESP32 DevKit | WiFi WS | `ws://192.168.4.1/ws` - 10 Hz JSON: pwm, armed, encoder counts/RPM |
 | ESP32-CAM | WiFi HTTP | `http://192.168.4.10:81/stream` (MJPEG), `/capture`, `/control`, `/status` |
-| BNO055 | I2C1 @ 0x28 | `adafruit-circuitpython-bno055` |
-| RPLidar | USB serial | `rplidar-roboticia` (or Slamtec SDK / ROS2 driver later) |
+| BNO055 | I2C1 @ 0x28 | raw registers via `smbus2` (`pi/imu.py`, no CircuitPython) |
+| YDLIDAR X2 | USB serial | raw packet parser via `pyserial` (`pi/lidar.py`, no vendor SDK) |
 | Servos | GPIO18/19 PWM | `pigpio` |
 
 ## Pi Software Checklist
@@ -153,15 +156,15 @@ and Pi in any order - both retry until the AP appears.
    on home WiFi first, or keep two NetworkManager profiles.)
 3. Packages: `sudo apt install python3-pip i2c-tools pigpio python3-pigpio`
    and `sudo systemctl enable --now pigpiod`.
-4. Python libs: `pip install adafruit-circuitpython-bno055 rplidar-roboticia
-   opencv-python websocket-client requests`.
+4. Python libs: `pip install smbus2 pyserial opencv-python websocket-client
+   requests` (or just `pip install -r pi/requirements.txt`).
 5. Smoke tests, in order:
    - `i2cdetect -y 1` -> `0x28` appears.
    - `ping 192.168.4.1` and `curl -X POST "http://192.168.4.1/api/estop"` ->
      `ESTOP` (proves control path; clear it from the phone UI).
    - `python -c "import cv2;c=cv2.VideoCapture('http://192.168.4.10:81/stream');print(c.read()[0])"`
      -> `True`.
-   - RPLidar: 5-line read loop from the `rplidar` package docs prints scans.
+   - YDLIDAR X2: `python pi/smoke/lidar_scan.py` prints 5 scans' point counts.
    - Servos: pigpio `set_servo_pulsewidth(18, 1500)` centers the pan servo.
 
 ## Safety Notes

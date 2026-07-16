@@ -4,19 +4,24 @@ Guidance for Claude Code when working in this repository.
 
 ## Project Overview
 
-ESP32 firmware for the Advanced RC Car V2 test bench. The ESP32 runs its own
-WiFi access point and serves phone-friendly pages for testing each subsystem.
+Advanced RC Car V2 — **Pi-centric architecture** (see
+`Hardware Architecture - Pi Centric.md`, which supersedes the Pi
+Integration Phase doc):
 
-Current scope:
+- **Raspberry Pi 4 = brain**: hosts the WiFi AP at 192.168.4.1 (SSID
+  `RC_Car_TestBench`), serves the main dashboard (`pi/webapp`, FastAPI on
+  port 80, merged telemetry WS), owns BNO055 (I2C, raw smbus2), YDLIDAR X2 (USB, raw serial parser)
+  and 2 gimbal servos (GPIO18/19), and forwards control to the DevKit.
+- **ESP32 DevKit = motor controller**: 4 TB6612FNG channels + 4 quadrature
+  encoders, REST/WS API (stable contract), its own web UI kept as a debug
+  fallback at 192.168.4.5, e-stop/safety authority, 500 ms drive deadman.
+  Joins the Pi's AP as a station (`WIFI_STATION_MODE` in `config.h`; `0`
+  restores the legacy self-hosted AP).
+- **ESP32-CAM = streaming appliance**: MJPEG at 192.168.4.10:81, untouched
+  by the migration; video is never proxied through the DevKit or the Pi
+  for plain viewing.
 
-- Motors: 4 independent TB6612FNG channels, one per wheel.
-- Encoders: 4 quadrature encoders, one per wheel.
-- IMU/LiDAR/ToF: on the Raspberry Pi side, not wired to this ESP32 pin map.
-- Pi integration phase (Pi 4 + BNO055 on I2C + RPLidar A1/C1 on USB + 2
-  gimbal servos on Pi GPIO18/19): see
-  `Hardware Architecture - Pi Integration Phase.md`. Pi joins the AP as a
-  station at 192.168.4.20 and uses the existing REST/WS/stream interfaces;
-  nothing new connects to the ESP32.
+IP plan: Pi .1, DevKit .5, CAM .10, phones DHCP .100-.200.
 
 Master MCU: ESP32 DevKit V1, Arduino-ESP32 core 3.x.
 Sketch entry point: `CarTestBench/CarTestBench.ino`.
@@ -136,13 +141,28 @@ Modules are single-purpose and wired together in the `.ino`.
 | `MotorChannel` | One TB6612 channel: arm/disarm, direction, PWM, brake/coast, shared-STBY management, e-stop latch |
 | `EncoderReader` | Four quadrature encoders using `attachInterruptArg`; global singleton `Encoders` |
 | `Imu` | Disabled ESP32-local BNO055 groundwork; sensors are now planned on Pi |
-| `AppServer` | WiFi AP, HTTP pages, REST API, WebSocket telemetry |
-| `WebUI.h` | All HTML/CSS/JS |
-| `config.h` | Pins, feature flags, PWM/encoder defaults, AP credentials |
+| `AppServer` | WiFi (station on the Pi's AP, or legacy AP), HTTP pages, REST API, WebSocket telemetry, drive deadman |
+| `WebUI.h` | All HTML/CSS/JS (fallback UI; the main dashboard lives in `pi/webapp`) |
+| `config.h` | Pins, feature flags, PWM/encoder defaults, WiFi mode + IPs, deadman timeout |
+
+Pi-side modules live in `pi/` (`esp32_link.py`, `imu.py`, `lidar.py`,
+`gimbal.py`, `camera.py`, `webapp/` with `hub.py` + `server.py` +
+`static/index.html`). `pi/config.py` mirrors `config.h` — keep the IPs and
+SSID in sync across both and `CamStreamer.ino`.
 
 ## REST And Telemetry
 
-Pages:
+The DevKit's REST/WS API is a **stable contract** — the Pi dashboard, the
+fallback UI and `pi/esp32_link.py` all depend on it. Extend it, never
+break it.
+
+**Drive deadman:** if any wheel has nonzero PWM and no `/api/drive` or
+`/api/motor?...pwm=` command arrives for `DRIVE_DEADMAN_MS` (500 ms), all
+wheels coast (still armed) and Serial logs it. Every UI/script that holds
+a nonzero PWM must re-send it every ~300 ms (`DEADMAN_RESEND_S`).
+
+Pages (fallback UI on the DevKit; the Pi serves the main dashboard at
+`http://192.168.4.1/`):
 
 - `/`
 - `/motors`
@@ -192,7 +212,8 @@ Keep DOM IDs, page JavaScript, and these JSON field names in sync.
 
 A second, separate board runs `CamStreamer/CamStreamer.ino` (AI-Thinker
 ESP32-CAM). Architecture rule: **video never passes through the main ESP32**.
-The CAM joins the DevKit's AP as a station with static IP `CAM_HOST`
+The CAM joins the car AP (now hosted by the Pi — same SSID/PSK, so the CAM
+firmware needed no change) as a station with static IP `CAM_HOST`
 (192.168.4.10) and serves:
 
 - `http://<CAM_HOST>:81/stream` — MJPEG (embedded by the `/camera` page and
