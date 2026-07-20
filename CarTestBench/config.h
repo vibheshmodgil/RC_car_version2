@@ -122,9 +122,12 @@ constexpr bool MOTOR_ACTIVE_BRAKE_ENABLED = false;
 
 // Drive deadman: if any wheel is moving (nonzero PWM) and no /api/drive or
 // /api/motor pwm command has arrived for this long, coast all wheels. Both
-// UIs re-send the held command every 300 ms, so a healthy client never
-// trips it; a dead browser/Pi/WiFi link does.
-constexpr uint32_t DRIVE_DEADMAN_MS = 500;
+// UIs re-send the held command every 150 ms, so a healthy client never
+// trips it; a dead browser/Pi/WiFi link does. Widened from 500ms after
+// measuring real home-WiFi jitter between the Pi and this board spiking
+// past 300ms at idle (ping, no motors) — 500ms was tripping on ordinary
+// WiFi jitter, not just genuine link loss, causing visible stutter.
+constexpr uint32_t DRIVE_DEADMAN_MS = 800;
 
 // ---------------------------------------------------------------------
 //  Encoder / telemetry settings
@@ -138,30 +141,33 @@ constexpr uint32_t RPM_CALC_INTERVAL_MS = 50;     // 20 Hz RPM recompute
 constexpr uint32_t WS_BROADCAST_MS      = 100;    // 10 Hz telemetry push
 
 // ---------------------------------------------------------------------
-//  WiFi - Pi-centric phase: the Raspberry Pi runs the access point at
-//  192.168.4.1 (same SSID/PSK as the old ESP32 AP, so the CAM firmware
-//  needs zero changes) and this DevKit joins as a station with a static
-//  IP, still serving its own UI there as a debug fallback.
+//  WiFi - home-WiFi phase: all three boards (Pi, this DevKit, the CAM)
+//  join the house WiFi router directly as stations with static IPs.
+//  There is no more Pi-hosted AP (retired 2026-07-20 - it was the main
+//  source of flaky bring-up). This DevKit still serves its own UI at its
+//  static IP as a debug fallback.
 //
-//  WIFI_STATION_MODE 1 = station on the Pi's AP (Pi-centric phase).
+//  WIFI_STATION_MODE 1 = station on the home WiFi router (current).
 //                    0 = legacy self-hosted AP (escape hatch: flash this
-//                        if the Pi AP is down and you need the old rig).
+//                        only if the car ever needs to run away from home
+//                        WiFi coverage).
 // ---------------------------------------------------------------------
 #define WIFI_STATION_MODE 1
 
-constexpr char AP_SSID[] = "RC_Car_TestBench";
-constexpr char AP_PASS[] = "carbench123";     // >= 8 chars, change as needed
+constexpr char AP_SSID[] = "Airtel_kuma_9602";
+constexpr char AP_PASS[] = "air71417";        // home WiFi password
 
-constexpr char STA_STATIC_IP[] = "192.168.4.5";   // this DevKit; pi/config.py ESP32_HOST must match
-constexpr char STA_GATEWAY[]   = "192.168.4.1";   // the Pi's AP
+constexpr char STA_STATIC_IP[] = "192.168.1.51";  // this DevKit; pi/config.py ESP32_HOST must match
+constexpr char STA_GATEWAY[]   = "192.168.1.1";   // the home WiFi router
 constexpr char STA_SUBNET[]    = "255.255.255.0";
-constexpr uint32_t STA_RECONNECT_MS = 5000;       // retry poll while the AP is unreachable
+constexpr uint32_t STA_RECONNECT_MS = 5000;       // retry poll while the router is unreachable
 
 // ---------------------------------------------------------------------
-//  Camera - separate ESP32-CAM board (CamStreamer sketch) that joins this
-//  AP as a station with a static IP. The browser and (later) the Pi pull
-//  MJPEG straight from the CAM; video never passes through this ESP32.
-//  Must match the constants at the top of CamStreamer/CamStreamer.ino.
+//  Camera - separate ESP32-CAM board (CamStreamer sketch) that joins the
+//  same home WiFi router as a station with a static IP. The browser and
+//  (later) the Pi pull MJPEG straight from the CAM; video never passes
+//  through this ESP32. Must match the constants at the top of
+//  CamStreamer/CamStreamer.ino.
 // ---------------------------------------------------------------------
-constexpr char     CAM_HOST[]      = "192.168.4.10";
+constexpr char     CAM_HOST[]      = "192.168.1.52";
 constexpr uint16_t CAM_STREAM_PORT = 81;      // MJPEG at :81/stream, JPEG at :80/capture

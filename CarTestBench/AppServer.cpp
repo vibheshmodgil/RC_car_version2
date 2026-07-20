@@ -259,7 +259,7 @@ void AppServer::loop() {
 #endif
 
     // Drive deadman: a wheel may only keep spinning while pwm/drive commands
-    // keep arriving (both UIs re-send every 300 ms while held). Covers a
+    // keep arriving (both UIs re-send every 150 ms while held). Covers a
     // crashed browser, a dead Pi, or a dropped WiFi link mid-drive. Coast
     // only — wheels stay armed, so the next command drives again.
     if (now - _lastMoveCmdMs > DRIVE_DEADMAN_MS) {

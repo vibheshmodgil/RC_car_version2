@@ -18,8 +18,8 @@ nav a:hover{color:var(--text);background:var(--panel2)}
 #conn{margin-left:auto;font-size:12px;font-weight:600;padding:5px 10px;border-radius:20px;
 background:var(--panel2);color:var(--bad)}
 #conn.ok{color:var(--good)}
-main{max-width:880px;margin:0 auto;padding:18px 14px 48px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+main{max-width:1100px;margin:0 auto;padding:18px 14px 48px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px}
 .card h2{margin:0 0 12px;font-size:15px;display:flex;justify-content:space-between;align-items:center;gap:8px}
 .tag{font-size:11px;font-weight:700;padding:3px 8px;border-radius:20px;background:var(--panel2);color:var(--muted)}
@@ -30,21 +30,21 @@ main{max-width:880px;margin:0 auto;padding:18px 14px 48px}
 .row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid var(--line)}
 .row:last-child{border-bottom:none}
 .row .k{color:var(--muted);font-size:14px}
-button{font-family:inherit;font-weight:600;font-size:14px;border:none;border-radius:9px;
+button,select,input[type=number]{font-family:inherit;font-weight:600;font-size:14px;border:none;border-radius:9px;
 padding:11px 14px;cursor:pointer;background:var(--panel2);color:var(--text)}
 button:active{transform:translateY(1px)}
 button.pri{background:var(--accent);color:#fff}
 button.good{background:var(--good);color:#06231a}
 button.bad{background:var(--bad);color:#2a0608}
 button.wide{width:100%}
-.btns{display:flex;gap:8px;flex-wrap:wrap}
+.btns{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .estop{width:100%;padding:18px;font-size:18px;font-weight:800;letter-spacing:.5px;
-background:var(--bad);color:#2a0608;border-radius:var(--radius);margin-bottom:12px}
+background:var(--bad);color:#2a0608;border-radius:var(--radius);margin-bottom:14px;border:none}
 input[type=range]{width:100%;accent-color:var(--accent);height:30px}
 label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
-table{width:100%;border-collapse:collapse;font-size:14px}
-th,td{text-align:left;padding:9px 6px;border-bottom:1px solid var(--line)}
-th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.4px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 5px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
 td.num{font-family:ui-monospace,monospace;text-align:right}
 .hint{color:var(--muted);font-size:13px;line-height:1.5}
 .bar{height:8px;background:var(--panel2);border-radius:6px;overflow:hidden;margin-top:5px}
@@ -54,6 +54,13 @@ td.num{font-family:ui-monospace,monospace;text-align:right}
 .dpad button.hold{background:var(--accent);color:#fff}
 #camImg{width:100%;border-radius:8px;background:#000;min-height:180px}
 #lidarCv{width:100%;aspect-ratio:1;background:#0b0d11;border-radius:8px;border:1px solid var(--line)}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+.chip{background:var(--panel2);color:var(--muted);border:none;border-radius:20px;
+padding:10px 18px;font-weight:700;font-size:13px;cursor:pointer}
+.chip.on{background:var(--accent);color:#fff}
+.chip.sm{padding:5px 10px;font-size:12px;border-radius:14px}
+#hint{margin:4px 0 18px}
+select,input[type=number]{width:100%}
 </style></head><body>
 
 <nav><span class="brand">RC Car · Pi Dashboard</span>
@@ -65,20 +72,28 @@ td.num{font-family:ui-monospace,monospace;text-align:right}
 <main>
 <button class="estop" onclick="estop()">EMERGENCY STOP</button>
 
+<div class="chips">
+  <button class="chip" id="chip-motors" onclick="toggleComponent('motors')">Motors</button>
+  <button class="chip" id="chip-encoders" onclick="toggleComponent('encoders')">Encoders</button>
+  <button class="chip" id="chip-imu" onclick="toggleComponent('imu')">IMU</button>
+  <button class="chip" id="chip-lidar" onclick="toggleComponent('lidar')">LiDAR</button>
+  <button class="chip" id="chip-gimbal" onclick="toggleComponent('gimbal')">Gimbal</button>
+  <button class="chip" id="chip-camera" onclick="toggleComponent('camera')">Camera</button>
+</div>
+<p class="hint" id="hint">Pick a component above to test it. Pick two or three to run them
+side by side. Your selection is remembered on this device.</p>
+
 <div class="grid">
 
-  <div class="card"><h2>Safety &amp; Arm
-      <span><span id="tEsp" class="tag bad">ESP32 OFFLINE</span>
+  <div class="card" id="panel-motors" style="display:none">
+    <h2>Motors <span><span id="tEsp" class="tag bad">ESP32 OFFLINE</span>
       <span id="tArm" class="tag bad">0/4</span></span></h2>
     <div class="btns">
-      <button class="good" onclick="post('/api/motor?ch=all&arm=1')">ARM ALL</button>
+      <button class="good" onclick="post('/api/motor?ch=all&arm=1')">Arm all</button>
       <button class="bad" onclick="post('/api/motor?ch=all&arm=0')">Disarm all</button>
       <button onclick="post('/api/estop/clear')">Clear E-Stop</button>
     </div>
-  </div>
-
-  <div class="card"><h2>Drive <span class="tag" id="tDrv">idle</span></h2>
-    <label>Speed PWM <span id="spdLbl">120</span> (0..255)</label>
+    <label style="margin-top:14px">Whole-car speed PWM <span id="spdLbl">120</span> (0..255)</label>
     <input type="range" id="spd" min="0" max="255" value="120" step="5"
            oninput="document.getElementById('spdLbl').textContent=this.value">
     <div class="dpad" style="margin-top:10px">
@@ -86,51 +101,93 @@ td.num{font-family:ui-monospace,monospace;text-align:right}
       <button id="bLeft">&#9664;</button><button class="bad" onclick="stopCar()">STOP</button><button id="bRight">&#9654;</button>
       <span></span><button id="bRev">&#9660;</button><span></span>
     </div>
-    <p class="hint" style="margin-bottom:0">Hold to drive — release stops. The firmware
-    also auto-stops 0.5&nbsp;s after commands stop arriving.</p>
+    <p class="hint">Hold to drive whole car — release stops. Firmware also auto-stops
+    0.5&nbsp;s after commands stop arriving.</p>
+    <label>Per-wheel control</label>
+    <table><thead><tr><th>Wheel</th><th>Armed</th><th>PWM (-255..255)</th><th>Mode</th><th>Inv</th></tr></thead>
+    <tbody id="mBody"></tbody></table>
   </div>
 
-  <div class="card"><h2>Wheels</h2>
-    <table><thead><tr><th>Wheel</th><th style="text-align:right">PWM</th><th style="text-align:right">RPM</th></tr></thead>
-    <tbody id="wBody"></tbody></table>
+  <div class="card" id="panel-encoders" style="display:none">
+    <h2>Encoders <span class="tag" id="tCpr">CPR --</span></h2>
+    <table><thead><tr><th>Wheel</th><th style="text-align:right">Count</th><th style="text-align:right">RPM</th><th></th></tr></thead>
+    <tbody id="eBody"></tbody></table>
+    <div class="btns" style="margin-top:10px">
+      <button onclick="post('/api/encoder/reset?ch=all')">Reset all</button>
+    </div>
+    <label>Counts per revolution (CPR)</label>
+    <div class="btns">
+      <input type="number" id="cprInput" style="flex:1">
+      <button class="pri" onclick="setCpr()">Set</button>
+    </div>
   </div>
 
-  <div class="card"><h2>Camera <span class="tag" id="tCam">connecting</span></h2>
-    <img id="camImg" alt="">
-    <div class="row" style="margin-top:8px"><span class="k">FPS</span><span class="metric good" id="cFps">--</span></div>
-    <div class="row"><span class="k">Bitrate</span><span><span class="metric accent" id="cKbps">--</span> <span class="unit">kbit/s</span></span></div>
-    <div class="row"><span class="k">Avg frame</span><span><span class="metric" id="cKb">--</span> <span class="unit">KB</span></span></div>
-    <button class="wide" style="margin-top:10px" onclick="camReload()">Reconnect stream</button>
-  </div>
-
-  <div class="card"><h2>IMU <span class="tag" id="tImu">--</span></h2>
+  <div class="card" id="panel-imu" style="display:none">
+    <h2>IMU <span class="tag" id="tImu">--</span></h2>
     <div class="row"><span class="k">Heading</span><span><span class="metric accent" id="iH">--</span> <span class="unit">deg</span></span></div>
     <div class="row"><span class="k">Roll</span><span class="metric" id="iR" style="font-size:20px">--</span></div>
     <div class="row"><span class="k">Pitch</span><span class="metric" id="iP" style="font-size:20px">--</span></div>
-    <label style="margin-top:12px">Calibration (sys / gyro / accel / mag)</label>
+    <label style="margin-top:12px">Calibration — 0..3, 3 = fully calibrated</label>
+    <div class="row"><span class="k">Sys</span><span class="unit" id="calN0">--</span></div>
     <div class="bar"><span id="cal0"></span></div>
+    <div class="row"><span class="k">Gyro</span><span class="unit" id="calN1">--</span></div>
     <div class="bar"><span id="cal1"></span></div>
+    <div class="row"><span class="k">Accel</span><span class="unit" id="calN2">--</span></div>
     <div class="bar"><span id="cal2"></span></div>
+    <div class="row"><span class="k">Mag</span><span class="unit" id="calN3">--</span></div>
     <div class="bar"><span id="cal3"></span></div>
   </div>
 
-  <div class="card"><h2>Gimbal <span class="tag" id="tGim">--</span></h2>
+  <div class="card" id="panel-lidar" style="display:none">
+    <h2>LiDAR <span class="tag" id="tLid">stopped</span></h2>
+    <canvas id="lidarCv" width="400" height="400"></canvas>
+    <div class="btns" style="margin-top:10px">
+      <button class="pri" onclick="post('/api/lidar/start')">Start scan</button>
+      <button onclick="post('/api/lidar/stop')">Stop</button>
+    </div>
+    <p class="hint">Rings every 1&nbsp;m, 4&nbsp;m full scale. Car faces up. Motor also
+    stops automatically if you deselect this panel.</p>
+  </div>
+
+  <div class="card" id="panel-gimbal" style="display:none">
+    <h2>Gimbal <span class="tag" id="tGim">--</span></h2>
     <label>Pan <span id="panLbl">90</span>&deg;</label>
     <input type="range" id="pan" min="0" max="180" value="90"
            oninput="gimbal('pan',this.value)">
     <label>Tilt <span id="tiltLbl">90</span>&deg;</label>
     <input type="range" id="tilt" min="0" max="180" value="90"
            oninput="gimbal('tilt',this.value)">
-    <button class="wide" style="margin-top:10px" onclick="gimbalCenter()">Center</button>
+    <div class="btns" style="margin-top:10px">
+      <button onclick="gimbalCenter()">Center</button>
+      <button onclick="post('/api/gimbal/release')">Release (limp)</button>
+    </div>
   </div>
 
-  <div class="card"><h2>LiDAR <span class="tag" id="tLid">stopped</span></h2>
-    <canvas id="lidarCv" width="400" height="400"></canvas>
+  <div class="card" id="panel-camera" style="display:none">
+    <h2>Camera <span class="tag" id="tCam">connecting</span></h2>
+    <img id="camImg" alt="">
+    <div class="row" style="margin-top:8px"><span class="k">FPS</span><span class="metric good" id="cFps">--</span></div>
+    <div class="row"><span class="k">Bitrate</span><span><span class="metric accent" id="cKbps">--</span> <span class="unit">kbit/s</span></span></div>
+    <div class="row"><span class="k">Avg frame</span><span><span class="metric" id="cKb">--</span> <span class="unit">KB</span></span></div>
     <div class="btns" style="margin-top:10px">
-      <button class="pri" onclick="post('/api/lidar/start')">Start scan</button>
-      <button onclick="post('/api/lidar/stop')">Stop</button>
+      <button onclick="camReload()">Reconnect stream</button>
+      <button onclick="camSnapshot()">Snapshot</button>
     </div>
-    <p class="hint" style="margin-bottom:0">Rings every 1&nbsp;m, 4&nbsp;m full scale. Car faces up.</p>
+    <label>Frame size</label>
+    <select id="camFramesize" onchange="camControl('framesize',this.value)">
+      <option value="5">QVGA 320x240</option>
+      <option value="8" selected>VGA 640x480</option>
+      <option value="9">SVGA 800x600</option>
+      <option value="13">UXGA 1600x1200</option>
+    </select>
+    <label>Quality <span id="camQLbl">12</span> (10 = best .. 63 = worst)</label>
+    <input type="range" id="camQuality" min="10" max="63" value="12"
+           oninput="document.getElementById('camQLbl').textContent=this.value"
+           onchange="camControl('quality',this.value)">
+    <div class="btns" style="margin-top:10px">
+      <button id="camVflip" onclick="camToggle('vflip')">V-flip: off</button>
+      <button id="camHmirror" onclick="camToggle('hmirror')">H-mirror: off</button>
+    </div>
   </div>
 
 </div>
@@ -139,6 +196,38 @@ td.num{font-family:ui-monospace,monospace;text-align:right}
 <script>
 const $=id=>document.getElementById(id);
 function post(url){return fetch(url,{method:'POST'});}
+const WHEEL_CH=['lf','lr','rf','rr'];
+const WHEELS=['Left-Front','Left-Rear','Right-Front','Right-Rear'];
+
+// ---------------------------------------------------------- component picker
+const COMPONENTS=['motors','encoders','imu','lidar','gimbal','camera'];
+let selected=new Set();
+try{selected=new Set(JSON.parse(localStorage.getItem('carSelectedComponents')||'[]')
+  .filter(c=>COMPONENTS.includes(c)));}catch(_){}
+
+function renderSelection(){
+  COMPONENTS.forEach(name=>{
+    const on=selected.has(name);
+    $('panel-'+name).style.display=on?'':'none';
+    $('chip-'+name).classList.toggle('on',on);
+  });
+  $('hint').style.display=selected.size?'none':'block';
+}
+function toggleComponent(name){
+  if(selected.has(name)){
+    selected.delete(name);
+    if(name==='lidar')post('/api/lidar/stop');
+    if(name==='camera')$('camImg').src='';
+  }else{
+    selected.add(name);
+    if(name==='lidar')post('/api/lidar/start');
+    if(name==='camera')camReload();
+    if(name==='encoders')loadCpr();
+  }
+  localStorage.setItem('carSelectedComponents',JSON.stringify([...selected]));
+  renderSelection();
+}
+renderSelection();
 
 // Addresses come from the server so pi/config.py stays the single source.
 let CAM='';
@@ -146,26 +235,41 @@ fetch('/api/config').then(r=>r.json()).then(c=>{
   CAM='http://'+c.cam;
   $('lnkEsp').href='http://'+c.esp32;
   $('lnkCam').href=CAM;
-  camReload();
+  if(selected.has('camera'))camReload();
 });
+if(selected.has('lidar'))post('/api/lidar/start');
+if(selected.has('encoders'))loadCpr();
+
 function camReload(){if(CAM)$('camImg').src=CAM+':81/stream?t='+Date.now();}
-$('camImg').addEventListener('error',()=>setTimeout(camReload,4000));
+$('camImg').addEventListener('error',()=>{if(selected.has('camera'))setTimeout(camReload,4000);});
+
+// -------------------------------------------------------------- camera ctrl
+// CamStreamer sends Access-Control-Allow-Origin:* on /control, so the
+// browser can call the CAM directly — no Pi-side proxy needed.
+let camFlags={vflip:0,hmirror:0};
+function camControl(varName,val){if(CAM)fetch(CAM+'/control?var='+varName+'&val='+val).catch(()=>{});}
+function camToggle(varName){
+  camFlags[varName]=camFlags[varName]?0:1;
+  camControl(varName,camFlags[varName]);
+  const label=varName==='vflip'?'V-flip: ':'H-mirror: ';
+  $('cam'+(varName==='vflip'?'Vflip':'Hmirror')).textContent=label+(camFlags[varName]?'on':'off');
+}
+function camSnapshot(){if(CAM)window.open(CAM+'/capture','_blank');}
 
 // ------------------------------------------------------------- driving
-// Hold-to-drive with a client deadman: while held, re-send every 300 ms so
-// the firmware's 500 ms auto-stop keeps trusting us.
+// Hold-to-drive with a client deadman: while held, re-send every 150 ms so
+// the firmware's 800 ms auto-stop keeps trusting us even through the WiFi
+// jitter this network measures (up to ~300ms at idle — see CLAUDE.md).
 let driving=null,tick=null;
 function send(dir){post('/api/drive?dir='+dir+'&pwm='+$('spd').value);}
 function startDrive(btn,dir){
   driving=dir;btn.classList.add('hold');send(dir);
-  $('tDrv').textContent=dir;$('tDrv').className='tag good';
   clearInterval(tick);
-  tick=setInterval(()=>{if(driving)send(driving);},300);
+  tick=setInterval(()=>{if(driving)send(driving);},150);
 }
 function stopCar(){
   driving=null;clearInterval(tick);tick=null;
   document.querySelectorAll('.dpad .hold').forEach(b=>b.classList.remove('hold'));
-  $('tDrv').textContent='idle';$('tDrv').className='tag';
   post('/api/drive?dir=stop');
 }
 function estop(){stopCar();post('/api/estop');}
@@ -176,6 +280,56 @@ function estop(){stopCar();post('/api/estop');}
     b.addEventListener(ev,()=>{if(driving)stopCar();}));
   b.addEventListener('contextmenu',e=>e.preventDefault());
 });
+
+// --------------------------------------------------------- per-wheel motors
+let wheelArmed=[false,false,false,false],wheelInv=[false,false,false,false];
+WHEELS.forEach((name,i)=>{
+  const ch=WHEEL_CH[i];
+  $('mBody').insertAdjacentHTML('beforeend',
+    '<tr><td>'+name+'</td>'+
+    '<td><button class="chip sm" id="mArm'+i+'" onclick="wheelArmToggle(\''+ch+'\','+i+')">off</button></td>'+
+    '<td><input type="range" min="-255" max="255" value="0" step="5" style="width:120px" '+
+    'oninput="wheelPwm(\''+ch+'\','+i+',this.value)"> <span id="mPwm'+i+'" class="unit">0</span></td>'+
+    '<td class="btns"><button onclick="post(\'/api/motor?ch='+ch+'&mode=brake\')">Brake</button>'+
+    '<button onclick="post(\'/api/motor?ch='+ch+'&mode=coast\')">Coast</button></td>'+
+    '<td><button class="chip sm" id="mInv'+i+'" onclick="wheelInvToggle(\''+ch+'\','+i+')">off</button></td></tr>');
+});
+function wheelArmToggle(ch,i){
+  wheelArmed[i]=!wheelArmed[i];
+  post('/api/motor?ch='+ch+'&arm='+(wheelArmed[i]?1:0));
+}
+function wheelInvToggle(ch,i){
+  wheelInv[i]=!wheelInv[i];
+  post('/api/motor?ch='+ch+'&inv='+(wheelInv[i]?1:0));
+}
+let pwmQ={},pwmT=null;
+function wheelPwm(ch,i,v){
+  $('mPwm'+i).textContent=v;
+  pwmQ[ch]=v;
+  if(!pwmT)pwmT=setTimeout(()=>{
+    Object.entries(pwmQ).forEach(([c,val])=>post('/api/motor?ch='+c+'&pwm='+val));
+    pwmQ={};pwmT=null;
+  },100);
+}
+
+// ------------------------------------------------------------- encoders
+WHEELS.forEach((name,i)=>{
+  $('eBody').insertAdjacentHTML('beforeend',
+    '<tr><td>'+name+'</td><td class="num" id="eC'+i+'">0</td><td class="num" id="eR'+i+'">0</td>'+
+    '<td><button onclick="post(\'/api/encoder/reset?ch='+i+'\')">Reset</button></td></tr>');
+});
+function loadCpr(){
+  fetch('/api/encoder/cpr').then(r=>r.json()).then(d=>{
+    $('tCpr').textContent='CPR '+d.cpr;
+    $('cprInput').value=d.cpr;
+  }).catch(()=>{});
+}
+function setCpr(){
+  const v=parseFloat($('cprInput').value);
+  if(!v)return;
+  fetch('/api/encoder/cpr',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({cpr:v})}).then(()=>loadCpr());
+}
 
 // -------------------------------------------------------------- gimbal
 // Throttle slider spam to one POST per 100 ms, last value wins.
@@ -215,9 +369,6 @@ function drawLidar(pts){
 drawLidar([]);
 
 // ----------------------------------------------------- merged telemetry
-const WHEELS=['Left-Front','Left-Rear','Right-Front','Right-Rear'];
-WHEELS.forEach((n,i)=>$('wBody').insertAdjacentHTML('beforeend',
-  '<tr><td>'+n+'</td><td class="num" id="wP'+i+'">0</td><td class="num" id="wR'+i+'">0</td></tr>'));
 function tag(id,txt,cls){const t=$(id);t.textContent=txt;t.className='tag '+(cls||'');}
 
 let ws;
@@ -237,7 +388,15 @@ function render(d){
     else tag('tEsp','LIVE','good');
     const n=t.a.filter(x=>x).length;
     tag('tArm',n+'/4 armed',n===4?'good':n?'warn':'bad');
-    t.m.forEach((v,i)=>{$('wP'+i).textContent=v;$('wR'+i).textContent=t.enc[i].r.toFixed(0);});
+    t.a.forEach((armed,i)=>{
+      wheelArmed[i]=armed;
+      const b=$('mArm'+i);b.textContent=armed?'ON':'off';b.classList.toggle('on',armed);
+    });
+    if(t.inv)t.inv.forEach((inv,i)=>{
+      wheelInv[i]=inv;
+      const b=$('mInv'+i);b.textContent=inv?'ON':'off';b.classList.toggle('on',inv);
+    });
+    t.enc.forEach((e,i)=>{$('eC'+i).textContent=e.c;$('eR'+i).textContent=e.r.toFixed(0);});
   }else{
     tag('tEsp','ESP32 OFFLINE','bad');tag('tArm','--','');
   }
@@ -247,7 +406,7 @@ function render(d){
     $('iH').textContent=d.imu.h.toFixed(1);
     $('iR').textContent=d.imu.r==null?'--':d.imu.r.toFixed(1);
     $('iP').textContent=d.imu.p==null?'--':d.imu.p.toFixed(1);
-    (d.imu.cal||[]).forEach((v,i)=>$('cal'+i).style.width=(v/3*100)+'%');
+    (d.imu.cal||[]).forEach((v,i)=>{$('cal'+i).style.width=(v/3*100)+'%';$('calN'+i).textContent=v;});
   }else{
     tag('tImu','offline','warn');$('iH').textContent='--';$('iR').textContent='--';$('iP').textContent='--';
   }

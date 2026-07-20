@@ -10,8 +10,8 @@ Run from pi/:
     .venv/bin/python -m uvicorn webapp.server:app --host 0.0.0.0 --port 80
 or install webapp/car-dashboard.service (see pi/README.md).
 
-Safety: if the browser dies mid-drive, its 0.3 s drive re-sends stop
-arriving and the DevKit's own 500 ms deadman coasts the wheels.
+Safety: if the browser dies mid-drive, its 0.15 s drive re-sends stop
+arriving and the DevKit's own 800 ms deadman coasts the wheels.
 """
 import asyncio
 import sys
@@ -54,6 +54,16 @@ def _forward(path: str, query: str) -> PlainTextResponse:
         return PlainTextResponse(f"esp32 unreachable: {e}", status_code=502)
 
 
+def _forward_json(path: str, body: bytes) -> PlainTextResponse:
+    url = f"http://{ESP32_HOST}{path}"
+    try:
+        r = requests.post(url, data=body,
+                           headers={"Content-Type": "application/json"}, timeout=1.0)
+        return PlainTextResponse(r.text, status_code=r.status_code)
+    except requests.RequestException as e:
+        return PlainTextResponse(f"esp32 unreachable: {e}", status_code=502)
+
+
 @app.post("/api/drive")
 def api_drive(request: Request):
     return _forward("/api/drive", request.url.query)
@@ -74,10 +84,37 @@ def api_estop_clear():
     return _forward("/api/estop/clear", "")
 
 
+# -------------------------------------------------------------- encoders
+@app.post("/api/encoder/reset")
+def api_encoder_reset(request: Request):
+    return _forward("/api/encoder/reset", request.url.query)
+
+
+@app.get("/api/encoder/cpr")
+def api_encoder_cpr_get():
+    try:
+        r = requests.get(f"http://{ESP32_HOST}/api/encoder/cpr", timeout=1.0)
+        return PlainTextResponse(r.text, status_code=r.status_code)
+    except requests.RequestException as e:
+        return PlainTextResponse(f"esp32 unreachable: {e}", status_code=502)
+
+
+@app.post("/api/encoder/cpr")
+async def api_encoder_cpr_post(request: Request):
+    return _forward_json("/api/encoder/cpr", await request.body())
+
+
 # --------------------------------------------------------------- gimbal
 @app.post("/api/gimbal")
 def api_gimbal(pan: float | None = None, tilt: float | None = None):
     if hub.gimbal_set(pan=pan, tilt=tilt):
+        return PlainTextResponse("OK")
+    return PlainTextResponse("gimbal offline", status_code=503)
+
+
+@app.post("/api/gimbal/release")
+def api_gimbal_release():
+    if hub.gimbal_release():
         return PlainTextResponse("OK")
     return PlainTextResponse("gimbal offline", status_code=503)
 

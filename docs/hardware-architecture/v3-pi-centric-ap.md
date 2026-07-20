@@ -1,8 +1,12 @@
-# Hardware Architecture - Pi Centric
+# Hardware Architecture - Pi Centric (v3)
 
-Status: current architecture. Supersedes
-`Hardware Architecture - Pi Integration Phase.md` (its wiring/power
-sections remain valid; its network topology does not).
+Status: **superseded by `v4-home-wifi-current.md`** (2026-07-20). The
+Pi-hosted AP described below was retired — it was the main source of
+flaky bring-up. All three boards now join the home WiFi router directly
+as stations instead. This doc still supersedes
+`v2-pi-integration-phase.md` for wiring/power sections (those remain
+valid); its own network topology below is history only, kept for
+reference.
 
 The Raspberry Pi 4 is now the brain of the car: it hosts the WiFi
 network, serves the main dashboard, owns every sensor, and is where

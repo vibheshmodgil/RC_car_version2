@@ -1,16 +1,22 @@
 # RC Car V2
 
-4WD skid-steer RC car with a three-board, Pi-centric architecture:
+4WD skid-steer RC car with a three-board architecture. All three boards
+join your **home WiFi router** directly — there's no separate car network
+to switch your phone to.
 
-| Board | Role | IP |
+| Board | Role | IP (home WiFi) |
 |---|---|---|
-| Raspberry Pi 4 | brain: WiFi AP, main dashboard, BNO055 IMU, YDLIDAR X2, gimbal | 192.168.4.1 |
-| ESP32 DevKit V1 | motor controller: 4x TB6612FNG + 4 encoders, REST/WS API, e-stop authority, fallback UI | 192.168.4.5 |
-| ESP32-CAM | MJPEG streaming appliance (video goes direct, never proxied) | 192.168.4.10 |
+| Raspberry Pi 4 | brain: main dashboard, BNO055 IMU, YDLIDAR X2, gimbal | 192.168.1.50 |
+| ESP32 DevKit V1 | motor controller: 4x TB6612FNG + 4 encoders, REST/WS API, e-stop authority, fallback UI | 192.168.1.51 |
+| ESP32-CAM | MJPEG streaming appliance (video goes direct, never proxied) | 192.168.1.52 |
 
-Connect a phone to the `RC_Car_TestBench` WiFi and open
-`http://192.168.4.1/` — e-stop, arm, hold-to-drive D-pad, per-wheel
+If your phone or laptop is already on the house WiFi, just open
+`http://192.168.1.50/` — e-stop, arm, hold-to-drive D-pad, per-wheel
 PWM/RPM, IMU, live camera, gimbal and LiDAR on one dark dashboard.
+
+**New to this project or coming back after a break?** Start with
+[`TESTING.md`](TESTING.md) — it walks through powering everything on and
+confirming each piece works, from scratch, assuming no prior context.
 
 ## Where everything goes
 
@@ -18,18 +24,17 @@ This repo holds code for **three physically different devices with three
 different toolchains**. The one thing to get right before touching any
 file is *which board does it run on* — nothing here shares a runtime.
 
-| Folder | Runs on | Toolchain | What belongs here |
-|---|---|---|---|
-| `pi/` | Raspberry Pi 4 | Python 3 (venv) | The dashboard (`webapp/`), every sensor driver (IMU, LiDAR, camera health, gimbal), the ESP32 REST/WS client, smoke tests. Anything that's plain Python and doesn't get flashed onto a chip. |
-| `CarTestBench/` | ESP32 DevKit V1 | Arduino-ESP32 core 3.x (C++, `.ino`) | Motor control (4x TB6612FNG), encoders, the REST/WS API, the fallback web UI, the drive deadman, e-stop. Anything that touches the car's motor/encoder pins. |
-| `CamStreamer/` | ESP32-CAM module | Arduino (C++) | The MJPEG streamer firmware only. Nothing else runs on this board — keep it that way (see "Camera" below). |
-| repo root | — (docs, not code) | Markdown / PDF | Architecture docs, `CLAUDE.md`, `LICENSE`. No device-specific code belongs at the root. |
+| Folder | Runs on | Toolchain | What belongs here | Setup guide |
+|---|---|---|---|---|
+| `pi/` | Raspberry Pi 4 | Python 3 (venv) | The dashboard (`webapp/`), every sensor driver (IMU, LiDAR, camera health, gimbal), the ESP32 REST/WS client, smoke tests. | [`pi/README.md`](pi/README.md) |
+| `CarTestBench/` | ESP32 DevKit V1 | Arduino-ESP32 core 3.x (C++, `.ino`) | Motor control (4x TB6612FNG), encoders, the REST/WS API, the fallback web UI, the drive deadman, e-stop. | [`CarTestBench/README.md`](CarTestBench/README.md) |
+| `CamStreamer/` | ESP32-CAM module | Arduino (C++) | The MJPEG streamer firmware only. Nothing else runs on this board (see "Camera" below). | [`CamStreamer/README.md`](CamStreamer/README.md) |
+| `docs/hardware-architecture/` | — (docs, not code) | Markdown / PDF | Network topology, IP plan, wiring, version history. | [`docs/hardware-architecture/README.md`](docs/hardware-architecture/README.md) |
+| repo root | — (docs, not code) | Markdown | `CLAUDE.md`, `TESTING.md`, `LICENSE`. No device-specific code belongs at the root. | — |
 
-Deploying each one:
-
-- `pi/` → `scp -r pi/ pi@<pi-ip>:~/car/` or `git pull` on the Pi (see `pi/README.md`).
-- `CarTestBench/` → open `CarTestBench/CarTestBench.ino` in Arduino IDE, select an ESP32 DevKit board, flash over USB.
-- `CamStreamer/` → open `CamStreamer/CamStreamer.ino`, board = "AI Thinker ESP32-CAM", GPIO0 strapped to GND to flash.
+If you've never flashed an ESP32 or SSH'd into a Raspberry Pi before,
+each linked README above starts from zero — installing the tools,
+wiring things up, and what "it worked" looks like.
 
 ### Adding a new Pi sensor or feature
 
@@ -57,16 +62,16 @@ the wheel index order (LF/LR/RF/RR) and TB6612 safety rules.
 `CamStreamer/` stays a dedicated MJPEG appliance. Don't add motor
 control, sensors, or anything else to it, and don't route video through
 either of the other two boards — the dashboard's `<img>` tag and the
-Pi's OpenCV capture both pull straight from `http://192.168.4.10:81/stream`.
+Pi's OpenCV capture both pull straight from `http://192.168.1.52:81/stream`.
 
 ## Docs
 
-- `Hardware Architecture - Pi Centric.md` — **current**: topology, IP
-  plan, AP setup, deadman safety, migration order (PDF alongside).
-- `Hardware Architecture - Pi Integration Phase.md` — superseded network
-  topology; still the wiring reference for BNO055/gimbal/power (its
-  LiDAR section was corrected to the real hardware, YDLIDAR X2).
-- `Hardware Architecture - TB6612FNG Rework.md` — motor driver wiring.
+- [`docs/hardware-architecture/`](docs/hardware-architecture/) — start at
+  `v4-home-wifi-current.md`: topology, IP plan, WiFi setup, deadman
+  safety. Older versions (Pi-hosted AP, pre-Pi phases) are kept there for
+  history.
+- [`TESTING.md`](TESTING.md) — end-to-end "does everything actually
+  work" checklist, in order.
 - `CLAUDE.md` — conventions: wheel order LF/LR/RF/RR, pin map,
   API contract, change rules.
 
@@ -74,7 +79,7 @@ Pi's OpenCV capture both pull straight from `http://192.168.4.10:81/stream`.
 
 1. STBY pull-downs keep the H-bridges dead until firmware arms a board.
 2. E-stop latch: `POST /api/estop` from any UI or script.
-3. Firmware drive deadman: wheels coast if drive commands stop for 500 ms.
-4. Clients re-send held commands every 300 ms.
+3. Firmware drive deadman: wheels coast if drive commands stop for 800 ms.
+4. Clients re-send held commands every 150 ms.
 
 First runs: wheels off the ground.

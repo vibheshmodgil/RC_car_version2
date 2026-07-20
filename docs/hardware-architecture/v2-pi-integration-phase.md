@@ -1,10 +1,11 @@
-# Hardware Architecture - Raspberry Pi Integration Phase
+# Hardware Architecture - Raspberry Pi Integration Phase (v2)
 
-Status: **superseded by `Hardware Architecture - Pi Centric.md`** (the Pi
-now hosts the AP at 192.168.4.1 and the main dashboard; the DevKit is a
-station at 192.168.4.5). The BNO055/gimbal/power wiring sections below
-remain valid; the network topology does not, and the LiDAR section below
-has been corrected to the actual hardware (YDLIDAR X2, not RPLidar).
+Status: **superseded — see `v4-home-wifi-current.md`** for the current
+network topology (all three boards on the home WiFi router; there was an
+intermediate `v3-pi-centric-ap.md` phase, also superseded, where the Pi
+hosted its own AP). The BNO055/gimbal/power wiring sections below remain
+valid; the network topology does not, and the LiDAR section below has
+been corrected to the actual hardware (YDLIDAR X2, not RPLidar).
 
 ## System Topology
 

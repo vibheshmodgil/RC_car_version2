@@ -4,24 +4,30 @@ Guidance for Claude Code when working in this repository.
 
 ## Project Overview
 
-Advanced RC Car V2 — **Pi-centric architecture** (see
-`Hardware Architecture - Pi Centric.md`, which supersedes the Pi
-Integration Phase doc):
+Advanced RC Car V2 — **home-WiFi architecture** (see
+`docs/hardware-architecture/v4-home-wifi-current.md`, which supersedes the
+Pi Centric and Pi Integration Phase docs, both archived in the same
+folder). All three boards join the house WiFi router directly as
+stations — there is no more Pi-hosted AP; that was retired 2026-07-20
+because it was the main source of flaky bring-up:
 
-- **Raspberry Pi 4 = brain**: hosts the WiFi AP at 192.168.4.1 (SSID
-  `RC_Car_TestBench`), serves the main dashboard (`pi/webapp`, FastAPI on
+- **Raspberry Pi 4 = brain**: station on the home WiFi router at
+  192.168.1.50, serves the main dashboard (`pi/webapp`, FastAPI on
   port 80, merged telemetry WS), owns BNO055 (I2C, raw smbus2), YDLIDAR X2 (USB, raw serial parser)
   and 2 gimbal servos (GPIO18/19), and forwards control to the DevKit.
 - **ESP32 DevKit = motor controller**: 4 TB6612FNG channels + 4 quadrature
   encoders, REST/WS API (stable contract), its own web UI kept as a debug
-  fallback at 192.168.4.5, e-stop/safety authority, 500 ms drive deadman.
-  Joins the Pi's AP as a station (`WIFI_STATION_MODE` in `config.h`; `0`
-  restores the legacy self-hosted AP).
-- **ESP32-CAM = streaming appliance**: MJPEG at 192.168.4.10:81, untouched
+  fallback at 192.168.1.51, e-stop/safety authority, 800 ms drive deadman.
+  Joins the home WiFi router as a station (`WIFI_STATION_MODE` in
+  `config.h`; `0` restores the legacy self-hosted-AP escape hatch, only
+  needed if the car ever runs away from home WiFi coverage).
+- **ESP32-CAM = streaming appliance**: MJPEG at 192.168.1.52:81, untouched
   by the migration; video is never proxied through the DevKit or the Pi
   for plain viewing.
 
-IP plan: Pi .1, DevKit .5, CAM .10, phones DHCP .100-.200.
+IP plan: home router .1, Pi .50, DevKit .51, CAM .52. All hardcoded static
+IPs on the house WiFi (`Airtel_kuma_9602`) — this car only ever runs at
+home, so phones/laptops never need to switch networks to reach it.
 
 Master MCU: ESP32 DevKit V1, Arduino-ESP32 core 3.x.
 Sketch entry point: `CarTestBench/CarTestBench.ino`.
@@ -141,7 +147,7 @@ Modules are single-purpose and wired together in the `.ino`.
 | `MotorChannel` | One TB6612 channel: arm/disarm, direction, PWM, brake/coast, shared-STBY management, e-stop latch |
 | `EncoderReader` | Four quadrature encoders using `attachInterruptArg`; global singleton `Encoders` |
 | `Imu` | Disabled ESP32-local BNO055 groundwork; sensors are now planned on Pi |
-| `AppServer` | WiFi (station on the Pi's AP, or legacy AP), HTTP pages, REST API, WebSocket telemetry, drive deadman |
+| `AppServer` | WiFi (station on the home WiFi router, or legacy self-hosted AP), HTTP pages, REST API, WebSocket telemetry, drive deadman |
 | `WebUI.h` | All HTML/CSS/JS (fallback UI; the main dashboard lives in `pi/webapp`) |
 | `config.h` | Pins, feature flags, PWM/encoder defaults, WiFi mode + IPs, deadman timeout |
 
@@ -157,12 +163,16 @@ fallback UI and `pi/esp32_link.py` all depend on it. Extend it, never
 break it.
 
 **Drive deadman:** if any wheel has nonzero PWM and no `/api/drive` or
-`/api/motor?...pwm=` command arrives for `DRIVE_DEADMAN_MS` (500 ms), all
+`/api/motor?...pwm=` command arrives for `DRIVE_DEADMAN_MS` (800 ms), all
 wheels coast (still armed) and Serial logs it. Every UI/script that holds
-a nonzero PWM must re-send it every ~300 ms (`DEADMAN_RESEND_S`).
+a nonzero PWM must re-send it every ~150 ms (`DEADMAN_RESEND_S`). These
+were widened/shortened from 500ms/300ms on 2026-07-20 after measuring real
+Pi-to-DevKit WiFi jitter on the home router spiking past 300ms (and 5%
+packet loss) at idle — the original numbers were tripping on ordinary
+jitter, not just genuine link loss, and looked like stuttering motors.
 
 Pages (fallback UI on the DevKit; the Pi serves the main dashboard at
-`http://192.168.4.1/`):
+`http://192.168.1.50/`):
 
 - `/`
 - `/motors`
@@ -212,9 +222,8 @@ Keep DOM IDs, page JavaScript, and these JSON field names in sync.
 
 A second, separate board runs `CamStreamer/CamStreamer.ino` (AI-Thinker
 ESP32-CAM). Architecture rule: **video never passes through the main ESP32**.
-The CAM joins the car AP (now hosted by the Pi — same SSID/PSK, so the CAM
-firmware needed no change) as a station with static IP `CAM_HOST`
-(192.168.4.10) and serves:
+The CAM joins the home WiFi router directly as a station with static IP
+`CAM_HOST` (192.168.1.52) and serves:
 
 - `http://<CAM_HOST>:81/stream` — MJPEG (embedded by the `/camera` page and
   consumable by OpenCV on the Raspberry Pi later).
@@ -230,6 +239,35 @@ them in sync with `config.h` (`AP_SSID`, `AP_PASS`, `CAM_HOST`).
 
 CamStreamer build: board "AI Thinker ESP32-CAM", flashed via a USB-serial
 adapter with GPIO0 strapped to GND. Needs a 5 V >= 2 A supply.
+
+## Pi Integration Status (read before resuming Pi work)
+
+The `pi/` code (config, ESP32 link, camera, IMU, LiDAR, gimbal, smoke
+tests, FastAPI dashboard) is written and merged to `main`, but **it has
+not been confirmed working end-to-end on the real car** — treat it as
+untested until each smoke test in `pi/README.md` has actually been run
+and passed on hardware, not as a finished feature.
+
+**2026-07-20 architecture pivot:** the Pi-hosted WiFi AP (`pi/setup_ap.sh`,
+`RC_Car_TestBench` @ 192.168.4.1) is retired. It was the main source of
+flaky bring-up (see the WiFi-channel debugging thread in
+`pi/RESUME_GUIDE.md`), and the one thing that *did* work reliably was the
+CAM joining the home WiFi directly. All three boards now join the home
+router (`Airtel_kuma_9602`) as stations with static IPs — see
+`docs/hardware-architecture/v4-home-wifi-current.md`. The Pi's WiFi is
+pinned to its static IP with the new `pi/setup_wifi.sh` (replaces
+`setup_ap.sh`). The whole "is the AP up, did the CAM find it" dance is
+gone — every board just needs to join the same WiFi network everything
+else in the house is already on.
+
+Not implemented despite being mentioned in older docs: the VL53L0X ToF
+sensor (still `ENABLE_VL53L0X 0`, no Pi driver). There is no physical
+screen on the car — "the screen" is the phone/browser dashboard in
+`pi/webapp`.
+
+If picking this up after a break, start at `pi/RESUME_GUIDE.md` — it
+covers SSH from scratch, how to find the Pi on the network, and the
+order to re-verify each subsystem in.
 
 ## Change Rules
 

@@ -3,14 +3,15 @@
 //
 //  THIS SKETCH GOES ON THE ESP32-CAM BOARD (AI-Thinker), NOT the DevKit.
 //  The DevKit keeps running CarTestBench/CarTestBench.ino unchanged roles:
-//  motors + encoders + AP. This board joins that AP as a station with a
-//  static IP and serves the video itself — the DevKit never touches video.
+//  motors + encoders. This board joins the home WiFi router as a station
+//  with a static IP and serves the video itself — the DevKit never
+//  touches video.
 //
-//  Endpoints (from a phone/Pi on the RC_Car_TestBench WiFi):
-//      http://192.168.4.10:81/stream    MJPEG live stream (used by /camera page)
-//      http://192.168.4.10/capture      single JPEG snapshot
-//      http://192.168.4.10/control?var=framesize|quality|vflip|hmirror&val=n
-//      http://192.168.4.10/             tiny status page
+//  Endpoints (from a phone/Pi on the home WiFi):
+//      http://192.168.1.52:81/stream    MJPEG live stream (used by /camera page)
+//      http://192.168.1.52/capture      single JPEG snapshot
+//      http://192.168.1.52/control?var=framesize|quality|vflip|hmirror&val=n
+//      http://192.168.1.52/             tiny status page
 //
 //  Build/flash (Arduino IDE):
 //    * Board: "AI Thinker ESP32-CAM"  (or "ESP32 Dev Module" + PSRAM enabled
@@ -30,10 +31,10 @@
 #include "esp_http_server.h"
 
 // ---- Must match CarTestBench/config.h ----
-static const char* AP_SSID = "RC_Car_TestBench";
-static const char* AP_PASS = "carbench123";
-static const IPAddress CAM_IP(192, 168, 4, 10);   // = CAM_HOST
-static const IPAddress GATEWAY(192, 168, 4, 1);   // DevKit softAP address
+static const char* AP_SSID = "Airtel_kuma_9602";
+static const char* AP_PASS = "air71417";
+static const IPAddress CAM_IP(192, 168, 1, 52);   // = CAM_HOST
+static const IPAddress GATEWAY(192, 168, 1, 1);   // home WiFi router
 static const IPAddress SUBNET(255, 255, 255, 0);
 
 // ---- AI-Thinker ESP32-CAM pin map (OV2640) ----
@@ -71,7 +72,7 @@ static esp_err_t index_handler(httpd_req_t* req) {
         "<h2>RC Car CamStreamer</h2>"
         "<p><a style='color:#4d8dff' href=':81/stream'>MJPEG stream (port 81)</a> &middot; "
         "<a style='color:#4d8dff' href='/capture'>snapshot</a></p>"
-        "<p>Open the test bench page at http://192.168.4.1/camera for the full UI.</p>"
+        "<p>Open the test bench page at http://192.168.1.50/camera for the full UI.</p>"
         "</body></html>";
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);

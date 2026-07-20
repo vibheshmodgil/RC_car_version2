@@ -36,7 +36,7 @@ class Hub:
         # Optional Pi-side devices (import inside the lambda so a missing
         # library only takes out that one device).
         self.imu = _try_open("IMU (BNO055)", lambda: __import__("imu").Imu())
-        self.gimbal = _try_open("Gimbal (pigpio)", lambda: __import__("gimbal").Gimbal())
+        self.gimbal = _try_open("Gimbal (lgpio)", lambda: __import__("gimbal").Gimbal())
         self.gimbal_pos = {"pan": 90.0, "tilt": 90.0}
         if self.gimbal:
             self.gimbal.center()
@@ -73,6 +73,12 @@ class Hub:
         if tilt is not None:
             self.gimbal.tilt(float(tilt))
             self.gimbal_pos["tilt"] = float(tilt)
+        return True
+
+    def gimbal_release(self) -> bool:
+        if not self.gimbal:
+            return False
+        self.gimbal.release()
         return True
 
     # ------------------------------------------------------------- LiDAR

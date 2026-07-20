@@ -234,7 +234,7 @@ function drive(k,v){document.getElementById(k+'Lbl').textContent=v;post('/api/mo
 setInterval(()=>{M.forEach(({k})=>{
   const v=parseInt(document.getElementById(k+'Slide').value);
   if(v)post('/api/motor?ch='+k+'&pwm='+v);
-});},300);
+});},150);
 function quick(k,v){document.getElementById(k+'Slide').value=v;drive(k,v);}
 function mode(k,m){resetSlider(k);post('/api/motor?ch='+k+'&mode='+m);}
 function toggleArm(k){post('/api/motor?ch='+k+'&arm='+(armed[k]?0:1));resetSlider(k);}

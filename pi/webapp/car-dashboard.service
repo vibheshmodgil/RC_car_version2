@@ -7,7 +7,7 @@
 
 [Unit]
 Description=RC Car dashboard (FastAPI/uvicorn)
-After=network-online.target pigpiod.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]

@@ -1,13 +1,14 @@
 """Single source of truth for the Pi-side constants — the config.h of the Pi.
 
 Network values must match CarTestBench/config.h (AP_SSID/STA_STATIC_IP/
-CAM_HOST) and the IP plan in 'Hardware Architecture - Pi Centric.md'.
+CAM_HOST) and the IP plan in
+'docs/hardware-architecture/v4-home-wifi-current.md'.
 """
 
-# ---- Network (car AP: RC_Car_TestBench, hosted by THIS Pi at .1) ----
-# IP plan: Pi .1 (AP + dashboard), DevKit .5, CAM .10, phones DHCP .100+.
-ESP32_HOST = "192.168.4.5"          # DevKit: REST control + WS telemetry
-CAM_HOST = "192.168.4.10"           # ESP32-CAM
+# ---- Network (all three boards are stations on the home WiFi router) ----
+# IP plan: home router .1, Pi .50 (dashboard), DevKit .51, CAM .52.
+ESP32_HOST = "192.168.1.51"         # DevKit: REST control + WS telemetry
+CAM_HOST = "192.168.1.52"           # ESP32-CAM
 CAM_STREAM_URL = f"http://{CAM_HOST}:81/stream"
 CAM_CAPTURE_URL = f"http://{CAM_HOST}/capture"
 CAM_STATUS_URL = f"http://{CAM_HOST}/status"
@@ -20,7 +21,7 @@ LIDAR_BAUD = 115200
 IMU_I2C_BUS = 1                     # /dev/i2c-1 (SDA1/SCL1, pins 3/5)
 IMU_I2C_ADDR = 0x28                 # ADR pin low/open
 
-# ---- Gimbal servos (Pi hardware PWM via pigpio) ----
+# ---- Gimbal servos (Pi hardware PWM via lgpio) ----
 GIMBAL_PAN_GPIO = 18                # physical pin 12
 GIMBAL_TILT_GPIO = 19               # physical pin 35
 # Conservative pulse limits; widen toward 500-2500 us only after checking
@@ -29,7 +30,7 @@ SERVO_MIN_US = 1000
 SERVO_MAX_US = 2000
 
 # ---- Safety ----
-DEADMAN_RESEND_S = 0.3              # re-send drive command at least this often
+DEADMAN_RESEND_S = 0.15             # re-send drive command at least this often
 TELEMETRY_STALE_S = 0.5             # telemetry older than this = link unhealthy
 
 # ---- Pi dashboard (pi/webapp) ----
