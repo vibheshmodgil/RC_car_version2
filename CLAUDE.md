@@ -24,6 +24,12 @@ because it was the main source of flaky bring-up:
 - **ESP32-CAM = streaming appliance**: MJPEG at 192.168.1.52:81, untouched
   by the migration; video is never proxied through the DevKit or the Pi
   for plain viewing.
+- **ROS2 bridge (optional, Pi-side, new)**: `ros2_ws/src/car_bridge` — a
+  ROS2 node that translates `cmd_vel`/e-stop/IMU/LiDAR to and from the
+  same REST/WS API and Pi sensor drivers everything else already uses.
+  Does not change the DevKit or CAM firmware. See
+  `docs/hardware-architecture/v5-ros2-bridge.md` (also a from-zero ROS2
+  primer) — written but not yet run on real hardware.
 
 IP plan: home router .1, Pi .50, DevKit .51, CAM .52. All hardcoded static
 IPs on the house WiFi (`Airtel_kuma_9602`) — this car only ever runs at
@@ -268,6 +274,34 @@ screen on the car — "the screen" is the phone/browser dashboard in
 If picking this up after a break, start at `pi/RESUME_GUIDE.md` — it
 covers SSH from scratch, how to find the Pi on the network, and the
 order to re-verify each subsystem in.
+
+## ROS2 Bridge (optional, Pi-side)
+
+Layers on top of everything above — does not change the DevKit/CAM
+firmware or the REST/WS contract, which stays exactly as documented
+above. `ros2_ws/src/car_bridge` is a single ROS2 node
+(`car_bridge/bridge_node.py`) that imports `pi/esp32_link.py`,
+`pi/imu.py`, `pi/lidar.py` directly (same modules `pi/webapp/hub.py`
+already uses) rather than duplicating their logic.
+
+Requires the Pi to be reimaged to **Ubuntu Server 24.04 (arm64)**
+running **ROS2 Jazzy** — Raspberry Pi OS Bookworm has no official ROS2
+Jazzy packages. Full rationale, exact reimage/install steps, and a
+from-zero ROS2 explanation live in
+`docs/hardware-architecture/v5-ros2-bridge.md`.
+
+| Name | Type | Direction | Notes |
+|---|---|---|---|
+| `cmd_vel` | `geometry_msgs/Twist` | subscribe | mixed into per-wheel PWM via `/api/motor`; re-sent every 0.1 s, zeroed if stale > 0.5 s |
+| `imu/data` | `sensor_msgs/Imu` | publish | orientation only, from the BNO055 |
+| `scan` | `sensor_msgs/LaserScan` | publish | from the YDLIDAR X2, 1° bins |
+| `estop` / `estop_clear` | `std_srvs/Trigger` | service | call `/api/estop` / `/api/estop/clear` |
+
+**Status: written, not yet run on real hardware.** Same "code exists,
+unproven on the car" caveat as the rest of `pi/` per
+`pi/RESUME_GUIDE.md`. The bridge never arms wheels itself — arm via
+the existing dashboard or DevKit UI first, same safety model as
+always.
 
 ## Change Rules
 

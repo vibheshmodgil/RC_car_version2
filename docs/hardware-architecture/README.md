@@ -2,10 +2,13 @@
 
 Read **`v4-home-wifi-current.md`** first — it's the current network
 architecture and the only one that matches the wiring/firmware in this
-repo today.
+repo today. **`v5-ros2-bridge.md`** is additive, not a replacement —
+read it once you want ROS2 on top of the v4 architecture (new, not yet
+verified on hardware).
 
 | File | Status |
 |---|---|
+| `v5-ros2-bridge.md` | **New, additive.** Optional ROS2 bridge node on the Pi; layers on top of v4, doesn't change it. Not yet run on hardware. |
 | `v4-home-wifi-current.md` | **Current.** All boards on home WiFi. |
 | `v3-pi-centric-ap.md` | Superseded 2026-07-20. Pi hosted its own WiFi AP. |
 | `v2-pi-integration-phase.md` | Superseded. Still has valid BNO055/gimbal/power wiring notes. |

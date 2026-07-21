@@ -21,6 +21,7 @@ sensor wiring and power sizing are still in
 | `main.py` | orchestrator skeleton (status loop + safety) | `.ino` |
 | `webapp/` | FastAPI dashboard: main car UI on port 80 | `WebUI.h` |
 | `setup_wifi.sh` | pins the Pi's WiFi to its static home-WiFi IP | — |
+| `../ros2_ws/` | optional ROS2 bridge node (`car_bridge`) — reuses this folder's modules | — |
 
 ## Step 0 — what SSH is, and how to get a terminal on the Pi
 
@@ -58,23 +59,35 @@ default, and it often just works without knowing the IP at all).
 
 ## One-time Pi setup
 
+**2026-07-21: the Pi's OS is Ubuntu Server 24.04 LTS (arm64)**, not
+Raspberry Pi OS — reimaged so ROS2 Jazzy's official packages install
+cleanly (see
+[`../docs/hardware-architecture/v5-ros2-bridge.md`](../docs/hardware-architecture/v5-ros2-bridge.md)
+for the why and the exact reimage steps, including the NetworkManager
+fix `setup_wifi.sh` below needs on Ubuntu Server). Everything in this
+file otherwise works the same as it did on Raspberry Pi OS Bookworm —
+only these package names below changed.
+
 Do this once, over SSH:
 
 ```bash
 sudo apt update
-sudo apt install -y python3-pip python3-venv python3-opencv python3-lgpio python3-smbus i2c-tools
-sudo raspi-config nonint do_i2c 0        # enable I2C
+sudo apt install -y python3-pip python3-venv python3-opencv python3-smbus i2c-tools
+pip install --break-system-packages lgpio    # not in Ubuntu's apt; pip has it
 
+# Enable I2C — Ubuntu has no raspi-config, so this is a direct config.txt edit:
+echo 'dtparam=i2c_arm=on' | sudo tee -a /boot/firmware/config.txt
 # BNO055 clock-stretch workaround:
 echo 'dtparam=i2c_arm_baudrate=10000' | sudo tee -a /boot/firmware/config.txt
+sudo usermod -aG i2c,dialout,gpio $USER      # re-login after this
 sudo reboot
 ```
 
 (Older guides for this project say `python3-pigpio`/`pigpiod` — that
 package was dropped from Raspberry Pi OS's apt repo as unmaintained
-starting with Bookworm/Trixie. The gimbal code now uses `lgpio`, the
-actively-maintained successor from the same author, which needs no
-background daemon.)
+starting with Bookworm/Trixie, and isn't in Ubuntu's either. The
+gimbal code uses `lgpio`, the actively-maintained successor from the
+same author, which needs no background daemon.)
 
 Then create the venv (system-site-packages so apt's opencv/pigpio are visible):
 
@@ -100,6 +113,13 @@ This replaces the Pi's connection with a static IP (192.168.1.50) on the
 home router `Airtel_kuma_9602`. Unlike the old AP setup this project used
 to use, the Pi keeps normal internet access the whole time — no more
 switching networks to get updates.
+
+`setup_wifi.sh` uses `nmcli` (NetworkManager). On the current Ubuntu
+Server 24.04 image this needs one extra one-time step first — Ubuntu
+Server's default network stack is netplan + systemd-networkd, not
+NetworkManager — see the "Networking fix" step in
+[`v5-ros2-bridge.md`](../docs/hardware-architecture/v5-ros2-bridge.md#reimage-steps).
+Once that's done, `setup_wifi.sh` itself needs no changes.
 
 ## Deploying code to the Pi
 
@@ -164,6 +184,38 @@ unit file if yours differ. The ESP32's own UI stays available at
 - Wrap driving code so exceptions call `link.estop()` and normal exit calls
   `link.stop()` — `main.py` shows the pattern.
 - Wheels off the ground for first runs, same as the phone UI workflow.
+
+## ROS2 bridge (optional)
+
+`ros2_ws/src/car_bridge` is an optional ROS2 node that sits next to
+this dashboard and reuses `esp32_link.py`/`imu.py`/`lidar.py` unchanged
+— it does not replace anything above. Needs ROS2 Jazzy installed (see
+[`../docs/hardware-architecture/v5-ros2-bridge.md`](../docs/hardware-architecture/v5-ros2-bridge.md)
+for install steps and a from-zero ROS2 explanation if you've never
+used it). Once ROS2 Jazzy is installed:
+
+```bash
+cd ~/car/ros2_ws
+source /opt/ros/jazzy/setup.bash
+colcon build --symlink-install
+source install/setup.bash
+ros2 launch car_bridge bridge_launch.py
+```
+
+Arm the wheels first via this dashboard or the DevKit UI — the bridge
+never arms anything itself. From another machine on the home WiFi
+(ROS2 auto-discovers it, no config needed):
+
+```bash
+ros2 topic echo /imu/data     # BNO055 orientation
+ros2 topic echo /scan         # YDLIDAR X2 scan
+ros2 run teleop_twist_keyboard teleop_twist_keyboard   # drive via keyboard
+rviz2                         # visualize imu/data + scan
+```
+
+**Status: written, not yet run on real hardware** — same caveat as
+everything else in this file until its own smoke test has actually
+passed on the car.
 
 ## If you get stuck / coming back after a break
 

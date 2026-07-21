@@ -31,6 +31,16 @@ break. It assumes zero memory of SSH, the Pi, or what was already tried.
   `CarTestBench/config.h`) — no Pi driver exists for it. There is also
   **no physical screen** on the car; "the screen" is the phone/browser
   dashboard served by `pi/webapp`.
+- **2026-07-21: ROS2 bridge added, also unproven on hardware.** The Pi
+  is being reimaged again — Raspberry Pi OS Bookworm -> Ubuntu Server
+  24.04 LTS — so ROS2 Jazzy's official packages install cleanly. New
+  optional node `ros2_ws/src/car_bridge` reuses `esp32_link.py`/
+  `imu.py`/`lidar.py` unchanged; it does not touch the DevKit/CAM
+  firmware or the dashboard. Full explanation (written for zero ROS
+  experience) and exact reimage/install steps are in
+  `../docs/hardware-architecture/v5-ros2-bridge.md`. Same rule as
+  everything above: code written and merged is not the same as proven
+  on the actual car.
 
 ## Step 0 — SSH and first boot, explained from zero
 
@@ -111,6 +121,15 @@ yours or a future session's — doesn't start from zero again.
 
 ## Progress log
 
+- **2026-07-21 — ROS2 bridge (`car_bridge`) added.** Reimaging the Pi
+  to Ubuntu Server 24.04 (from Raspberry Pi OS Bookworm) to get
+  official ROS2 Jazzy packages — see
+  `../docs/hardware-architecture/v5-ros2-bridge.md`. The new node is
+  written and reuses `esp32_link.py`/`imu.py`/`lidar.py` as-is, but has
+  not been built or run on the real Pi/car yet. Next session: redo the
+  reimage + `pi/README.md` one-time setup on Ubuntu Server, then
+  `colcon build` and walk the verification steps in the v5 doc before
+  trusting any of it.
 - **2026-07-20 — architecture pivot to home WiFi.** Retired the
   Pi-hosted AP (`pi/setup_ap.sh`, `RC_Car_TestBench` @ 192.168.4.1) after
   repeated flaky bring-up (see the channel-debugging entries below, which
