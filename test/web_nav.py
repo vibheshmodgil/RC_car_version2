@@ -1,0 +1,4144 @@
+"""
+Nav — drive, LiDAR and IMU on one page. The full cockpit.
+
+    cd ~/Desktop/Speaker_truck && source .venv/bin/activate
+    python test/web_nav.py
+
+Then open  http://<pi-ip>:5004  and click the page once for keyboard focus.
+
+*** WHEELS OFF THE GROUND until the drivers are replaced. The TB6612s cannot
+*** survive a stall on these motors (JGB37-520 stalls at 4-5 A, TB6612 peaks
+*** at 3.2 A). WIRING.md section 8.
+
+This supersedes web_pilot.py — same drive and LiDAR, plus orientation.
+
+Ports: web_dashboard 5000, web_drive 5001, lidar_view 5002, web_pilot 5003,
+this 5004. Only ONE of the GPIO-owning pages runs at a time; they claim the
+same pins.
+
+What the IMU adds beyond a pretty dial
+--------------------------------------
+  Heading      A north marker on the LiDAR ring. The scan is drawn in the
+               robot's own frame, so without this you cannot tell which way
+               the robot is actually pointing in the room.
+  Attitude     Roll and pitch, with a tilt warning. A skid-steer robot on a
+               ramp loses traction long before it tips.
+  Slip check   Differential drive says yaw rate = (v_right - v_left) / track.
+               The gyro measures yaw rate directly. When the two disagree,
+               the wheels are slipping and the encoder odometry is lying.
+               That is a thing only having both sensors can tell you.
+
+Every part degrades on its own: no IMU still gives drive + LiDAR, no LiDAR
+still gives drive + IMU. Nothing here refuses to start because a sensor is
+missing — it says so on the page instead.
+
+Needs:  sudo apt install -y python3-serial i2c-tools python3-smbus2
+"""
+
+import argparse
+import json
+import math
+import os
+import socket
+import struct
+import sys
+import threading
+import time
+from collections import deque
+
+# Absolute path, so the script works no matter which directory it is
+# launched from. __file__.rsplit("/") breaks when run as `python x.py`
+# from inside test/, because there is then no "/" to split on.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from pins import (  # noqa: E402
+    LEFT_ENC_A, LEFT_ENC_B, RIGHT_ENC_A, RIGHT_ENC_B,
+    LEFT_PWM, LEFT_IN1, LEFT_IN2,
+    RIGHT_PWM, RIGHT_IN1, RIGHT_IN2,
+    STBY, PWM_HZ, MAX_DUTY, COUNTS_PER_REV,
+    IMU_YAW_OFFSET, IMU_ROLL_OFFSET, IMU_PITCH_OFFSET,
+    TRUCK_LENGTH_MM, TRUCK_WIDTH_MM, TRACK_WIDTH_MM, WHEEL_DIAM_MM,
+    LIDAR_OFFSET_X, LIDAR_OFFSET_Y, LIDAR_YAW_OFFSET, SAFETY_MARGIN_MM,
+    CREEP_MARGIN_MM, CREEP_THROTTLE,
+    CAM_SIZE, CAM_FPS, CAM_HFLIP, CAM_VFLIP, CAM_HFOV, CAM_YAW_OFFSET,
+    CAM_HEIGHT_MM, CAM_PITCH_DEG, MARKER_SIZE_MM,
+    CAM_OFFSET_X, CAM_OFFSET_Y, IMU_OFFSET_X, IMU_OFFSET_Y, CAM_ROTATION,
+)
+
+import tuning  # noqa: E402
+from slam import Slam  # noqa: E402
+from explore import Explorer  # noqa: E402
+from gpiozero import DigitalOutputDevice, PWMOutputDevice, RotaryEncoder  # noqa: E402
+from flask import (  # noqa: E402
+    Flask, Response, jsonify, render_template_string, request,
+)
+
+try:
+    import serial
+    import serial.tools.list_ports as list_ports
+except ImportError:
+    serial = None
+    list_ports = None
+
+HTTP_PORT = 5004
+LIDAR_BAUD = 115200
+WATCHDOG_S = 0.6
+RATED_RPM = 330
+
+GUARD_STOP_MM = 350
+GUARD_SECTOR_DEG = 50
+
+TRUCK_LEN_MM = TRUCK_LENGTH_MM      # geometry now lives in pins.py
+
+TILT_WARN_DEG = 20        # a skid-steer loses traction well before it tips
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+INVERT_FILE = os.path.join(_HERE, "drive_invert.json")
+MAP_FILE = os.path.join(_HERE, "house_map.json")
+PLACES_FILE = os.path.join(_HERE, "places.json")
+LIDAR_CAL_FILE = os.path.join(_HERE, "lidar_cal.json")
+
+
+class LidarCal:
+    """Where the scanner is bolted on, adjustable while running.
+
+    These are mounting facts, and mounting facts are discovered by looking at
+    the plot and nudging a number - not by editing a constant, restarting, and
+    trying to remember what the last value looked like. pins.py holds the
+    defaults; whatever is tuned here is saved and wins on the next start.
+    """
+
+    def __init__(self):
+        self.yaw = LIDAR_YAW_OFFSET
+        self.x = LIDAR_OFFSET_X
+        self.y = LIDAR_OFFSET_Y
+        self.load()
+
+    def load(self):
+        try:
+            with open(LIDAR_CAL_FILE) as f:
+                d = json.load(f)
+            self.yaw = float(d.get("yaw", self.yaw))
+            self.x = float(d.get("x", self.x))
+            self.y = float(d.get("y", self.y))
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def save(self):
+        try:
+            tmp = LIDAR_CAL_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"yaw": self.yaw, "x": self.x, "y": self.y}, f, indent=2)
+            os.replace(tmp, LIDAR_CAL_FILE)
+        except OSError:
+            pass
+
+    def set(self, yaw=None, x=None, y=None):
+        if yaw is not None:
+            self.yaw = ((float(yaw) + 180) % 360) - 180
+        if x is not None:
+            self.x = max(-600.0, min(600.0, float(x)))
+        if y is not None:
+            self.y = max(-600.0, min(600.0, float(y)))
+        self.save()
+        # SLAM keeps its own copy for the grid and the matcher; without this
+        # the guard would use the new value while the map kept using the old.
+        if slam is not None:
+            off = (self.x, self.y, self.yaw)
+            slam.slam.grid.lidar_off = off
+            slam.slam.matcher.off = off
+
+    @property
+    def as_dict(self):
+        return {"yaw": round(self.yaw, 1), "x": round(self.x, 1),
+                "y": round(self.y, 1)}
+
+
+lidar_cal = None
+INVERT_KEYS = ("left", "right", "swap")
+LIKELY_USB = ("cp210", "ch340", "ch9102", "silicon labs", "usb-serial", "ftdi")
+
+
+def load_places():
+    """Named coordinates: {"kitchen": [x, y], ...}.
+
+    This is what turns a map into somewhere you can send the robot. Naming a
+    spot you have driven to is deliberately manual — auto-detecting rooms is a
+    much harder problem and buys nothing until the basics work.
+    """
+    try:
+        with open(PLACES_FILE) as f:
+            d = json.load(f)
+        return {str(k): [float(v[0]), float(v[1])] for k, v in d.items()}
+    except (OSError, ValueError, TypeError, KeyError, IndexError):
+        return {}
+
+
+def save_places(d):
+    try:
+        tmp = PLACES_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, PLACES_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def load_invert():
+    try:
+        with open(INVERT_FILE) as f:
+            d = json.load(f)
+        return {k: bool(d.get(k, False)) for k in INVERT_KEYS}
+    except (OSError, ValueError, TypeError):
+        return {k: False for k in INVERT_KEYS}
+
+
+def save_invert(d):
+    try:
+        with open(INVERT_FILE, "w") as f:
+            json.dump(d, f)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Motors
+# ---------------------------------------------------------------------------
+
+class Side:
+    """One TB6612 channel pair.
+
+        IN1=H IN2=L -> forward      IN1=L IN2=H -> reverse
+        IN1=L IN2=L -> coast        IN1=H IN2=H -> brake
+    """
+
+    def __init__(self, name, in1, in2, pwm_pin):
+        self.name = name
+        # initial_value=False writes the safe level before the pin is driven.
+        self.in1 = DigitalOutputDevice(in1, initial_value=False)
+        self.in2 = DigitalOutputDevice(in2, initial_value=False)
+        self.pwm = PWMOutputDevice(pwm_pin, initial_value=0, frequency=PWM_HZ)
+        self._speed = 0.0
+
+    def drive(self, speed):
+        speed = max(-1.0, min(1.0, speed))
+        duty = min(abs(speed), MAX_DUTY)
+        self._speed = speed
+        if speed > 0:
+            self.in1.on();  self.in2.off()
+        elif speed < 0:
+            self.in1.off(); self.in2.on()
+        else:
+            self.in1.off(); self.in2.off()
+            duty = 0
+        self.pwm.value = duty
+
+    def brake(self):
+        self.in1.on(); self.in2.on()
+        self.pwm.value = 1.0
+        self._speed = 0.0
+
+    def coast(self):
+        self.in1.off(); self.in2.off()
+        self.pwm.value = 0
+        self._speed = 0.0
+
+    def close(self):
+        self.coast()
+        self.in1.close(); self.in2.close(); self.pwm.close()
+
+
+class Robot:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._enabled = False
+        self.invert = load_invert()
+        self.limit = MAX_DUTY
+
+        self.stby = DigitalOutputDevice(STBY, initial_value=False)
+        self.left = Side("LEFT", LEFT_IN1, LEFT_IN2, LEFT_PWM)
+        self.right = Side("RIGHT", RIGHT_IN1, RIGHT_IN2, RIGHT_PWM)
+
+        self.enc_left = RotaryEncoder(LEFT_ENC_A, LEFT_ENC_B, max_steps=0)
+        self.enc_right = RotaryEncoder(RIGHT_ENC_A, RIGHT_ENC_B, max_steps=0)
+        self._last_l = self._last_r = 0
+        self._last_t = time.monotonic()
+        self._rpm_l = self._rpm_r = 0.0
+
+        self._last_cmd = time.monotonic()
+        self._tripped = False
+
+        threading.Thread(target=self._rpm_loop, daemon=True).start()
+        threading.Thread(target=self._watchdog_loop, daemon=True).start()
+
+    def enable(self):
+        with self._lock:
+            self.stby.on()
+            self._enabled = True
+        self._tripped = False
+
+    def estop(self):
+        with self._lock:
+            self.stby.off()
+            self._enabled = False
+            self.left.coast()
+            self.right.coast()
+
+    def stop(self):
+        with self._lock:
+            self.left.brake()
+            self.right.brake()
+            time.sleep(0.1)
+            self.left.coast()
+            self.right.coast()
+
+    def drive(self, throttle, steer):
+        throttle = max(-1.0, min(1.0, float(throttle)))
+        steer = max(-1.0, min(1.0, float(steer)))
+        left, right = throttle + steer, throttle - steer
+        # Scale the pair together rather than clipping, so a turn keeps its
+        # shape at speed instead of straightening out.
+        peak = max(1.0, abs(left), abs(right))
+        left, right = left / peak * self.limit, right / peak * self.limit
+        if self.invert["swap"]:
+            left, right = right, left
+        if self.invert["left"]:
+            left = -left
+        if self.invert["right"]:
+            right = -right
+        self._last_cmd = time.monotonic()
+        with self._lock:
+            self.left.drive(left)
+            self.right.drive(right)
+
+    def set_invert(self, changes):
+        for k in INVERT_KEYS:
+            if k in changes:
+                self.invert[k] = bool(changes[k])
+        save_invert(self.invert)
+
+    def set_limit(self, v):
+        self.limit = max(0.05, min(MAX_DUTY, float(v)))
+
+    def reset_encoders(self):
+        self.enc_left.steps = 0
+        self.enc_right.steps = 0
+
+    def _rpm_loop(self):
+        while True:
+            time.sleep(0.2)
+            now = time.monotonic()
+            dt = now - self._last_t
+            l, r = self.enc_left.steps, self.enc_right.steps
+            if dt > 0 and COUNTS_PER_REV > 0:
+                self._rpm_l = ((l - self._last_l) / COUNTS_PER_REV) / dt * 60.0
+                self._rpm_r = ((r - self._last_r) / COUNTS_PER_REV) / dt * 60.0
+            self._last_l, self._last_r, self._last_t = l, r, now
+
+    def _moving(self):
+        return self.left._speed != 0.0 or self.right._speed != 0.0
+
+    def _watchdog_loop(self):
+        while True:
+            time.sleep(0.1)
+            if not self._moving():
+                continue
+            if time.monotonic() - self._last_cmd > WATCHDOG_S:
+                print(f"  watchdog: no command for {WATCHDOG_S}s — stopping")
+                self.drive(0, 0)
+                self.stop()
+                self._tripped = True
+
+    def encoder_yaw_rate(self):
+        """Yaw rate the wheels claim, deg/s.
+
+        Differential drive: omega = (v_right - v_left) / track_width.
+        Compared against the gyro, a mismatch means the wheels are slipping.
+        """
+        circ_mm = math.pi * WHEEL_DIAM_MM
+        v_l = self._rpm_l / 60.0 * circ_mm          # mm/s
+        v_r = self._rpm_r / 60.0 * circ_mm
+        if TRACK_WIDTH_MM <= 0:
+            return 0.0
+        return math.degrees((v_r - v_l) / TRACK_WIDTH_MM)
+
+    @property
+    def state(self):
+        return {
+            "enabled": self._enabled,
+            "tripped": self._tripped,
+            "invert": self.invert,
+            "limit": round(self.limit, 3),
+            "max_duty": MAX_DUTY,
+            "left_speed": round(self.left._speed, 3),
+            "right_speed": round(self.right._speed, 3),
+            "left_rpm": round(self._rpm_l, 1),
+            "right_rpm": round(self._rpm_r, 1),
+            "enc_yaw_rate": round(self.encoder_yaw_rate(), 1),
+            "rated_rpm": RATED_RPM,
+        }
+
+    def close(self):
+        self.stop()
+        self.estop()
+        self.left.close()
+        self.right.close()
+        self.stby.close()
+
+
+# ---------------------------------------------------------------------------
+# LiDAR  (protocol verified against the device — see lidar_view.py)
+# ---------------------------------------------------------------------------
+
+def autodetect_lidar():
+    if list_ports is None:
+        return None
+    ports = list(list_ports.comports())
+    for p in ports:
+        if any(k in (p.description or "").lower() for k in LIKELY_USB):
+            return p.device
+    # Never fall back to /dev/ttyAMA0 or /dev/ttyS0 — a Pi always has
+    # those built-in UARTs with nothing attached, and picking one means
+    # the viewer sits silent forever. A USB scanner always has a VID.
+    usb = [p for p in ports if p.vid is not None]
+    return usb[0].device if usb else None
+
+
+def angle_correction(d):
+    return 0.0 if d <= 0 else math.degrees(
+        math.atan(21.8 * (155.3 - d) / (155.3 * d)))
+
+
+def cluster_points(points, max_gap_mm=180, max_ang_gap=8.0, min_pts=3, limit=14):
+    """Neighbouring rays become one object; a jump in range ends the group."""
+    if not points:
+        return []
+    pts = sorted(points)
+    groups, cur = [], [pts[0]]
+    for prev, p in zip(pts, pts[1:]):
+        if (p[0] - prev[0]) > max_ang_gap or abs(p[1] - prev[1]) > max_gap_mm:
+            groups.append(cur)
+            cur = []
+        cur.append(p)
+    groups.append(cur)
+    if len(groups) > 1:
+        first, last = groups[0], groups[-1]
+        if (first[0][0] + 360 - last[-1][0]) <= max_ang_gap and \
+                abs(first[0][1] - last[-1][1]) <= max_gap_mm:
+            groups[0] = last + first
+            groups.pop()
+    out = []
+    for g in groups:
+        if len(g) < min_pts:
+            continue
+        angs = [a for a, _ in g]
+        dists = [d for _, d in g]
+        if max(angs) - min(angs) > 180:
+            angs = [a + 360 if a < 180 else a for a in angs]
+        span = max(angs) - min(angs)
+        mean_d = sum(dists) / len(dists)
+        out.append({
+            "bearing": round((sum(angs) / len(angs)) % 360, 1),
+            "start": round(min(angs) % 360, 1),
+            "span": round(span, 1),
+            "near": round(min(dists)),
+            "width": round(2 * mean_d * math.sin(math.radians(span) / 2)),
+            "points": len(g),
+        })
+    out.sort(key=lambda c: c["near"])
+    return out[:limit]
+
+
+class Lidar:
+    def __init__(self, port, baud=LIDAR_BAUD):
+        self.port, self.baud = port, baud
+        self.buf = bytearray()
+        self._lock = threading.Lock()
+        self._current, self._scan = [], []
+        self._last_angle = None
+        self._rev_times = deque(maxlen=20)
+        self._scan_time = 0.0
+        self.packets = self.bad = 0
+        self.connected = False
+        self.error = "" if port else "no serial port found"
+        if port and serial:
+            threading.Thread(target=self._run, daemon=True).start()
+        elif not serial:
+            self.error = "pyserial not installed"
+
+    def _run(self):
+        while True:
+            try:
+                with serial.Serial(self.port, self.baud, timeout=0.2) as ser:
+                    self.connected, self.error = True, ""
+                    ser.reset_input_buffer()
+                    while True:
+                        chunk = ser.read(4096)
+                        if chunk:
+                            self.buf += chunk
+                            self._consume()
+                        elif len(self.buf) > 65536:
+                            self.buf.clear()
+            except serial.SerialException as e:
+                self.connected, self.error = False, str(e)
+                time.sleep(1.5)
+
+    def _consume(self):
+        while True:
+            idx = self.buf.find(b"\xAA\x55")
+            if idx < 0:
+                if len(self.buf) > 2:
+                    del self.buf[:-1]
+                return
+            if idx:
+                del self.buf[:idx]
+            if len(self.buf) < 10:
+                return
+            ct, lsn = self.buf[2], self.buf[3]
+            need = 10 + lsn * 2
+            if len(self.buf) < need:
+                return
+            fsa, lsa, cs = struct.unpack("<HHH", self.buf[4:10])
+            samples = struct.unpack(f"<{lsn}H", self.buf[10:need])
+            chk = 0x55AA ^ (ct | (lsn << 8)) ^ fsa ^ lsa
+            for v in samples:
+                chk ^= v
+            if chk != cs:
+                self.bad += 1
+                del self.buf[:2]
+                continue
+            self.packets += 1
+            self._emit(fsa, lsa, samples)
+            del self.buf[:need]
+
+    def _emit(self, fsa, lsa, samples):
+        a0, a1 = (fsa >> 1) / 64.0, (lsa >> 1) / 64.0
+        span = (a1 - a0) % 360.0
+        n = len(samples)
+        pts = []
+        for i, raw in enumerate(samples):
+            d = raw / 4.0
+            if d <= 0:
+                continue
+            a = (a0 + span * (i / (n - 1) if n > 1 else 0.0)) % 360.0
+            pts.append((round((a + angle_correction(d)) % 360.0, 1), round(d)))
+        with self._lock:
+            for a, d in pts:
+                # Revolution boundary: the angle stepped backwards past 360.
+                #
+                # The point count guard matters. angle_correction can nudge a
+                # reading near 0 deg back to ~359, and the next point at 1 deg
+                # then looks like a wrap. That splits one revolution into two,
+                # producing a TRUNCATED scan and a bogus rate (measured up to
+                # 16 Hz on a scanner that physically turns at 11). A real
+                # revolution always carries far more than 30 points.
+                if (self._last_angle is not None and a < self._last_angle - 180
+                        and len(self._current) > 30):
+                    self._scan, self._current = self._current, []
+                    self._rev_times.append(time.monotonic())
+                    self._scan_time = time.monotonic()
+                self._last_angle = a
+                self._current.append((a, d))
+
+    def hz(self):
+        if len(self._rev_times) < 2:
+            return 0.0
+        s = self._rev_times[-1] - self._rev_times[0]
+        return (len(self._rev_times) - 1) / s if s > 0 else 0.0
+
+    def fresh(self, max_age=1.0):
+        return self._scan_time > 0 and (time.monotonic() - self._scan_time) < max_age
+
+    def scan(self):
+        with self._lock:
+            return list(self._scan)
+
+    @staticmethod
+    def sector_min(points, centre, half):
+        best = None
+        for a, d in points:
+            if abs((a - centre + 180) % 360 - 180) <= half and (best is None or d < best):
+                best = d
+        return best
+
+
+# ---------------------------------------------------------------------------
+# IMU — polled in its own thread so fusion gets an even timestep
+# ---------------------------------------------------------------------------
+
+class ImuReader:
+    def __init__(self, hz=50):
+        self.dev = None
+        self.data = None
+        self.error = ""
+        self.name = ""
+        self._hz = hz
+        try:
+            from imu import IMU
+            self.dev = IMU()
+            self.name = self.dev.name
+            threading.Thread(target=self._run, daemon=True).start()
+        except Exception as e:                                # noqa: BLE001
+            self.error = str(e)
+
+    def _run(self):
+        period = 1.0 / self._hz
+        while True:
+            try:
+                self.data = self.dev.read()
+                self.error = ""
+            except OSError as e:
+                self.error = str(e)                # a wobbly wire, keep trying
+            time.sleep(period)
+
+    @property
+    def state(self):
+        if self.dev is None:
+            return {"present": False, "error": self.error or "not detected"}
+        d = self.data
+        if d is None:
+            return {"present": True, "name": self.name, "ready": False,
+                    "error": self.error}
+        return {
+            "present": True, "ready": True, "name": self.name,
+            "error": self.error,
+            "yaw": round((d["yaw"] + IMU_YAW_OFFSET) % 360.0, 1),
+            # Mount offsets removed so these describe the BODY, not the board.
+            "roll": round(d["roll"] - IMU_ROLL_OFFSET, 2),
+            "pitch": round(d["pitch"] - IMU_PITCH_OFFSET, 2),
+            "raw_roll": d["roll"], "raw_pitch": d["pitch"],
+            "gyro": d["gyro"], "accel": d["accel"], "mag": d.get("mag"),
+            "temp": d.get("temp"),
+            "heading_ok": d.get("heading_ok", False),
+            "fused": d.get("fused", False),
+            "calib": d.get("calib"),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Camera — CSI, streamed straight off the hardware JPEG encoder
+# ---------------------------------------------------------------------------
+
+class CameraReader:
+    """Opens the CSI camera, or explains on the page why it could not.
+
+    Same contract as ImuReader: a missing camera must never stop the cockpit
+    starting. Losing video is an inconvenience; losing the drive controls and
+    the collision guard because a ribbon came loose is not.
+
+    There is no polling thread here, unlike the IMU. Picamera2 already runs
+    its own capture thread and pushes finished JPEGs at us, so a loop on this
+    side would only be busy-waiting on work that is already done.
+    """
+
+    CAPTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "captures")
+
+    def __init__(self):
+        self.cam = None
+        self.error = ""
+        self.name = ""
+        self.last_still = ""
+        self.auto_mm = 0.0            # 0 = off; else mm between auto stills
+        self._last_auto = None
+        self._lock = threading.Lock()
+        self.captures = self._read_index()
+        try:
+            from camera import Camera
+            self.cam = Camera(size=CAM_SIZE, fps=CAM_FPS,
+                              hflip=CAM_HFLIP, vflip=CAM_VFLIP)
+            self.name = self.cam.name
+        except Exception as e:                                # noqa: BLE001
+            self.error = str(e)
+
+    def stream(self):
+        from camera import mjpeg_stream
+        return mjpeg_stream(self.cam)
+
+    def frame(self):
+        return self.cam.frame() if self.cam else None
+
+    INDEX = "index.json"
+
+    def snap(self, pose=None, why="manual"):
+        """Save the current view, and WHERE the robot was when it saw it.
+
+        The pose is the point. A folder of photos of a house tells you very
+        little; the same photos pinned to the spots on the map they were
+        taken from turn the occupancy grid — which is only ever grey, white
+        and black — into something a person can actually read. When the map
+        comes out wrong, "what was it looking at here" becomes a question
+        with an answer.
+        """
+        if self.cam is None:
+            return None
+        os.makedirs(self.CAPTURE_DIR, exist_ok=True)
+        name = time.strftime("cam-%Y%m%d-%H%M%S.jpg")
+        path = os.path.join(self.CAPTURE_DIR, name)
+        if self.cam.still(path) is None:
+            return None
+        self.last_still = name
+        entry = {"file": name, "t": time.time(), "why": why}
+        if pose is not None:
+            entry.update(x=round(pose.x), y=round(pose.y),
+                         th=round(math.degrees(pose.th), 1))
+        with self._lock:
+            self.captures.append(entry)
+            self._write_index()
+        return path
+
+    def _write_index(self):
+        """The index is rewritten whole on every capture. It is a few hundred
+        entries of a few fields; appending would save nothing and would leave
+        a truncated file unreadable after a power cut mid-write."""
+        tmp = os.path.join(self.CAPTURE_DIR, self.INDEX + ".tmp")
+        try:
+            with open(tmp, "w") as f:
+                json.dump({"version": 1, "captures": self.captures[-500:]}, f)
+            os.replace(tmp, os.path.join(self.CAPTURE_DIR, self.INDEX))
+        except OSError as e:
+            self.error = str(e)
+
+    def _read_index(self):
+        try:
+            with open(os.path.join(self.CAPTURE_DIR, self.INDEX)) as f:
+                return json.load(f).get("captures", [])
+        except (OSError, ValueError):
+            return []
+
+    def auto(self, pose):
+        """Take a still if the robot has moved far enough since the last one.
+
+        Distance-gated, not time-gated. A robot parked for ten minutes should
+        not fill the card with the same picture, and one crossing a room
+        quickly should still leave a trail of them.
+        """
+        if not self.auto_mm or self.cam is None or pose is None:
+            return None
+        last = self._last_auto
+        if last is not None and math.hypot(pose.x - last[0],
+                                           pose.y - last[1]) < self.auto_mm:
+            return None
+        self._last_auto = (pose.x, pose.y)
+        return self.snap(pose, why="auto")
+
+    @property
+    def state(self):
+        if self.cam is None:
+            return {"present": False, "error": self.error or "not detected",
+                    "hfov": CAM_HFOV, "yaw": CAM_YAW_OFFSET}
+        d = dict(self.cam.state)
+        d["hfov"] = CAM_HFOV
+        d["yaw"] = CAM_YAW_OFFSET
+        d["last_still"] = self.last_still
+        return d
+
+    def close(self):
+        if self.cam:
+            self.cam.close()
+
+
+class SlamRunner:
+    """Runs SLAM in its own thread, paced independently of the web poll.
+
+    Encoder SIGN is the thing to check first if the map comes out mirrored or
+    the robot appears to drive backwards through its own map. Direction
+    inversion (drive_invert.json) fixes which way the MOTOR turns; it says
+    nothing about which way the ENCODER counts. Push the robot forward by
+    hand and watch the counts in /snapshot — both must increase. If one
+    decreases, flip its sign below.
+    """
+    # Measured on the robot 2026-09-06 by driving a verified-forward burst
+    # and reading the count deltas: left +291, right -267.
+    ENC_SIGN_LEFT = 1
+    ENC_SIGN_RIGHT = -1
+
+    # 5 Hz, not 10. A scan-match costs ~96 ms on a Pi 4, so a 10 Hz loop
+    # has no headroom. At walking pace 5 Hz still gives an update every
+    # ~100 mm, which is finer than the 40 mm mapping gate needs.
+    def __init__(self, robot, lidar, imu, hz=5):
+        self.robot, self.lidar, self.imu = robot, lidar, imu
+        self.slam = Slam(COUNTS_PER_REV, WHEEL_DIAM_MM, TRACK_WIDTH_MM)
+        self.enabled = True
+        self.ms = 0.0
+        self._hz = hz
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        period = 1.0 / self._hz
+        while True:
+            time.sleep(period)
+            if not self.enabled:
+                continue
+            try:
+                pts = self.lidar.scan()
+                st = self.imu.state
+                # Use the IMU's heading whenever it is reading at all —
+                # NOT only when the magnetometer has a fix.
+                #
+                # SLAM references heading to yaw0 at startup, so it only ever
+                # consumes the CHANGE in heading. The magnetometer fixes
+                # absolute north, which nothing here uses. Without a fix the
+                # BNO055 still fuses gyro and gravity, which drifts a degree
+                # or two per minute and is completely immune to wheel slip.
+                #
+                # The alternative, falling back to (dr-dl)/track, is the worst
+                # source available on a skid-steer: it slips on every turn by
+                # design. Measured effect of getting this wrong: walls smeared
+                # into arcs instead of straight lines.
+                yaw = st.get("yaw") if st.get("ready") else None
+                t0 = time.perf_counter()
+                self.slam.update(self.ENC_SIGN_LEFT * self.robot.enc_left.steps,
+                                 self.ENC_SIGN_RIGHT * self.robot.enc_right.steps,
+                                 yaw, pts)
+                self.ms = (time.perf_counter() - t0) * 1000.0
+                # Photo trail. Here rather than in the control loop because
+                # this is where a freshly corrected pose exists — a still
+                # tagged with a pose from before the scan match is pinned to
+                # the wrong place on the map, which is the whole value gone.
+                if camera is not None:
+                    camera.auto(self.slam.pose)
+            except Exception as e:                            # noqa: BLE001
+                print(f"  slam: {e}")
+
+    def apply_fix(self, x, y, gain):
+        """Absolute position fix from a marker. Goes through here rather than
+        straight at Slam so there is one writer to the pose per thread and the
+        cockpit has one place to count fixes."""
+        return self.slam.apply_fix(x, y, gain)
+
+    @property
+    def state(self):
+        d = dict(self.slam.state)
+        d["enabled"] = self.enabled
+        d["ms"] = round(self.ms, 1)
+        d["counts"] = [self.robot.enc_left.steps, self.robot.enc_right.steps]
+        return d
+
+
+HALF_L = TRUCK_LENGTH_MM / 2.0
+HALF_W = TRUCK_WIDTH_MM / 2.0
+CORNER_R = math.hypot(HALF_L, HALF_W)        # circumscribing radius
+
+
+def set_cam_rotation(deg):
+    """Rotate the DISPLAYED picture by a quarter turn. Browser-side only.
+
+    Deliberately not done in the camera. Rotating there would mean tearing
+    the pipeline down and reconfiguring it on every change - a second of
+    dropped video, and a real chance of leaving the camera shut if the
+    reconfigure fails - to achieve something CSS does for free and instantly.
+    And 90/270 are not expressible as an ISP transform anyway: libcamera has
+    flips, not a transpose.
+
+    *** The consequence, which the page states rather than hiding: ***
+    the floor check reads the RAW frame. It assumes the bottom row is the
+    nearest floor, and rotating the display does not change what it reads. So
+    on a camera that is physically not upright, the floor check is measuring
+    the wrong direction and should be turned off - or the mount corrected
+    with CAM_HFLIP/CAM_VFLIP in pins.py, which the ISP does apply, at the
+    cost of a restart.
+
+    Marker detection is genuinely unaffected: a square is a square at any
+    rotation and ArUco does not care.
+
+    OBJECT detection is not, and an earlier version of this comment wrongly
+    said it was. YOLO has never seen an upside-down living room and finds
+    almost nothing in one - silently, while the picture on screen looks
+    perfectly normal. detect.py therefore turns the frame to match this
+    setting before inference and maps the boxes back afterwards.
+    """
+    global CAM_ROTATION
+    CAM_ROTATION = int(round(int(deg) / 90.0)) * 90 % 360
+    return CAM_ROTATION
+
+
+def set_truck(length=None, width=None):
+    """Resize the vehicle footprint, live.
+
+    The footprint is not cosmetic. It decides three separate things, and they
+    have to move together or they start disagreeing about where the robot
+    ends:
+
+      1. What the plot draws, so you can size the box against the returns the
+         scanner gets off the robot's own chassis.
+      2. Which returns are DISCARDED as being the chassis - here for the
+         guard, and in slam.SELF_L/SELF_W for the map. Too big and real
+         obstacles vanish; too small and the robot paints a permanent blob
+         around itself and believes it is boxed in wherever it stands.
+      3. The region swept_obstacle() checks, including CORNER_R - a skid-steer
+         turns about its centre and its widest point is a corner, not the nose.
+
+    Derived values are recomputed rather than left to go stale: HALF_L, HALF_W
+    and CORNER_R are read inside the 50 Hz guard loop, so they are cached
+    rather than computed per call.
+    """
+    global TRUCK_LENGTH_MM, TRUCK_WIDTH_MM, TRUCK_LEN_MM
+    global HALF_L, HALF_W, CORNER_R
+    if length is not None:
+        TRUCK_LENGTH_MM = float(length)
+    if width is not None:
+        TRUCK_WIDTH_MM = float(width)
+    TRUCK_LEN_MM = TRUCK_LENGTH_MM
+    HALF_L = TRUCK_LENGTH_MM / 2.0
+    HALF_W = TRUCK_WIDTH_MM / 2.0
+    CORNER_R = math.hypot(HALF_L, HALF_W)
+
+    # The mapper keeps its own copy of the half-extents, and the explorer was
+    # handed the geometry as a dict at construction. Both are updated here so
+    # there is exactly one place that knows the footprint changed.
+    import slam as _slam
+    _slam.SELF_L, _slam.SELF_W = HALF_L, HALF_W
+    if explorer is not None and getattr(explorer, "geom", None):
+        explorer.geom["len"] = TRUCK_LENGTH_MM
+        explorer.geom["wid"] = TRUCK_WIDTH_MM
+    # The body-frame cache keys on the scan, not the geometry, so a stale
+    # entry would keep the old footprint filter for one more scan.
+    _bp_cache["key"] = None
+    return TRUCK_LENGTH_MM, TRUCK_WIDTH_MM
+
+
+_bp_cache = {"key": None, "val": []}
+
+
+def body_points(points):
+    """Scan returns in the BODY frame, corner-mounted scanner accounted for."""
+    out = []
+    cal = lidar_cal
+    yaw = cal.yaw if cal else LIDAR_YAW_OFFSET
+    ox = cal.x if cal else LIDAR_OFFSET_X
+    oy = cal.y if cal else LIDAR_OFFSET_Y
+
+    # The same scan gets transformed by the control loop at 50 Hz, the survey
+    # at 3 Hz and the explorer - roughly 250 points of trigonometry each time,
+    # for an answer that only changes when a new scan arrives (~11 Hz).
+    key = (id(points), len(points), yaw, ox, oy)
+    if _bp_cache["key"] == key:
+        return _bp_cache["val"]
+    ry = math.radians(yaw)
+    c0, s0 = math.cos(ry), math.sin(ry)
+    for a, d in points:
+        if d < 120:                      # inside the chassis, spurious
+            continue
+        r = math.radians(a)
+        x, y = d * math.cos(r), -d * math.sin(r)
+        if yaw:
+            x, y = x * c0 - y * s0, x * s0 + y * c0
+        x, y = x + ox, y + oy
+        # The scanner sits on a corner and sees the robot's own chassis.
+        # Those returns are not obstacles, and leaving them in pins the guard
+        # permanently - measured 40 of 251 returns inside the footprint.
+        if abs(x) <= HALF_L and abs(y) <= HALF_W:
+            continue
+        out.append((x, y))
+    return out
+
+
+def swept_obstacle(bpts, throttle, steer, stop_mm):
+    """Nearest return inside the region this command would sweep through.
+
+    A single "distance ahead" number is wrong for a body 400 mm wide with the
+    scanner at one corner: an obstacle off the far shoulder is invisible to a
+    narrow cone, and one beside the scanner reads close while being nowhere
+    near the path. So the test is geometric.
+
+      driving straight  a rectangle the FULL WIDTH of the truck plus margin,
+                        extending stop_mm beyond the leading edge
+      turning on spot   an annulus out to the circumscribing radius, because
+                        a skid-steer sweeps its corners through a circle and
+                        the widest point is a corner, not the nose
+
+    Returns (distance, description) or (None, "") when clear.
+    """
+    m = SAFETY_MARGIN_MM
+    worst = None
+    if abs(throttle) > 0.01:
+        ahead = throttle > 0
+        near = HALF_L if ahead else -HALF_L
+        far = near + (stop_mm + m) * (1 if ahead else -1)
+        lo, hi = (near, far) if ahead else (far, near)
+        for x, y in bpts:
+            if lo <= x <= hi and abs(y) <= HALF_W + m:
+                d = (x - HALF_L) if ahead else (-HALF_L - x)
+                if worst is None or d < worst:
+                    worst = d
+        if worst is not None:
+            return max(0.0, worst), ("ahead" if ahead else "behind")
+    elif abs(steer) > 0.01:
+        # Turning in place: the corners sweep a circle of radius CORNER_R.
+        #
+        # Half margin here, deliberately. Driving needs clearance for braking
+        # distance — momentum carries the truck FORWARD past where it decided
+        # to stop. Rotating does not: momentum carries a corner around the
+        # same circle, so the swept radius is unchanged and the margin only
+        # has to cover sensor noise and pose error. Using the full driving
+        # margin boxes the robot in against a wall it could physically turn
+        # away from, which is how it ends up stuck with only reverse.
+        m = SAFETY_MARGIN_MM * 0.5
+        for x, y in bpts:
+            r = math.hypot(x, y)
+            if r <= CORNER_R + m:
+                d = r - CORNER_R
+                if worst is None or d < worst:
+                    worst = d
+        if worst is not None:
+            return max(0.0, worst), "in the turning circle"
+    return None, ""
+
+
+class Guard:
+    """Footprint-aware collision guard.
+
+    Blocks whichever direction is obstructed, and ONLY that one — so there is
+    always a way out. Reverse stays available when the front is blocked, and
+    turning is judged against the turning circle rather than the nose.
+
+    With the guard on and no fresh scan, motion is refused rather than
+    allowed. A guard that silently stops guarding when its sensor dies is
+    worse than no guard; the page says exactly why.
+    """
+
+    def __init__(self):
+        self.enabled = True
+        self.stop_mm = GUARD_STOP_MM
+        self.blocked = False
+        self.reason = ""
+        self.creeping = False
+        self.clear = {}
+
+    def survey(self, lidar):
+        """Clearance in each direction, for display."""
+        if not lidar.fresh():
+            self.clear = {}
+            return
+        b = body_points(lidar.scan())
+        out = {}
+        for name, th, st in (("fwd", 1, 0), ("rev", -1, 0), ("turn", 0, 1)):
+            d, _ = swept_obstacle(b, th, st, self.stop_mm)
+            out[name] = None if d is None else round(d)
+        self.clear = out
+
+    def apply(self, throttle, steer, lidar):
+        self.blocked, self.reason = False, ""
+        if not self.enabled or (throttle == 0 and steer == 0):
+            return throttle, steer
+        if not lidar.fresh():
+            self.blocked, self.reason = True, "no fresh LiDAR scan"
+            return 0.0, 0.0
+
+        # The camera's veto, checked BEFORE the LiDAR's and only against
+        # forward motion.
+        #
+        # It has to come first because it is the one hazard the scanner
+        # cannot see at all: a stair edge returns nothing to a horizontal
+        # beam, so the LiDAR check below would pass it as clear floor and the
+        # robot would drive off the top step at full confidence.
+        #
+        # Forward only, and no creep. The creep escape exists so the robot can
+        # wriggle out of furniture rather than wait for a human — but creeping
+        # forward over a drop is the exact move it must never make. Reverse
+        # and rotation stay available, which is always enough to leave.
+        if cliff is not None and cliff.enabled and cliff.blocked and throttle > 0:
+            self.blocked = True
+            self.creeping = False
+            self.reason = "camera: " + cliff.reason
+            return 0.0, steer
+
+        b = body_points(lidar.scan())
+        d, where = swept_obstacle(b, throttle, steer, self.stop_mm)
+        if d is None or d >= self.stop_mm:
+            self.creeping = False
+            return throttle, steer
+
+        self.blocked = True
+        self.reason = f"{d:.0f} mm {where}"
+
+        # Kill only the blocked component. Driving into something still leaves
+        # turning available, so it can rotate away.
+        if abs(throttle) > 0.01:
+            alt_t, alt_s = 0.0, steer
+        else:
+            alt_t, alt_s = 0.0, 0.0
+
+        # Escape hatch. If the requested move is blocked AND everything else
+        # is too, allow a slow creep in the requested direction provided there
+        # is still CREEP_MARGIN_MM of room. Without this the robot wedges
+        # itself against furniture and has to be lifted out by hand — which is
+        # exactly what happened on the first three house runs.
+        others = []
+        for th_, st_ in ((1, 0), (-1, 0), (0, 1)):
+            dd, _ = swept_obstacle(b, th_, st_, self.stop_mm)
+            others.append(dd is None or dd >= self.stop_mm)
+        if not any(others) and d > CREEP_MARGIN_MM:
+            self.creeping = True
+            self.reason += " — creeping out"
+            return throttle * CREEP_THROTTLE, steer * CREEP_THROTTLE
+        self.creeping = False
+        return alt_t, alt_s
+
+
+class Intent:
+    """What the operator (or the explorer) last asked for.
+
+    Motor commands used to be applied inside the HTTP handler, which meant
+    every keypress waited on a guard evaluation - body_points over ~250
+    returns plus three swept_obstacle sweeps - AND on the GIL, which the SLAM
+    thread can hold for hundreds of milliseconds at a time. That is the lag:
+    it is worst exactly when SLAM is busiest.
+
+    Now the handler only records intent and returns, and a dedicated thread
+    applies it at a steady 50 Hz. Command latency stops depending on how busy
+    the mapper is.
+    """
+
+    def __init__(self):
+        self.throttle = 0.0
+        self.steer = 0.0
+        self.ts = 0.0
+        self.source = "idle"
+        self.lock = threading.Lock()
+
+    def set(self, throttle, steer, source="manual"):
+        with self.lock:
+            self.throttle = max(-1.0, min(1.0, float(throttle or 0)))
+            self.steer = max(-1.0, min(1.0, float(steer or 0)))
+            self.ts = time.monotonic()
+            self.source = source
+
+    def get(self):
+        with self.lock:
+            return self.throttle, self.steer, self.ts, self.source
+
+
+def control_loop():
+    """Apply the latest intent at a fixed rate, with the guard in this thread."""
+    period = 1.0 / 50.0
+    last_applied = None
+    while True:
+        time.sleep(period)
+        if robot is None:
+            continue
+        th, st, ts, _ = intent.get()
+        if time.monotonic() - ts > WATCHDOG_S:
+            th = st = 0.0                       # deadman: intent went stale
+        try:
+            th, st = guard.apply(th, st, lidar)
+        except Exception:                                     # noqa: BLE001
+            th = st = 0.0
+        # Only touch the GPIO when something actually changed. Rewriting the
+        # same PWM value 50 times a second is pure contention.
+        cur = (round(th, 3), round(st, 3))
+        if cur != last_applied:
+            robot.drive(th, st)
+            last_applied = cur
+        elif th or st:
+            robot._last_cmd = time.monotonic()  # keep Robot's own watchdog fed
+
+
+app = Flask(__name__)
+robot = lidar = imu = slam = explorer = camera = None
+markers = cliff = detector = None
+intent = Intent()
+guard = Guard()
+from calibrate import PushMeasure  # noqa: E402
+pusher = PushMeasure()
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Speaker Truck — Nav</title>
+<style>
+/* ---------------------------------------------------------------------------
+   Layout system
+   ---------------------------------------------------------------------------
+   Three levels, and nothing else, so a new panel has an obvious home:
+
+     .topbar    sticky. State you must never have to scroll to find, and the
+                e-stop. Always on screen, on every tab.
+     .tabs      one per job you might be doing. Only one panel is in the
+                document flow at a time.
+     .work      inside a tab: one big viewport plus a rail of readouts.
+                Collapses to a single column on a phone.
+
+   The old page was ten cards in a vertical stack, which meant scrolling to
+   find anything and never seeing two related numbers together.
+--------------------------------------------------------------------------- */
+:root{
+  color-scheme: dark;
+  --bg:#0d1117; --surface-1:#161b22; --surface-2:#1c2430; --border:#2a323d;
+  --text-1:#fff; --text-2:#a9b4c0; --text-3:#6e7b8a; --grid:#242d3a;
+  --series-1:#3987e5; --series-2:#d95926;
+  --point:#3987e5; --obj:#199e70; --imu:#9085e9; --cam:#2bb3c0;
+  --good:#3fb950; --warning:#d29922; --critical:#f85149;
+  --sky:#1d3a57; --ground:#3d2d1c;
+  --rail: 330px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif;
+     background:var(--bg);color:var(--text-1);-webkit-font-smoothing:antialiased;
+     padding:0 0 40px}
+.wrap{max-width:1680px;margin:0 auto;padding:0 18px}
+.mono{font-family:ui-monospace,"SF Mono",Consolas,monospace}
+.num{font-variant-numeric:tabular-nums}
+
+/* --- sticky top bar ------------------------------------------------------ */
+.topbar{position:sticky;top:0;z-index:40;background:color-mix(in srgb,var(--bg) 92%,transparent);
+        backdrop-filter:blur(9px);border-bottom:1px solid var(--border)}
+.topbar .wrap{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding-top:10px;
+              padding-bottom:10px}
+.brand{font-size:.78rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+       white-space:nowrap}
+.brand span{color:var(--text-3);font-weight:400}
+.spacer{flex:1}
+.livepose{font-size:.68rem;color:var(--text-2);white-space:nowrap;
+          font-family:ui-monospace,monospace;font-variant-numeric:tabular-nums}
+.livepose b{color:var(--text-1);font-weight:600}
+.speedbox{display:flex;align-items:center;gap:8px;min-width:190px}
+.speedbox label{font-size:.62rem;color:var(--text-3);letter-spacing:.07em;
+                text-transform:uppercase;font-weight:650;white-space:nowrap}
+.speedbox input[type=range]{flex:1;min-width:80px}
+.badge{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:99px;
+       font-size:.66rem;font-weight:700;letter-spacing:.05em;border:1px solid;white-space:nowrap}
+.badge .dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+.badge.on{color:var(--good);border-color:color-mix(in srgb,var(--good) 45%,transparent);
+          background:color-mix(in srgb,var(--good) 12%,transparent)}
+.badge.off{color:var(--critical);border-color:color-mix(in srgb,var(--critical) 45%,transparent);
+           background:color-mix(in srgb,var(--critical) 12%,transparent)}
+.badge.warn{color:var(--warning);border-color:color-mix(in srgb,var(--warning) 45%,transparent);
+            background:color-mix(in srgb,var(--warning) 12%,transparent)}
+.btns{display:flex;gap:7px;flex-wrap:wrap}
+
+/* --- tab strip ----------------------------------------------------------- */
+.tabs{position:sticky;top:var(--tabtop,52px);z-index:39;background:var(--bg);
+      border-bottom:1px solid var(--border)}
+.tabs .wrap{display:flex;gap:2px;overflow-x:auto;scrollbar-width:none}
+.tabs .wrap::-webkit-scrollbar{display:none}
+.tab{padding:11px 17px;border:none;border-bottom:2px solid transparent;background:none;
+     color:var(--text-3);font-size:.75rem;font-weight:650;letter-spacing:.05em;
+     cursor:pointer;white-space:nowrap;border-radius:0;transition:color .12s}
+.tab:hover{color:var(--text-2);filter:none}
+.tab.on{color:var(--text-1);border-bottom-color:var(--series-1)}
+.tab .pip{display:inline-block;width:6px;height:6px;border-radius:50%;margin-left:7px;
+          background:var(--critical);vertical-align:middle;opacity:0}
+.tab .pip.show{opacity:1}
+
+/* --- tab panels and the work grid ---------------------------------------- */
+.tabpanel{display:none;padding-top:16px}
+.tabpanel.on{display:block}
+.work{display:grid;grid-template-columns:minmax(0,1fr) var(--rail);gap:14px;
+      align-items:start}
+.work.even{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+.work.narrow{--rail:290px}
+@media(max-width:1000px){.work,.work.even{grid-template-columns:1fr}}
+.stack{display:flex;flex-direction:column;gap:14px}
+.cols2{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;
+       align-items:start}
+
+/* --- cards --------------------------------------------------------------- */
+.card{background:var(--surface-1);border:1px solid var(--border);border-radius:12px;padding:15px}
+.card.pad0{padding:11px}
+.card h2{font-size:.64rem;text-transform:uppercase;letter-spacing:.1em;
+         color:var(--text-3);font-weight:650;margin-bottom:10px;
+         display:flex;align-items:baseline;gap:7px;flex-wrap:wrap}
+.card h2 .mono{text-transform:none;letter-spacing:0;color:var(--text-2);font-weight:600}
+.card h2 .hint{margin-left:auto;font-size:.6rem;color:var(--text-3);font-weight:400;
+               text-transform:none;letter-spacing:0}
+
+/* --- buttons ------------------------------------------------------------- */
+button{padding:8px 14px;border:1px solid var(--border);border-radius:7px;font-size:.74rem;
+       font-weight:650;letter-spacing:.03em;cursor:pointer;background:var(--surface-2);
+       color:var(--text-1);transition:filter .12s,transform .06s}
+button:hover{filter:brightness(1.25)}
+button:active{transform:translateY(1px)}
+.b-enable{background:color-mix(in srgb,var(--good) 20%,var(--surface-2));
+          border-color:color-mix(in srgb,var(--good) 40%,transparent);color:var(--good)}
+.b-stop{background:color-mix(in srgb,var(--warning) 18%,var(--surface-2));
+        border-color:color-mix(in srgb,var(--warning) 40%,transparent);color:var(--warning)}
+.b-estop{background:var(--critical);border-color:var(--critical);color:#fff}
+.tog{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:9px}
+.tog button{flex:1;min-width:84px;font-size:.7rem;padding:8px 6px}
+.tog button.on{background:color-mix(in srgb,var(--warning) 22%,var(--surface-2));
+               border-color:color-mix(in srgb,var(--warning) 55%,transparent);color:var(--warning)}
+.tog button.g-on{background:color-mix(in srgb,var(--good) 20%,var(--surface-2));
+                 border-color:color-mix(in srgb,var(--good) 45%,transparent);color:var(--good)}
+
+/* --- viewports ----------------------------------------------------------- */
+/* The page itself does not scroll.
+   On a desktop the whole tab is sized to the viewport: the topbar and tab
+   strip are fixed-height, the work area takes the rest, and each COLUMN
+   scrolls on its own if it has to. Before this the plot alone was taller than
+   the screen, so the controls that change it sat below the fold - you had to
+   scroll away from the picture to adjust it, which is exactly backwards.
+   Below 1000px this unwinds to an ordinary scrolling page, because on a phone
+   a locked viewport just makes everything cramped. */
+@media(min-width:1001px){
+  html,body{height:100%}
+  body{display:flex;flex-direction:column;overflow:hidden}
+  .topbar,.tabs{flex:none}
+  /* width:100% is load-bearing. .wrap carries `margin:0 auto`, and an auto
+     CROSS-AXIS margin on a flex item cancels the default stretch - so this
+     shrink-wrapped to its content and the whole cockpit rendered 629px wide
+     in a 2304px window. Stating the width restores it; max-width and the
+     auto margins still centre it. */
+  .content{width:100%;flex:1;min-height:0;display:flex;flex-direction:column;
+           overflow:hidden;padding-bottom:10px}
+  .tabpanel.on{flex:1;min-height:0;display:flex;flex-direction:column}
+  /* stretch, not the `align-items:start` the grid carries by default: the
+     plot card has to be as tall as the row for its .view to have any height
+     to inherit. With start, .view measured 0 and the canvas never drew. */
+  .tabpanel.on > .work{flex:1;min-height:0;align-items:stretch}
+  .work > .card,.work > .stack{max-height:100%;overflow-y:auto;
+                               scrollbar-width:thin}
+  .work > .card.pad0{height:100%;display:flex;flex-direction:column;
+                     overflow:hidden}
+  #tab-tune{overflow-y:auto}
+}
+.view{position:relative;flex:1;min-height:0}
+/* Without the viewport lock there is no flex height to inherit, so the box
+   states its own shape and the canvas fills it. */
+@media(max-width:1000px){.view{aspect-ratio:1;width:100%}}
+/* Fit the viewport, not the column.
+   A square canvas at width:100% in a 1150 px column is 1150 px TALL, so the
+   plot ran off the bottom of the screen and its own controls sat below the
+   fold - you had to scroll past the picture to reach the sliders that change
+   it, which is the whole problem this layout exists to solve. Sizing by the
+   smaller of the column and the free viewport height keeps it square AND on
+   screen. */
+/* NEVER size these with width:auto or height:auto.
+   A canvas with an auto dimension takes it from the width/height ATTRIBUTE,
+   and draw() sets that attribute from clientWidth every frame. The two feed
+   each other: the canvas grows by devicePixelRatio 25 times a second, and the
+   page locks up within seconds. It looks exactly like the robot being slow.
+   Both dimensions must therefore be stated, or derived from aspect-ratio.
+
+   Non-square is fine - draw() and drawMap() both work from Math.min(w,h), so
+   the drawing simply centres in whichever dimension is larger. */
+/* The canvas is positioned ABSOLUTELY inside .view, and that is the whole
+   trick. A canvas whose width or height resolves to `auto` takes that
+   dimension from its width/height ATTRIBUTE - which draw() rewrites from
+   clientWidth every frame. The two feed each other and the canvas grows by
+   devicePixelRatio 25 times a second until the browser dies.
+
+   `height:100%` is not safe either: .view is a flex item, so its height is
+   indefinite, and a percentage against an indefinite height falls back to
+   auto - the same loop by a longer road. That is exactly how this bug came
+   back after the first fix.
+
+   Absolute positioning takes both dimensions from the containing block,
+   which is always definite once laid out. Nothing reads the attribute, so
+   there is no path back to the loop. */
+canvas#plot,canvas#map{position:absolute;left:0;top:0;
+                       width:100%;height:100%;display:block}
+canvas#plot{cursor:grab;touch-action:none}
+canvas#plot.drag{cursor:grabbing}
+canvas#map{image-rendering:pixelated;background:var(--surface-2);border-radius:8px}
+.viewbar{display:flex;gap:7px;flex-wrap:wrap;align-items:center;margin-bottom:9px}
+.chips{display:flex;gap:5px;flex-wrap:wrap}
+.chip{padding:5px 10px;border:1px solid var(--border);border-radius:99px;
+      background:var(--surface-2);color:var(--text-2);cursor:pointer;font-size:.7rem;font-weight:600}
+.chip.sel{background:color-mix(in srgb,var(--point) 22%,var(--surface-2));
+          border-color:color-mix(in srgb,var(--point) 55%,transparent);color:var(--point)}
+.zoomnote{font-size:.62rem;color:var(--text-3);margin-left:auto}
+
+/* --- readouts ------------------------------------------------------------ */
+.stat{display:flex;justify-content:space-between;align-items:baseline;padding:5px 0;
+      border-bottom:1px solid var(--border);font-size:.73rem;gap:10px}
+.stat:last-child{border-bottom:none}
+.stat .k{color:var(--text-3)}
+.stat .v{font-weight:600;text-align:right}
+.rows{display:flex;gap:12px;justify-content:center;margin-top:9px}
+.rd{text-align:center;flex:1}
+.rd .hd{display:flex;align-items:center;gap:5px;justify-content:center;font-size:.6rem;
+        font-weight:700;letter-spacing:.09em;color:var(--text-2)}
+.sw{width:9px;height:9px;border-radius:3px}
+.rd .v{font-size:1.25rem;font-weight:250;line-height:1.3}
+.rd .s{font-size:.6rem;color:var(--text-3)}
+.ctl-hd{display:flex;justify-content:space-between;align-items:center;margin-bottom:5px}
+.ctl-hd label{font-size:.68rem;color:var(--text-2);font-weight:600}
+input[type=range]{width:100%;accent-color:var(--series-1);height:22px}
+input[type=number],input[type=text]{width:100%;background:var(--surface-2);
+  border:1px solid var(--border);color:var(--text-1);padding:6px 9px;border-radius:6px;
+  font-size:.78rem}
+label.lbl{display:block;font-size:.61rem;color:var(--text-3);margin-bottom:4px;
+          letter-spacing:.07em;text-transform:uppercase;font-weight:650}
+/* Explanations are off by default and revealed by the ? in the top bar.
+   They are genuinely useful the first week and pure height forever after,
+   and height is the scarce thing on this page. */
+.note{display:none;font-size:.66rem;color:var(--text-3);line-height:1.55;
+      margin-top:9px}
+body.docs .note{display:block}
+.note b{color:var(--text-2)}
+/* Amber the moment a tuned value would be lost by a restart, grey when the
+   card matches the running values. It lives in the sticky bar because that
+   is the only place visible from whichever tab you were tuning on - having
+   the only Save button on the Tune tab meant walking away from your evidence
+   to press it. */
+.b-save{padding:5px 11px;font-size:.68rem;font-weight:700;letter-spacing:.05em;
+        color:var(--text-3);border-color:var(--border)}
+.b-save.dirty{background:color-mix(in srgb,var(--warning) 22%,var(--surface-2));
+              border-color:color-mix(in srgb,var(--warning) 60%,transparent);
+              color:var(--warning)}
+.b-docs{padding:5px 10px;font-size:.72rem;font-weight:700}
+body.docs .b-docs{background:color-mix(in srgb,var(--series-1) 30%,var(--surface-2));
+                  border-color:var(--series-1);color:#fff}
+
+/* --- drive pad ----------------------------------------------------------- */
+.pad{display:grid;grid-template-columns:repeat(3,54px);grid-template-rows:repeat(3,54px);
+     gap:7px;justify-content:center;margin:2px auto 11px;touch-action:none}
+.pad button{display:flex;align-items:center;justify-content:center;font-size:1.1rem;
+            padding:0;border-radius:10px;user-select:none}
+.pad button.on{background:color-mix(in srgb,var(--series-1) 35%,var(--surface-2));
+               border-color:var(--series-1);color:#fff}
+.pad .mid{font-size:.56rem}
+.hint{font-size:.66rem;color:var(--text-3);line-height:1.6;text-align:center}
+.hint kbd{background:var(--surface-2);border:1px solid var(--border);border-radius:4px;
+          padding:1px 5px;font-family:ui-monospace,monospace;font-size:.64rem;color:var(--text-2)}
+
+/* --- banners ------------------------------------------------------------- */
+.banner{display:none;margin-bottom:10px;padding:9px 12px;border-radius:8px;
+        font-size:.74rem;font-weight:600}
+.banner.show{display:block}
+.banner.warn{color:var(--warning);background:color-mix(in srgb,var(--warning) 12%,transparent);
+             border:1px solid color-mix(in srgb,var(--warning) 40%,transparent)}
+.banner.info{color:var(--text-2);background:var(--surface-2);border:1px solid var(--border)}
+
+/* --- camera -------------------------------------------------------------- */
+.camwrap{position:relative;background:var(--surface-2);border-radius:8px;
+         overflow:hidden;aspect-ratio:4/3;display:flex;align-items:center;
+         justify-content:center}
+.camrot{position:absolute;inset:0;transform-origin:50% 50%;
+        transition:transform .18s ease}
+.camwrap img{width:100%;height:100%;object-fit:contain;display:block}
+/* A quarter turn inside a 4:3 box overflows unless it is scaled down by the
+   aspect ratio - 3/4 here. Without the scale the long edge is cropped and
+   the floor grid lines up with pixels that are no longer on screen. */
+.camrot.r90 {transform:rotate(90deg)  scale(.75)}
+.camrot.r180{transform:rotate(180deg)}
+.camrot.r270{transform:rotate(270deg) scale(.75)}
+.camoff{color:var(--text-3);font-size:.73rem;text-align:center;padding:20px;
+        line-height:1.7;max-width:38ch}
+.camdot{position:absolute;top:9px;left:9px;display:flex;align-items:center;gap:6px;
+        padding:4px 9px;border-radius:99px;font-size:.58rem;font-weight:700;
+        letter-spacing:.08em;background:rgba(13,17,23,.72);color:var(--cam)}
+.camdot i{width:6px;height:6px;border-radius:50%;background:currentColor}
+/* Boxes are positioned as a percentage of the frame, so they follow the
+   picture at any size and through the rotation transform without any
+   arithmetic on this side. */
+.detboxes{position:absolute;inset:0;pointer-events:none}
+.detbox{position:absolute;border:2px solid var(--obj);border-radius:3px;
+        box-shadow:0 0 0 1px rgba(13,17,23,.55)}
+.detbox b{position:absolute;left:-2px;top:-17px;white-space:nowrap;
+          background:var(--obj);color:#07231a;font-size:.6rem;font-weight:700;
+          letter-spacing:.03em;padding:1px 5px;border-radius:3px 3px 0 0;
+          font-family:ui-monospace,monospace}
+/* A box with no LiDAR range behind it cannot be placed on the map. Drawn in
+   the warning colour rather than hidden, because "seen but not placed" is a
+   real state and hiding it makes the map look mysteriously incomplete. */
+.detbox.noplace{border-color:var(--warning);border-style:dashed}
+.detbox.noplace b{background:var(--warning);color:#231a07}
+.cliffgrid{position:absolute;inset:auto 0 0 0;height:55%;display:grid;
+           pointer-events:none}
+.cliffgrid div{border:1px solid rgba(255,255,255,.045)}
+.cc1{background:color-mix(in srgb,var(--warning) 34%,transparent)}
+.cc2{background:color-mix(in srgb,var(--critical) 46%,transparent)}
+
+/* --- markers, photos ----------------------------------------------------- */
+.taglist{display:flex;flex-wrap:wrap;gap:5px;margin:8px 0}
+.tag{padding:3px 8px;border-radius:99px;font-size:.65rem;font-weight:700;
+     font-family:ui-monospace,monospace;border:1px solid var(--border);
+     background:var(--surface-2);color:var(--text-3)}
+.tag.on{color:var(--cam);border-color:color-mix(in srgb,var(--cam) 55%,transparent);
+        background:color-mix(in srgb,var(--cam) 15%,transparent)}
+.tag.fix{color:var(--good);border-color:color-mix(in srgb,var(--good) 55%,transparent);
+         background:color-mix(in srgb,var(--good) 15%,transparent)}
+.shots{display:grid;grid-template-columns:repeat(auto-fill,minmax(84px,1fr));
+       gap:7px;margin-top:10px;max-height:300px;overflow-y:auto}
+.shots a{display:block;border-radius:6px;overflow:hidden;border:1px solid var(--border);
+         line-height:0}
+.shots img{width:100%;aspect-ratio:4/3;object-fit:cover}
+.shots .lbl{font-size:.55rem;color:var(--text-3);padding:3px 4px;line-height:1.3;
+            font-family:ui-monospace,monospace}
+
+/* --- mounting calibration, places, auto-map ------------------------------ */
+.cal{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin:8px 0}
+.cal .f{display:flex;flex-direction:column;gap:4px}
+.cal label{font-size:.61rem;color:var(--text-3);letter-spacing:.07em;
+           text-transform:uppercase;font-weight:650}
+.cal input[type=number]{width:88px}
+.cal input[type=range]{width:190px}
+.calnow{font-size:.78rem;font-weight:600;font-variant-numeric:tabular-nums;
+        color:var(--point);min-width:56px}
+.places{display:flex;gap:7px;flex-wrap:wrap;margin:9px 0}
+.place{display:inline-flex;align-items:center;gap:6px;padding:5px 9px;
+  border:1px solid var(--border);border-radius:99px;background:var(--surface-2);
+  font-size:.72rem;color:var(--text-1)}
+.place button{padding:2px 8px;font-size:.66rem;border-radius:5px}
+.place .x{background:none;border:none;color:var(--text-3);padding:2px 4px}
+.place .x:hover{color:var(--critical)}
+.row2{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
+.row2 input{width:150px}
+.auto{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+.b-auto{background:color-mix(in srgb,var(--obj) 24%,var(--surface-2));
+        border-color:color-mix(in srgb,var(--obj) 55%,transparent);color:var(--obj);
+        font-size:.78rem;padding:10px 18px}
+.b-auto.on{background:var(--obj);color:#0d1117;border-color:var(--obj)}
+.calbox{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;
+        padding:10px 12px;font-size:.71rem;color:var(--text-2);margin-top:10px}
+.calbox b{color:var(--text-1)}
+.calnote{color:var(--warning);margin-top:5px}
+
+/* --- IMU dials ----------------------------------------------------------- */
+.imu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;
+          align-items:start}
+.dial{display:flex;flex-direction:column;align-items:center;gap:6px}
+.dial canvas{width:100%;max-width:200px;aspect-ratio:1}
+.dial .cap{font-size:.6rem;letter-spacing:.09em;color:var(--text-3);font-weight:700}
+.dial .big{font-size:1.45rem;font-weight:250;line-height:1}
+
+/* --- tables -------------------------------------------------------------- */
+table{width:100%;border-collapse:collapse;font-size:.72rem}
+th,td{text-align:right;padding:5px 7px;border-bottom:1px solid var(--border);
+      font-variant-numeric:tabular-nums}
+th{color:var(--text-3);font-weight:650;font-size:.6rem;text-transform:uppercase}
+td{color:var(--text-2)}
+th:first-child,td:first-child{text-align:left}
+td.n{color:var(--text-1);font-weight:600}
+.idx{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;
+     border-radius:5px;background:var(--surface-2);border:1px solid var(--obj);
+     color:var(--obj);font-size:.6rem;font-weight:700}
+
+/* --- tuning tab ---------------------------------------------------------- */
+.tunegrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;
+          align-items:start}
+.tunerow{padding:9px 0;border-bottom:1px solid var(--border)}
+.tunerow:last-child{border-bottom:none}
+.tunehd{display:flex;align-items:baseline;gap:8px;margin-bottom:5px}
+.tunehd .lb{font-size:.72rem;font-weight:600;color:var(--text-1)}
+.tunehd .vv{margin-left:auto;font-family:ui-monospace,monospace;font-size:.74rem;
+            font-weight:650;color:var(--point);font-variant-numeric:tabular-nums}
+.tunehd .vv.dirty{color:var(--warning)}
+.tunerow input[type=range]{height:18px}
+.tunerow .doc{font-size:.63rem;color:var(--text-3);line-height:1.5;margin-top:4px;
+              display:none}
+.tunerow.open .doc{display:block}
+.tunehd .q{background:none;border:none;color:var(--text-3);font-size:.68rem;padding:0 4px;
+           cursor:pointer;font-weight:700}
+.tunehd .q:hover{color:var(--text-1);filter:none}
+.tunesub{font-size:.6rem;text-transform:uppercase;letter-spacing:.1em;
+         color:var(--text-3);font-weight:650;margin:12px 0 2px;
+         padding-top:9px;border-top:1px solid var(--border)}
+.tunerow:first-child + .tunesub,.tunesub:first-child{margin-top:0;padding-top:0;border-top:none}
+.tuneact{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+.tuneact .msg{font-size:.68rem;color:var(--text-3)}
+.swrow{display:flex;gap:8px;align-items:center}
+.swrow button{flex:1}
+</style>
+</head>
+<body>
+
+<!-- Sticky. Nothing here scrolls away, because the e-stop and the sensor
+     badges are exactly what you need when something is going wrong. -->
+<div class="topbar">
+  <div class="wrap">
+    <span class="brand">Speaker Truck <span>/ nav</span></span>
+    <span id="badge" class="badge off"><i class="dot"></i>DISABLED</span>
+    <span id="lbadge" class="badge off"><i class="dot"></i>NO LIDAR</span>
+    <span id="ibadge" class="badge off"><i class="dot"></i>NO IMU</span>
+    <span id="cbadge" class="badge off"><i class="dot"></i>NO CAM</span>
+    <span id="fbadge" class="badge off"><i class="dot"></i>FLOOR</span>
+    <span id="mbadge" class="badge off"><i class="dot"></i>TAGS</span>
+    <div class="spacer"></div>
+    <span class="livepose" id="toppose">&mdash;</span>
+    <div class="speedbox">
+      <label for="lim">Speed</label>
+      <input type="range" id="lim" min="5" max="40" value="40" step="1">
+      <span class="num mono" id="limv" style="font-size:.72rem">0.40</span>
+    </div>
+    <div class="btns">
+      <button class="b-save" id="b-save" onclick="tuneSave()"
+              title="Write tuned values to tuning.json on the Pi">SAVED</button>
+      <button class="b-docs" id="b-docs" onclick="toggleDocs()" title="Show or hide the explanations">?</button>
+      <button class="b-enable" onclick="cmd('/enable')">ENABLE</button>
+      <button class="b-stop" onclick="cmd('/stop')">STOP</button>
+      <button class="b-estop" onclick="cmd('/estop')">E-STOP</button>
+    </div>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="wrap">
+    <button class="tab on" data-tab="drive" onclick="showTab('drive')">Drive</button>
+    <button class="tab" data-tab="map" onclick="showTab('map')">Map</button>
+    <button class="tab" data-tab="sensors" onclick="showTab('sensors')">Sensors</button>
+    <button class="tab" data-tab="vision" onclick="showTab('vision')">Vision<i class="pip" id="pip-vision"></i></button>
+    <button class="tab" data-tab="tune" onclick="showTab('tune')">Tune</button>
+  </div>
+</div>
+
+<div class="wrap content">
+
+<div id="trip" class="banner warn">&#9888; Watchdog tripped &mdash; commands stopped arriving, so the motors were stopped.</div>
+<div id="blocked" class="banner warn"></div>
+<div id="tilt" class="banner warn"></div>
+<div id="cliffbanner" class="banner warn"></div>
+<div id="jserr" class="banner warn" style="font-family:ui-monospace,monospace;font-size:.7rem;white-space:pre-wrap"></div>
+<div id="focusnote" class="banner info show">Click anywhere on the page once, then the arrow keys will drive.</div>
+
+<!-- ===================================================== DRIVE ========== -->
+<div class="tabpanel on" id="tab-drive">
+  <div class="work">
+
+    <div class="card pad0">
+      <div class="viewbar">
+        <div class="chips" id="ranges"></div>
+        <span class="zoomnote">scroll to zoom &middot; drag to pan &middot; double-click to reset</span>
+      </div>
+      <div class="view"><canvas id="plot"></canvas></div>
+      <p class="note">
+        Everything is drawn in the <b>body frame</b>: origin at the truck's
+        geometric centre, +x forward, +y left &mdash; the same frame the
+        collision guard and SLAM use, so what you see is what they judge.
+        Sensors are drawn <b>where they physically are</b>, with the arrow
+        showing which way each faces. Zoom in and they label themselves.
+        The two shaded boxes and the dashed circle are exactly what the
+        collision guard tests &mdash; the forward and reverse swept
+        rectangles, and the circle the corners sweep when turning on the
+        spot. Each turns amber on its own clearance, so you can put an object
+        in front of the robot and watch that box light up. If the box covers
+        the obstacle and nothing goes amber, the geometry is wrong, not the
+        sensor. The cyan wedge is what the camera can see.
+      </p>
+    </div>
+
+    <div class="stack">
+      <div class="card">
+        <h2>Camera <span class="hint">moves to Vision when that tab is open</span></h2>
+        <!-- The camera lives in ONE node that gets moved between these two
+             slots on a tab change. Two .camwrap elements would mean two
+             <img> tags pointing at /camera.mjpg, which is two MJPEG
+             connections off one Pi for one picture. -->
+        <div id="camslot-drive">
+          <div class="camwrap" id="camwrap">
+            <!-- The picture and the floor grid live inside one rotating box.
+                 Rotating them separately would drift them apart the moment
+                 the mount is anything but upright, and the grid is only
+                 useful because it sits over the pixels it judged. The LIVE
+                 pip and the off message stay outside, upright. -->
+            <div class="camrot" id="camrot">
+              <div class="cliffgrid" id="cliffgrid"></div>
+              <div class="detboxes" id="detboxes"></div>
+            </div>
+            <div class="camoff" id="camoff">Camera off.</div>
+            <div class="camdot" id="camdot" style="display:none"><i></i>LIVE</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Drive</h2>
+        <div class="pad">
+          <span></span><button id="p-f">&uarr;</button><span></span>
+          <button id="p-l">&larr;</button><button class="mid" id="p-s">STOP</button><button id="p-r">&rarr;</button>
+          <span></span><button id="p-b">&darr;</button><span></span>
+        </div>
+        <p class="hint"><kbd>&larr;</kbd><kbd>&uarr;</kbd><kbd>&darr;</kbd><kbd>&rarr;</kbd> or <kbd>WASD</kbd> to drive &middot; <kbd>space</kbd> e-stop</p>
+        <div class="rows">
+          <div class="rd"><div class="hd"><i class="sw" style="background:var(--series-1)"></i>LEFT</div>
+            <div class="v num mono" id="lr">0.0</div><div class="s">RPM</div></div>
+          <div class="rd"><div class="hd"><i class="sw" style="background:var(--series-2)"></i>RIGHT</div>
+            <div class="v num mono" id="rr">0.0</div><div class="s">RPM</div></div>
+        </div>
+      </div>
+
+      <!-- Mounting sits next to the plot because that is the only place you
+           can see whether it is right. The measurement below beats the
+           slider: it gives a number with a residual instead of an opinion. -->
+      <div class="card">
+        <h2>Vehicle <span class="hint">size it against the plot</span></h2>
+        <div id="tune-vehicle"></div>
+        <p class="note">
+          Park the robot against a wall and size this box until it matches the
+          returns the scanner gets off the robot's own body. Everything inside
+          the box is thrown away as the robot seeing itself &mdash; too big and
+          real obstacles vanish, too small and it paints a permanent blob
+          around itself and refuses to move. This is also what the guard
+          measures clearances from, and its diagonal is what the turning check
+          uses, because a skid-steer's widest point is a corner, not the nose.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Scanner mounting <span class="hint">watch the plot</span></h2>
+        <div id="tune-mount"></div>
+        <div class="cal" style="margin:10px 0 0">
+          <span class="calnow" id="lyawv">0&deg;</span>
+          <button onclick="nudgeYaw(-1)">&minus;1&deg;</button>
+          <button onclick="nudgeYaw(1)">+1&deg;</button>
+        </div>
+        <p class="note">
+          Face a flat wall: it should sit <b>square across the top</b> of the
+          plot. If the wall is drawn skewed, rotation is wrong &mdash; and the
+          guard is checking a different direction than you think.
+        </p>
+        <div class="tog" style="margin-top:10px">
+          <button id="cal-start" onclick="pushStart()">Measure by pushing</button>
+          <button id="cal-finish" onclick="pushFinish()" style="display:none">Finish</button>
+        </div>
+        <div id="calresult" class="calbox" style="display:none"></div>
+        <p class="note">
+          Push the robot ~0.5&nbsp;m in a straight line and this fits the range
+          change across <b>every</b> bearing at once. The phase is the true
+          nose bearing; the amplitude is how far it really went, which also
+          gives counts-per-rev. Both come with a residual, so you can tell
+          whether to believe them.
+        </p>
+      </div>
+
+      <!-- The guard's numbers and the guard's knobs, together. Changing a
+           margin without watching the clearances it produces is guessing. -->
+      <div class="card">
+        <h2>Guard</h2>
+        <div class="tog"><button id="t-guard" onclick="toggleGuard()">Guard</button></div>
+        <div class="stat"><span class="k">Ahead</span><span class="v num mono" id="ahead">&mdash;</span></div>
+        <div class="stat"><span class="k">Clear forward</span><span class="v num mono" id="cl-fwd">&mdash;</span></div>
+        <div class="stat"><span class="k">Clear reverse</span><span class="v num mono" id="cl-rev">&mdash;</span></div>
+        <div class="stat"><span class="k">Clear to turn</span><span class="v num mono" id="cl-turn">&mdash;</span></div>
+        <div id="tune-guard" style="margin-top:10px"></div>
+        <p class="note">
+          <b>Stop distance</b> sets how far the boxes on the plot extend past
+          the body; <b>Safety margin</b> sets how far they stand out to the
+          sides. Walk something into the forward box and it should go amber
+          and <b>Clear forward</b> should fall below the stop distance. If it
+          does not, the fault is the scanner mounting above, not the guard.
+          The dashed circle is the turning check &mdash; it uses half the
+          margin, because momentum carries a corner around the same circle
+          rather than past it.
+        </p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================================================== MAP ============ -->
+<div class="tabpanel" id="tab-map">
+  <div class="work">
+
+    <div class="card pad0">
+      <div class="view"><canvas id="map"></canvas></div>
+      <p class="note">
+        White is occupied, dark is free space the LiDAR has seen through, grey
+        is unknown. The violet line is the path driven, green dots are
+        recognised objects, cyan squares are known markers, cyan dots are
+        saved stills &mdash; click one to open the
+        picture. Mapping only happens once the robot has moved 40&nbsp;mm or
+        turned 4&deg;; integrating hundreds of identical scans while parked
+        makes the map over-confident about one viewpoint.
+      </p>
+    </div>
+
+    <div class="stack">
+      <div class="card">
+        <h2>Pose &amp; SLAM</h2>
+        <div class="stat"><span class="k">Pose x</span><span class="v num mono" id="px">&mdash;</span></div>
+        <div class="stat"><span class="k">Pose y</span><span class="v num mono" id="py">&mdash;</span></div>
+        <div class="stat"><span class="k">Heading</span><span class="v num mono" id="pth">&mdash;</span></div>
+        <div class="stat"><span class="k">Distance driven</span><span class="v num mono" id="pdist">&mdash;</span></div>
+        <div class="stat"><span class="k">Scans mapped</span><span class="v num mono" id="pscans">&mdash;</span></div>
+        <div class="stat"><span class="k">Match correction</span><span class="v num mono" id="pcorr">&mdash;</span></div>
+        <div class="stat"><span class="k">SLAM cpu</span><span class="v num mono" id="pms">&mdash;</span></div>
+        <div class="stat"><span class="k">Match confidence</span><span class="v num mono" id="pconf">&mdash;</span></div>
+        <div class="stat"><span class="k">Scans refused</span><span class="v num mono" id="prej">&mdash;</span></div>
+        <div class="stat"><span class="k">Loop closures</span><span class="v num mono" id="ploop">&mdash;</span></div>
+        <div class="stat"><span class="k">Encoder counts</span><span class="v num mono" id="pcnt">&mdash;</span></div>
+        <div class="tog" style="margin-top:10px">
+          <button id="t-slam" onclick="post('/slam',{enabled:!slamOn})">SLAM</button>
+          <button id="t-match" onclick="post('/slam',{matching:!matchOn})">Match</button>
+        </div>
+        <div class="tog">
+          <button onclick="post('/slam',{reset:true})">Reset map</button>
+          <button onclick="post('/map/save',{})">Save map</button>
+          <button onclick="post('/map/load',{})">Load map</button>
+        </div>
+        <p class="note" id="slamnote"></p>
+      </div>
+
+      <!-- Matching and grid knobs go here, not in a list elsewhere: SLAM cpu
+           and Match correction are directly above, and those two numbers are
+           how you tell whether a change helped. -->
+      <div class="card">
+        <h2>Mapping <span class="hint">watch SLAM cpu above</span></h2>
+        <div id="tune-slam"></div>
+        <p class="note">
+          Past about <b>150 ms</b> of SLAM cpu the 5&nbsp;Hz loop has no
+          headroom and pose quality gets worse even though you were trying to
+          improve it. Raise <b>Decimate</b> first &mdash; it divides the cost
+          linearly, while the search window grows it as the square.
+          <br><br>
+          <b>Match confidence</b> above is how pinned the pose is: near 0.6 in
+          a room, near 0.1 sliding along a corridor. Below <b>Min
+          confidence</b> the scan is refused rather than mapped &mdash; a gap
+          gets filled on the next pass, a smear never leaves.
+          <b>Loop closures</b> is how often the robot recognised somewhere it
+          had already been and corrected against it; without that, error only
+          ever grows with distance driven.
+        </p>
+      </div>
+
+      <!-- Odometry sits with Distance driven, which is the only way to judge
+           it, and with the push measurement that produces the number. -->
+      <div class="card">
+        <h2>Odometry <span class="hint">map scale lives here</span></h2>
+        <div id="tune-odom"></div>
+        <p class="note">
+          If the map comes out uniformly too big or too small it is
+          <b>counts per rev</b> and nothing else. Drive a measured metre and
+          compare <b>Distance driven</b> against a tape &mdash; or use
+          <b>Measure by pushing</b> on the Drive tab, which derives it from
+          the LiDAR without a tape at all.
+          Push the robot forward by hand and both encoder counts must
+          <b>increase</b>; if one falls, flip its sign here.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Auto-map</h2>
+        <div class="auto">
+          <button id="b-auto" class="b-auto" onclick="toggleAuto()">START AUTO-MAP</button>
+          <span id="autostate" class="mono" style="font-size:.74rem;color:var(--text-2)"></span>
+        </div>
+        <div id="calbox" class="calbox" style="display:none"></div>
+        <p class="note">
+          Explores by frontier: it drives to the boundary between mapped floor
+          and unknown space. A doorway <b>is</b> such a boundary, so doors get
+          found and driven through without being a special case. Touching the
+          arrow keys takes over instantly.
+        </p>
+        <div id="tune-expl" style="margin-top:10px"></div>
+      </div>
+
+      <div class="card">
+        <h2>Places</h2>
+        <div class="places" id="places"></div>
+        <div class="row2">
+          <input type="text" id="pname" placeholder="name this spot, e.g. kitchen">
+          <button onclick="savePlace()">Save here</button>
+        </div>
+        <p class="note">
+          Saved spots are world coordinates in the current map, so save the map
+          before shutting down or they mean nothing next boot.
+        </p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================================================== SENSORS ======== -->
+<div class="tabpanel" id="tab-sensors">
+  <div class="work even">
+
+    <div class="card">
+      <h2>Orientation &middot; <span id="imuname" class="mono">&mdash;</span></h2>
+      <div class="imu-grid">
+        <div class="dial">
+          <canvas id="compass"></canvas>
+          <div class="cap">HEADING</div>
+          <div class="big num mono" id="yaw">&mdash;</div>
+        </div>
+        <div class="dial">
+          <canvas id="horizon"></canvas>
+          <div class="cap">ROLL / PITCH</div>
+          <div class="big num mono" id="rp">&mdash;</div>
+        </div>
+      </div>
+      <div style="margin-top:12px">
+        <div class="stat"><span class="k">Roll</span><span class="v num mono" id="s-roll">&mdash;</span></div>
+        <div class="stat"><span class="k">Pitch</span><span class="v num mono" id="s-pitch">&mdash;</span></div>
+        <div class="stat"><span class="k">Turn rate (gyro)</span><span class="v num mono" id="s-gz">&mdash;</span></div>
+        <div class="stat"><span class="k">Turn rate (wheels)</span><span class="v num mono" id="s-enc">&mdash;</span></div>
+        <div class="stat"><span class="k">Slip</span><span class="v num mono" id="s-slip">&mdash;</span></div>
+        <div class="stat"><span class="k">Temp</span><span class="v num mono" id="s-temp">&mdash;</span></div>
+      </div>
+      <p class="note" id="imunote"></p>
+    </div>
+
+    <div class="stack">
+      <div class="card">
+        <h2>LiDAR</h2>
+        <div class="stat"><span class="k">Rate</span><span class="v num mono" id="hz">&mdash;</span></div>
+        <div class="stat"><span class="k">Points / turn</span><span class="v num mono" id="count">&mdash;</span></div>
+        <div class="stat"><span class="k">Dropped frames</span><span class="v num mono" id="l-bad">&mdash;</span></div>
+        <div class="stat"><span class="k">Port</span><span class="v mono" id="l-port">&mdash;</span></div>
+      </div>
+
+      <div class="card">
+        <h2>Drive train</h2>
+        <div class="stat"><span class="k">Left RPM</span><span class="v num mono" id="s-lrpm">&mdash;</span></div>
+        <div class="stat"><span class="k">Right RPM</span><span class="v num mono" id="s-rrpm">&mdash;</span></div>
+        <div class="stat"><span class="k">Encoder counts</span><span class="v num mono" id="s-cnt">&mdash;</span></div>
+        <div class="tog" style="margin-top:10px">
+          <button id="t-left" onclick="toggle('left')">Inv L</button>
+          <button id="t-right" onclick="toggle('right')">Inv R</button>
+          <button id="t-swap" onclick="toggle('swap')">Swap</button>
+        </div>
+        <p class="note">
+          Push the robot forward by hand: <b>both counts must increase</b>. If
+          one decreases, flip its sign on the Tune tab. Inversion here fixes
+          which way the MOTOR turns and says nothing about the encoder.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Camera</h2>
+        <div class="stat"><span class="k">Model</span><span class="v mono" id="camname">&mdash;</span></div>
+        <div class="stat"><span class="k">Resolution</span><span class="v num mono" id="c-size">&mdash;</span></div>
+        <div class="stat"><span class="k">Frame rate</span><span class="v num mono" id="c-hz">&mdash;</span></div>
+        <div class="stat"><span class="k">Frames</span><span class="v num mono" id="c-frames">&mdash;</span></div>
+        <div class="stat"><span class="k">Encoder</span><span class="v mono" id="c-enc">&mdash;</span></div>
+        <div class="stat"><span class="k">Field of view</span><span class="v num mono" id="c-fov">&mdash;</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <h2>Detected objects &middot; nearest first</h2>
+    <table>
+      <thead><tr><th>#</th><th>Bearing</th><th>Nearest</th><th>Width</th><th>Arc</th><th>Rays</th></tr></thead>
+      <tbody id="objs"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ===================================================== VISION ========= -->
+<div class="tabpanel" id="tab-vision">
+  <div class="work">
+
+    <div class="card pad0">
+      <div class="viewbar">
+        <button id="t-cam" onclick="toggleCam()">Live view</button>
+        <button onclick="snap()">Save still</button>
+        <button id="t-auto-mm" onclick="toggleAutoShots()">Auto every 500 mm</button>
+        <div class="chips" id="overlays" style="margin-left:auto">
+          <button class="chip" data-ov="boxes">Boxes</button>
+          <button class="chip" data-ov="floor">Floor grid</button>
+          <button class="chip" data-ov="none">Clean</button>
+        </div>
+        <span class="zoomnote" id="camnote"></span>
+      </div>
+      <div id="camslot-vision"></div>
+      <p class="note">
+        <b>Live view</b> stops the stream without stopping the robot &mdash;
+        MJPEG is by far the largest thing on this page, and over a weak Wi-Fi
+        link it will starve the drive commands before anything else gives way.
+        <b>Boxes</b> draws what the detector sees, with its confidence and the
+        LiDAR range that will place it on the map. A <b>dashed amber</b> box
+        was recognised but has no range behind it, so it cannot be placed
+        &mdash; usually too far, or the scanner is looking under it.
+        <b>Floor grid</b> shows the cliff check instead: amber is something
+        that is not floor, red is a drop-off.
+      </p>
+    </div>
+
+    <div class="stack">
+      <div class="card">
+        <h2>Camera mounting <span class="hint">watch the picture</span></h2>
+        <div id="tune-cam"></div>
+        <p class="note">
+          Two different questions. <b>Bearing</b> is where the lens looks on
+          the robot &mdash; it moves the cyan wedge on the Drive plot and
+          decides which way a detected marker is reported to lie, so it has to
+          be right even when the picture looks fine. <b>Rotation</b> is only
+          which way up the sensor sits in its bracket.
+          Rotation turns the display, not the camera: the floor check reads
+          raw pixels and still sees the sensor's own orientation, which is
+          why a quarter turn warns above.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Floor check &middot; <span id="cliffstate" class="mono">&mdash;</span></h2>
+        <div class="tog">
+          <button id="t-cliff" onclick="post('/cliff',{enabled:!cliffOn})">Veto forward</button>
+          <button onclick="post('/cliff',{relearn:true})">Relearn floor</button>
+        </div>
+        <div class="stat"><span class="k">Nearest anomaly</span><span class="v num mono" id="f-near">&mdash;</span></div>
+        <div class="stat"><span class="k">Camera tilt</span><span class="v num mono" id="f-geom">&mdash;</span></div>
+        <div class="stat"><span class="k">Check cost</span><span class="v num mono" id="f-ms">&mdash;</span></div>
+        <div id="cliffwarn" class="banner warn" style="margin:8px 0 0">
+          &#9888; The camera is rotated a quarter turn, so the floor check
+          is reading across the picture instead of down it. Its distances
+          are wrong &mdash; turn it off, or correct the mount with
+          <b>CAM_HFLIP</b>/<b>CAM_VFLIP</b> in <b>pins.py</b>.
+        </div>
+        <div id="tune-vision" style="margin-top:8px"></div>
+        <p class="note">
+          The LiDAR sweeps one horizontal plane, so a stair edge returns
+          nothing to it and the collision guard reads the top step as clear
+          floor. This is the only thing on the robot that can see a drop.
+          <b>Relearn</b> on open floor after changing surface &mdash; it takes
+          what it sees as the definition of floor, so do not do it facing a
+          wall.
+          To tune these, switch the picture above to <b>Floor grid</b>: the
+          cells recolour within a fifth of a second of moving a tolerance, and
+          that is the feedback to tune against. Too twitchy on a patterned
+          rug? Raise <b>chroma</b> before luma.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Markers &middot; <span id="tagcount" class="mono">&mdash;</span></h2>
+        <div class="tog">
+          <button id="t-mk" onclick="post('/markers',{enabled:!mkOn})">Detect</button>
+          <button id="t-learn" onclick="post('/markers',{learn:!mkLearn})">Learn</button>
+        </div>
+        <div class="taglist" id="taglist"></div>
+        <div class="stat"><span class="k">Fixes applied</span><span class="v num mono" id="m-fix">&mdash;</span></div>
+        <div class="stat"><span class="k">Rejected</span><span class="v num mono" id="m-rej">&mdash;</span></div>
+        <div class="stat"><span class="k">Last correction</span><span class="v num mono" id="m-last">&mdash;</span></div>
+        <div class="stat"><span class="k">Detect cost</span><span class="v num mono" id="m-ms">&mdash;</span></div>
+        <div class="tog" style="margin-top:10px">
+          <button onclick="window.open('/markers/sheet.svg?ids=0,1,2,3,4,5')">Print tags</button>
+          <button onclick="post('/markers',{save:true})">Save map</button>
+        </div>
+        <p class="note" id="mknote">
+          A printed tag at a known spot is the only input here that does not
+          depend on the robot's own history. Print at <b>100%</b>, measure a
+          tag, set <b>MARKER_SIZE_MM</b>. Turn <b>Learn</b> on, drive the house
+          once, turn it off &mdash; from then on they hold the map straight.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Objects &middot; <span id="objstate" class="mono">&mdash;</span></h2>
+        <div class="tog">
+          <button id="t-detect" onclick="post('/detect',{enabled:!detOn})">Detect</button>
+          <button onclick="post('/detect',{save:true})">Save</button>
+          <button class="b-stop" onclick="post('/detect',{forget:'all'})">Forget all</button>
+        </div>
+        <div class="taglist" id="detlist"></div>
+        <div id="tune-detect"></div>
+        <div class="stat"><span class="k">On the map</span><span class="v num mono" id="d-obj">&mdash;</span></div>
+        <div class="stat"><span class="k">Frames</span><span class="v num mono" id="d-frames">&mdash;</span></div>
+        <div class="stat"><span class="k">Skipped for SLAM</span><span class="v num mono" id="d-skip">&mdash;</span></div>
+        <div class="stat"><span class="k">Inference</span><span class="v num mono" id="d-ms">&mdash;</span></div>
+        <div class="stat"><span class="k">Running on</span><span class="v mono" id="d-backend">&mdash;</span></div>
+        <label class="lbl" style="margin-top:10px">Off-board server (bigger model on your PC)</label>
+        <div class="row2">
+          <input type="text" id="d-url" placeholder="http://192.168.1.5:8000/detect"
+                 style="flex:1;min-width:150px">
+          <button onclick="setDetectUrl()">Use</button>
+        </div>
+        <p class="note" id="detnote">
+          The camera says <b>what</b> and roughly which direction; it has no
+          depth. The <b>LiDAR</b> supplies the range at that bearing, and the
+          pose turns the two into a world coordinate &mdash; neither sensor
+          can place an object on the map alone.
+          A label only sticks after <b>three</b> agreeing sightings: one frame
+          is noise, and a single misfire would otherwise plant "bed" in the
+          hallway permanently.
+          Walls are not detected here and never will be &mdash; the LiDAR
+          already does walls better, faster and in the dark.
+          Detection yields to mapping: it skips a cycle whenever SLAM is over
+          budget, which is what <b>Skipped</b> counts.
+          <br><br>
+          <b>Off-board</b>: run <b>tools/detect_server.py</b> on your PC and
+          paste its URL above. The robot then sends the JPEG the camera
+          already encoded &mdash; about 30&nbsp;kB a frame, nothing next to the
+          video stream &mdash; and a desktop-sized model answers. Far better
+          results than the Pi can manage: yolov8n at 320&nbsp;px on-board
+          against yolov8m at 640 there.
+          If the PC goes to sleep the robot falls back to the on-board model
+          and says so here; mapping never depends on your laptop being awake.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Photo trail &middot; <span id="shotcount" class="mono">&mdash;</span></h2>
+        <div class="shots" id="shots"></div>
+        <p class="note">
+          Each still is tagged with the pose it was taken from and pinned to
+          the map. Stills live in <b>test/captures/</b> on the Pi.
+        </p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================================================== TUNE =========== -->
+<div class="tabpanel" id="tab-tune">
+  <div class="tuneact">
+    <button class="b-enable" onclick="tuneSave()">Save to tuning.json</button>
+    <button class="b-stop" onclick="tuneRevert()">Revert to code defaults</button>
+    <button onclick="tuneDocs()">What do these do?</button>
+    <span class="msg" id="tunemsg"></span>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <h2>Live effect</h2>
+    <div class="cols2">
+      <div class="stat"><span class="k">SLAM cpu</span><span class="v num mono" id="tu-ms">&mdash;</span></div>
+      <div class="stat"><span class="k">Match correction</span><span class="v num mono" id="tu-corr">&mdash;</span></div>
+      <div class="stat"><span class="k">Scan rate</span><span class="v num mono" id="tu-hz">&mdash;</span></div>
+      <div class="stat"><span class="k">Points / turn</span><span class="v num mono" id="tu-pts">&mdash;</span></div>
+      <div class="stat"><span class="k">Scans mapped</span><span class="v num mono" id="tu-scans">&mdash;</span></div>
+      <div class="stat"><span class="k">Distance driven</span><span class="v num mono" id="tu-dist">&mdash;</span></div>
+    </div>
+    <p class="note">
+      Watch these while you move a slider &mdash; that is the whole point of
+      tuning here rather than in <b>pins.py</b>. Raising the search window or
+      lowering decimate shows up in <b>SLAM cpu</b> immediately; if it climbs
+      past ~150&nbsp;ms the 5&nbsp;Hz SLAM loop has no headroom left.
+      Changes apply live but are <b>not saved</b> until you press Save.
+    </p>
+  </div>
+
+  <div class="tunegrid" id="tunegrid"></div>
+
+  <p class="note" style="margin-top:14px">
+    <b>This tab is the index, not the place to tune.</b> Every one of these
+    also appears next to the thing it changes &mdash; scanner mounting and
+    guard margins on <b>Drive</b> beside the plot, matching and odometry on
+    <b>Map</b> beside SLAM cpu and the pose, floor thresholds on
+    <b>Vision</b> over the live picture. Tune them there, where you can see
+    the effect; come here to see everything at once, to save, or to revert.
+    Both views are the same controls, so a change in one shows up in the other.
+    <br><br>
+    Grid size and resolution are deliberately absent: changing them means
+    reallocating the grid and discarding the map, so they stay in
+    <b>pins.py</b> and need a restart. Full explanations in
+    <b>docs/TUNING.md</b>.
+  </p>
+</div>
+
+</div><!-- /wrap -->
+
+<script>
+const $ = id => document.getElementById(id);
+
+// Show script errors ON THE PAGE.
+//
+// A single uncaught error stops the rest of the script dead, and what you get
+// is a page that looks fine and does nothing - no clue unless you happen to
+// have devtools open. This page is usually read on a phone, over wifi, next
+// to a robot, where opening a console is not practical. So the page reports
+// its own failures.
+//
+// Registered before anything else runs, so it catches errors in this file too.
+addEventListener('error', e => {
+  const el = document.getElementById('jserr');
+  if(!el) return;
+  el.classList.add('show');
+  // Template literal, not quoted strings with escapes. Real line breaks are
+  // legal inside backticks, so this cannot be broken by anything that mangles
+  // a backslash on its way into the file — which is exactly how the previous
+  // version of THIS handler ended up an unterminated string literal and took
+  // down the whole page it was written to diagnose.
+  el.textContent = `Script error — the page has stopped updating.
+${e.message || e.error}
+${e.filename || ''} line ${e.lineno || '?'}
+
+Reload with Ctrl+Shift+R. If it persists, send this text.`;
+});
+addEventListener('unhandledrejection', e => {
+  const el = document.getElementById('jserr');
+  if(!el) return;
+  el.classList.add('show');
+  el.textContent = 'Request failed: ' + (e.reason && e.reason.message || e.reason);
+});
+// Live, not baked in: the footprint is tunable from the Drive tab and
+// the drawing has to follow it as you drag.
+let TRUCK = {len: %%LEN%%, wid: %%WID%%};
+const SECTOR = %%SECTOR%%, TILT_WARN = %%TILT%%;
+const CAM_HFOV = %%HFOV%%;
+// Scanner mounting rotation. Note the MINUS where this is used: a
+// return at bearing a lands at body math angle (-a + yaw), and screen
+// bearing is the negative of that, so the plot draws (a - yaw). Getting
+// this backwards makes eyeball tuning produce the negative of the value
+// the guard needs - measured +38 while the slider read -37.
+// Scanner mounting rotation, so the plot shows the SAME frame the
+// guard and SLAM use. Drawing raw bearings here while the collision
+// check used corrected ones made a rotated scanner impossible to see.
+let LIDAR_YAW = %%LYAW%%;
+// Where each sensor physically sits, body frame, mm. LIDAR_X/Y are
+// overwritten from /state whenever the mounting is retuned; the others
+// are fixed in pins.py.
+let LIDAR_X = %%LX%%, LIDAR_Y = %%LY%%;
+const IMU_X = %%IMUX%%, IMU_Y = %%IMUY%%;
+const CAM_X = %%CAMX%%, CAM_Y = %%CAMY%%;
+let SECTOR_LIVE = %%SECTOR%%;
+let CAM_YAW = %%CAMYAW%%;
+// Both come from /state so the drawn regions follow a retune of the
+// guard immediately - the point of drawing them is to check them.
+let GUARD_MARGIN = %%MARGIN%%;
+let clearance = {};
+
+let maxRange = 4000, pts = [], clusters = [];
+let rpmL = 0, rpmR = 0, phaseL = 0, phaseR = 0, lastFrame = performance.now();
+let guardOn = true, guardBlocked = false, stopMm = 350;
+let yaw = null, roll = 0, pitch = 0, headingOk = false;
+
+// Camera. camWant is the operator's switch, camLive is whether the Pi is
+// actually producing frames. Both have to be true before the <img> gets a
+// src: pointing it at a dead stream leaves a broken-image icon on the page
+// and a socket open on the Pi for no reason.
+let camWant = true, camLive = false, camOn = false;
+let cliffOn = false, mkOn = false, mkLearn = false, detOn = false;
+let objects = [];
+// What goes over the live picture. Boxes by default - a label is only
+// checkable if you can see WHICH thing it was put on.
+let overlay = 'boxes';
+try { overlay = localStorage.getItem('nav.overlay') || 'boxes'; } catch(e) {}
+let shots = [], knownTags = [], autoMm = 0, mapHit = [];
+// 1x1 transparent GIF. Assigning this is what CLOSES an MJPEG connection —
+// img.src='' makes some browsers re-request the page itself, and simply
+// hiding the element leaves the stream running and the bandwidth spent.
+const BLANK = 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
+
+const RANGES = [1000, 2000, 4000, 8000];
+$('ranges').innerHTML = RANGES.map(r => `<button class="chip" data-r="${r}">${r/1000} m</button>`).join('');
+$('ranges').querySelectorAll('.chip').forEach(b => b.addEventListener('click', () => {
+  maxRange = +b.dataset.r; markRange(); }));
+function markRange(){ $('ranges').querySelectorAll('.chip')
+  .forEach(b => b.classList.toggle('sel', +b.dataset.r === maxRange)); }
+markRange();
+
+// Size a canvas from its CONTAINER, never from itself.
+//
+// c.clientWidth can be fed by the canvas's own width ATTRIBUTE whenever CSS
+// leaves a dimension auto - and draw() sets that attribute from clientWidth,
+// so the two chase each other and the canvas doubles 25 times a second until
+// the tab dies. It looks exactly like the robot being slow, and it came back
+// once after a CSS-only fix, so the guarantee belongs here in the JS rather
+// than resting on a stylesheet staying correct.
+//
+// The parent box is laid out by the grid and cannot depend on the canvas, so
+// measuring it is safe. The size is also clamped: if anything ever does feed
+// back, it stops at something survivable instead of locking the browser.
+function fitCanvas(c, self){
+  // `self` measures the canvas rather than its parent. Only for the IMU
+  // dials, whose CSS pins width to 100% and derives height from
+  // aspect-ratio - no auto dimension, so no path to the attribute - and
+  // whose parent box also contains the caption and value text.
+  const box = (self ? c : c.parentElement).getBoundingClientRect();
+  const w = Math.max(1, Math.min(2000, Math.round(box.width)));
+  const h = Math.max(1, Math.min(2000, Math.round(box.height)));
+  const dpr = Math.min(2, devicePixelRatio || 1);
+  const bw = Math.round(w*dpr), bh = Math.round(h*dpr);
+  if(c.width !== bw || c.height !== bh){ c.width = bw; c.height = bh; }
+  const g = c.getContext('2d');
+  g.setTransform(dpr,0,0,dpr,0,0);
+  g.clearRect(0,0,w,h);
+  return [g, w, h];
+}
+
+const css = k => getComputedStyle(document.documentElement).getPropertyValue(k).trim();
+const mm = v => v == null ? '—' : (v >= 1000 ? (v/1000).toFixed(2)+' m' : Math.round(v)+' mm');
+
+// ---------------------------------------------------------------- polar plot
+// ---------------------------------------------------------------- the plot
+//
+// Everything below works in the BODY frame: origin at the truck's geometric
+// centre, +x forward, +y LEFT. That is the frame body_points() in web_nav.py
+// builds and the frame the collision guard and SLAM judge against.
+//
+// It did not used to be. The old renderer applied the scanner's ROTATION to
+// each bearing and then drew it from the canvas centre, never applying the
+// scanner's POSITION. So the picture and the guard were working 250 mm apart
+// - the scanner sits on the back left corner, not the middle - and a wall the
+// guard called 350 mm away could be drawn somewhere else entirely. Points,
+// clusters, wedges and the truck are now all put through the same transform.
+
+let zoom = 1, panX = 0, panY = 0;      // pan is in mm, body frame
+
+// px per mm, and where the body origin lands on screen.
+function view(w, h){
+  const R = Math.min(w, h) / 2 - 26;
+  const s = R / maxRange * zoom;
+  return {s, R, ox: w / 2 - (0 - panY) * s, oy: h / 2 - (0 - panX) * s};
+}
+// body (mm) -> screen (px)
+function P(v, x, y){ return [v.ox - (y) * v.s, v.oy - (x) * v.s]; }
+
+// One scan return -> body frame. This is body_points() in JavaScript; if the
+// two ever disagree the picture is lying about what the guard can see.
+function toBody(a, d){
+  const r = a * Math.PI / 180;
+  let x = d * Math.cos(r), y = -d * Math.sin(r);
+  if(LIDAR_YAW){
+    const c = Math.cos(LIDAR_YAW * Math.PI / 180), sn = Math.sin(LIDAR_YAW * Math.PI / 180);
+    const nx = x * c - y * sn; y = x * sn + y * c; x = nx;
+  }
+  return [x + LIDAR_X, y + LIDAR_Y];
+}
+
+function draw(){
+  const now = performance.now(), dt = Math.min(0.1, (now - lastFrame)/1000);
+  lastFrame = now;
+  phaseL = (phaseL + rpmL/60*360*dt) % 360;
+  phaseR = (phaseR + rpmR/60*360*dt) % 360;
+
+  if(tab !== 'drive') return;
+  const c = $('plot');
+  const [g, w, h] = fitCanvas(c);
+  if(w < 2 || h < 2) return;
+
+  const v = view(w, h);
+  const [ox, oy] = [v.ox, v.oy];
+
+  // --- range rings, centred on the BODY, not on the scanner ---------------
+  g.font = '10px ui-monospace,monospace'; g.textAlign='center'; g.textBaseline='middle';
+  const span = maxRange / zoom;
+  const stepM = span <= 800 ? 0.25 : span <= 2000 ? 0.5 : span <= 4000 ? 1 : 2;
+  for(let m = stepM; m*1000 <= maxRange*1.6; m += stepM){
+    const r = m*1000*v.s;
+    if(r > Math.hypot(w,h)) break;
+    g.strokeStyle = css('--grid'); g.lineWidth = 1;
+    g.beginPath(); g.arc(ox,oy,r,0,6.2832); g.stroke();
+    g.fillStyle = css('--text-3'); g.fillText(m+' m', ox, oy-r-8);
+  }
+  for(let a = 0; a < 360; a += 45){
+    const rad = (a-90)*Math.PI/180;
+    g.strokeStyle = css('--grid'); g.globalAlpha = .5;
+    g.beginPath(); g.moveTo(ox,oy);
+    g.lineTo(ox+Math.cos(rad)*v.R*1.5, oy+Math.sin(rad)*v.R*1.5);
+    g.stroke(); g.globalAlpha = 1;
+  }
+
+  // --- the regions the guard ACTUALLY tests -------------------------------
+  //
+  // Not a pie slice. swept_obstacle() checks a RECTANGLE the full width of
+  // the truck plus margin when driving, and an ANNULUS out to the
+  // circumscribing radius when turning on the spot. A wedge is neither, so
+  // the old drawing could not be used to verify anything - an obstacle could
+  // sit inside the wedge and outside the tested box, or the reverse.
+  //
+  // Each region is coloured by its OWN clearance, so you can put something in
+  // front of the robot and watch that box go amber while the others stay
+  // clear. That is the check: if the box covers the obstacle and the guard
+  // has not blocked, the geometry is wrong.
+  if(guardOn) drawGuard(g, v);
+
+  // --- camera wedge, from where the LENS is ------------------------------
+  //
+  // Drawn from the camera's own position, not the body centre. The lens sits
+  // 150 mm forward, so a centre-drawn wedge overstates what it can see close
+  // in by exactly that much - which is the range the cliff check works at.
+  if(camLive && CAM_HFOV > 0){
+    const half = CAM_HFOV/2, mid = -90 - CAM_YAW;
+    const [sx, sy] = P(v, CAM_X, CAM_Y);
+    const a0 = (mid - half)*Math.PI/180, a1 = (mid + half)*Math.PI/180;
+    g.beginPath(); g.moveTo(sx,sy); g.arc(sx,sy,v.R*1.4,a0,a1); g.closePath();
+    g.fillStyle = css('--cam'); g.globalAlpha = .07; g.fill();
+    g.globalAlpha = .5; g.strokeStyle = css('--cam'); g.lineWidth = 1;
+    g.setLineDash([4,4]); g.stroke(); g.setLineDash([]); g.globalAlpha = 1;
+  }
+
+  // --- the scan ----------------------------------------------------------
+  g.fillStyle = css('--point');
+  const dot = Math.max(1.3, Math.min(3, v.s*900));
+  for(const [a,d] of pts){
+    if(d > maxRange*1.6) continue;
+    const [bx,by] = toBody(a,d);
+    const [sx,sy] = P(v,bx,by);
+    if(sx < -20 || sy < -20 || sx > w+20 || sy > h+20) continue;
+    g.beginPath(); g.arc(sx,sy,dot,0,6.2832); g.fill();
+  }
+
+  // Cluster circles used to be drawn here. They were removed: cluster
+  // identity is not stable frame to frame, so the rings flickered and
+  // renumbered constantly while telling you nothing the points did not
+  // already show. The clustering itself is still computed and still useful
+  // as a TABLE - it is on the Sensors tab, sorted by distance, where a
+  // number you can read beats a ring that moves.
+
+  drawTruck(g, v);
+  drawLegend(g, w, h, v);
+}
+
+// What the guard is testing, drawn exactly as swept_obstacle() computes it.
+function drawGuard(g, v){
+  const m = GUARD_MARGIN;
+  const hl = TRUCK.len/2, hw = TRUCK.wid/2;
+  const half = hw + m;
+
+  // A direction is blocked when its clearance is under the stop distance.
+  // clearance.* is null when nothing is in that region at all.
+  const blocked = k => clearance[k] != null && clearance[k] < stopMm;
+
+  // Body-frame rectangle -> screen. P() flips both axes, so min/max have to
+  // be taken after projecting rather than assumed.
+  const boxOf = (x0,x1,y0,y1) => {
+    const a = P(v,x0,y0), b = P(v,x1,y1);
+    return [Math.min(a[0],b[0]), Math.min(a[1],b[1]),
+            Math.abs(b[0]-a[0]), Math.abs(b[1]-a[1])];
+  };
+
+  const region = (r, bad, label) => {
+    g.fillStyle = bad ? css('--warning') : css('--text-3');
+    g.globalAlpha = bad ? .20 : .07;
+    g.fillRect(r[0],r[1],r[2],r[3]);
+    g.globalAlpha = bad ? .9 : .45;
+    g.strokeStyle = bad ? css('--warning') : css('--grid');
+    g.lineWidth = 1; g.setLineDash(bad ? [] : [3,3]);
+    g.strokeRect(r[0],r[1],r[2],r[3]); g.setLineDash([]);
+    if(label && r[2] > 40 && r[3] > 14){
+      g.globalAlpha = .85; g.font = '9px ui-monospace,monospace';
+      g.fillStyle = bad ? css('--warning') : css('--text-3');
+      g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.fillText(label, r[0]+r[2]/2, r[1]+r[3]/2);
+    }
+    g.globalAlpha = 1;
+  };
+
+  const reach = stopMm + m;
+  region(boxOf(hl, hl + reach, -half, half), blocked('fwd'),
+         clearance.fwd != null ? mm(clearance.fwd) : 'forward');
+  region(boxOf(-hl - reach, -hl, -half, half), blocked('rev'),
+         clearance.rev != null ? mm(clearance.rev) : 'reverse');
+
+  // Turning sweeps a circle of the circumscribing radius. Half margin, as in
+  // the Python: momentum carries a corner around the SAME circle, so only
+  // sensor noise and pose error have to be covered.
+  const cr = (Math.hypot(hl, hw) + m/2) * v.s;
+  const [cxp, cyp] = P(v, 0, 0);
+  const turnBad = blocked('turn');
+  g.strokeStyle = turnBad ? css('--warning') : css('--grid');
+  g.globalAlpha = turnBad ? .9 : .5; g.lineWidth = turnBad ? 1.5 : 1;
+  g.setLineDash([5,4]);
+  g.beginPath(); g.arc(cxp, cyp, cr, 0, 6.2832); g.stroke();
+  g.setLineDash([]); g.globalAlpha = 1;
+}
+
+// The truck, and every sensor drawn where it physically sits.
+function drawTruck(g, v){
+  const L = TRUCK.len*v.s, W = TRUCK.wid*v.s;
+  const [ox, oy] = P(v, 0, 0);
+  if(L < 5){
+    g.fillStyle = css('--text-2');
+    g.beginPath(); g.arc(ox,oy,3,0,6.2832); g.fill(); return;
+  }
+
+  // The chassis. Drawn with a chamfered nose rather than as a plain
+  // rectangle, because on a skid-steer the plot is the only thing telling
+  // you which way the robot faces - the shape has to say it at a glance,
+  // at any zoom, without reading a label.
+  g.save(); g.translate(ox, oy);
+  const nose = Math.min(L*0.22, W*0.30);          // chamfer, front corners
+  g.beginPath();
+  g.moveTo(-W/2 + nose, -L/2);
+  g.lineTo( W/2 - nose, -L/2);
+  g.lineTo( W/2, -L/2 + nose);
+  g.lineTo( W/2,  L/2 - 2);
+  g.arcTo( W/2,  L/2, W/2 - 3, L/2, Math.min(4, W/6));
+  g.lineTo(-W/2 + 3, L/2);
+  g.arcTo(-W/2,  L/2, -W/2, L/2 - 3, Math.min(4, W/6));
+  g.lineTo(-W/2, -L/2 + nose);
+  g.closePath();
+  g.fillStyle = css('--surface-2'); g.globalAlpha = .88; g.fill();
+  g.globalAlpha = 1;
+  g.strokeStyle = css('--text-3'); g.lineWidth = 1.2; g.stroke();
+
+  // Front edge picked out in the good colour: the single strongest cue for
+  // orientation, and it survives being only a few pixels long.
+  g.strokeStyle = css('--good'); g.lineWidth = Math.max(1.5, L*0.035);
+  g.globalAlpha = .95;
+  g.beginPath();
+  g.moveTo(-W/2 + nose, -L/2); g.lineTo(W/2 - nose, -L/2); g.stroke();
+  g.globalAlpha = 1;
+
+  // Heading ray out of the nose, so orientation reads even when the body is
+  // only a few pixels across.
+  g.strokeStyle = css('--good'); g.lineWidth = 1.2; g.globalAlpha = .5;
+  g.setLineDash([3,3]);
+  g.beginPath(); g.moveTo(0,-L/2); g.lineTo(0,-L/2 - Math.max(14, L*0.5));
+  g.stroke(); g.setLineDash([]); g.globalAlpha = 1;
+
+  // Wheels, turning at the measured RPM. The spoke is what makes direction
+  // visible: a plain block cannot show which way it is going round, and
+  // watching one side reverse while the other drives forward is how you see
+  // a skid-steer turning on the spot.
+  const wl = Math.max(4, L*0.30), ww = Math.max(3, W*0.16);
+  for(const [sx,sy,side] of [[-1,-1,'l'],[1,-1,'r'],[-1,1,'l'],[1,1,'r']]){
+    const x = sx*(W/2), y = sy*(L*0.27);
+    const col = side==='l' ? css('--series-1') : css('--series-2');
+    g.fillStyle = col; g.globalAlpha = .92;
+    g.beginPath(); g.roundRect(x-ww/2, y-wl/2, ww, wl, ww/2.2); g.fill();
+    g.globalAlpha = 1;
+    if(wl > 9){
+      const ph = (side==='l'?phaseL:phaseR)*Math.PI/180;
+      // Two spokes half a turn apart, so the tread reads as rotating rather
+      // than as one mark sliding up and down.
+      g.strokeStyle = '#fff'; g.lineWidth = 1.1;
+      for(const off of [0, Math.PI]){
+        const t = Math.sin(ph + off);
+        g.globalAlpha = .25 + .55*Math.abs(Math.cos(ph + off));
+        g.beginPath();
+        g.moveTo(x - ww/2 + 0.8, y + t*wl/2*0.78);
+        g.lineTo(x + ww/2 - 0.8, y + t*wl/2*0.78);
+        g.stroke();
+      }
+      g.globalAlpha = 1;
+    }
+  }
+  g.restore();
+
+  // Sensor markers. Labels appear once there is room for them rather than at
+  // a fixed zoom, so they never overlap into unreadability.
+  const label = L > 90;
+  marker(g, v, LIDAR_X, LIDAR_Y, css('--point'), 'LIDAR', LIDAR_YAW, label,
+         `${LIDAR_X.toFixed(0)}, ${LIDAR_Y.toFixed(0)} @ ${LIDAR_YAW.toFixed(0)}°`);
+  marker(g, v, IMU_X, IMU_Y, css('--imu'), 'IMU',
+         yaw === null ? null : -yaw, label,
+         yaw === null ? 'no fix' : `heading ${yaw.toFixed(0)}°`);
+  marker(g, v, CAM_X, CAM_Y, css('--cam'), 'CAM', CAM_YAW, label,
+         `${CAM_HFOV.toFixed(0)}° fov`);
+
+  if(label){
+    g.fillStyle = css('--text-3'); g.font = '9px ui-monospace,monospace';
+    g.textAlign = 'center';
+    g.fillText(`${TRUCK.len} × ${TRUCK.wid} mm`, ox, oy + L/2 + 12);
+  }
+}
+
+// A sensor: dot, facing arrow, and (when there is room) what it is.
+function marker(g, v, bx, by, colour, name, headingDeg, label, sub){
+  const [x, y] = P(v, bx, by);
+  g.fillStyle = colour;
+  g.beginPath(); g.arc(x, y, 4, 0, 6.2832); g.fill();
+  g.strokeStyle = colour; g.globalAlpha = .35; g.lineWidth = 1;
+  g.beginPath(); g.arc(x, y, 7.5, 0, 6.2832); g.stroke(); g.globalAlpha = 1;
+
+  if(headingDeg !== null && headingDeg !== undefined){
+    const rad = (-headingDeg - 90) * Math.PI/180, len = 17;
+    g.strokeStyle = colour; g.lineWidth = 1.6;
+    g.beginPath(); g.moveTo(x, y);
+    g.lineTo(x + Math.cos(rad)*len, y + Math.sin(rad)*len); g.stroke();
+    g.beginPath();
+    g.moveTo(x + Math.cos(rad)*len, y + Math.sin(rad)*len);
+    g.lineTo(x + Math.cos(rad+2.6)*6, y + Math.sin(rad+2.6)*6);
+    g.lineTo(x + Math.cos(rad-2.6)*6, y + Math.sin(rad-2.6)*6);
+    g.closePath(); g.fillStyle = colour; g.fill();
+  }
+  if(label){
+    g.fillStyle = colour; g.font = 'bold 9px ui-monospace,monospace';
+    g.textAlign = 'left'; g.textBaseline = 'middle';
+    g.fillText(name, x + 10, y - 5);
+    g.fillStyle = css('--text-3'); g.font = '8px ui-monospace,monospace';
+    g.fillText(sub, x + 10, y + 5);
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+  }
+}
+
+// Fixed overlay: which way is north, what scale we are at, and the numbers
+// currently driving the picture. Without these the plot is a pretty shape.
+function drawLegend(g, w, h, v){
+  g.font = '9px ui-monospace,monospace'; g.textAlign = 'left'; g.textBaseline = 'top';
+  const lines = [
+    `${(maxRange/zoom/1000).toFixed(2)} m across  ·  zoom ${zoom.toFixed(1)}×`,
+    `body frame  ·  +x forward  ·  +y left`,
+  ];
+  g.fillStyle = css('--text-3');
+  lines.forEach((t,i) => g.fillText(t, 8, 8 + i*12));
+
+  // north, as a small rose rather than a marker on a ring that no longer
+  // exists now the view pans
+  if(yaw !== null){
+    const rx = w - 26, ry = 26, rad = (-yaw - 90)*Math.PI/180;
+    g.strokeStyle = css('--border'); g.lineWidth = 1;
+    g.beginPath(); g.arc(rx, ry, 15, 0, 6.2832); g.stroke();
+    g.strokeStyle = headingOk ? css('--imu') : css('--text-3'); g.lineWidth = 2;
+    g.beginPath(); g.moveTo(rx, ry);
+    g.lineTo(rx + Math.cos(rad)*12, ry + Math.sin(rad)*12); g.stroke();
+    g.fillStyle = headingOk ? css('--imu') : css('--text-3');
+    g.font = 'bold 9px ui-monospace,monospace';
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillText('N', rx + Math.cos(rad)*20, ry + Math.sin(rad)*20);
+  }
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+}
+
+// --- zoom and pan ----------------------------------------------------------
+//
+// The projection is  sx = w/2 - (y - panY)*s ,  sy = h/2 - (x - panX)*s
+// so inverting it, the body point under a cursor offset (mx, my) from the
+// centre is  y = panY - mx/s ,  x = panX - my/s.
+// Both handlers below are just that algebra rearranged; the signs are worth
+// deriving rather than guessing, because a wrong one still "works" and only
+// feels subtly inverted.
+(function plotNav(){
+  const c = $('plot');
+  let dragging = false, lx = 0, ly = 0;
+  const box = () => c.parentElement.getBoundingClientRect();
+  const scale = () => (Math.min(box().width, box().height)/2 - 26)/maxRange*zoom;
+
+  c.addEventListener('wheel', e => {
+    e.preventDefault();
+    const s0 = scale();
+    zoom = Math.max(0.25, Math.min(24, zoom * (e.deltaY < 0 ? 1.15 : 1/1.15)));
+    const s1 = scale();
+    // Hold whatever is under the cursor still. Without this the view always
+    // creeps toward the centre and you lose the thing you were zooming at.
+    const b = box();
+    const mx = e.offsetX - b.width/2, my = e.offsetY - b.height/2;
+    panY += mx*(1/s1 - 1/s0);
+    panX += my*(1/s1 - 1/s0);
+    draw();
+  }, {passive:false});
+
+  c.addEventListener('pointerdown', e => {
+    dragging = true; lx = e.clientX; ly = e.clientY;
+    c.classList.add('drag'); c.setPointerCapture(e.pointerId);
+  });
+  c.addEventListener('pointermove', e => {
+    if(!dragging) return;
+    const s = scale();
+    // Content follows the finger: d(sx)/d(panY) = +s, likewise for x.
+    panY += (e.clientX - lx)/s;
+    panX += (e.clientY - ly)/s;
+    lx = e.clientX; ly = e.clientY;
+    draw();
+  });
+  const stop = () => { dragging = false; c.classList.remove('drag'); };
+  c.addEventListener('pointerup', stop);
+  c.addEventListener('pointercancel', stop);
+  c.addEventListener('dblclick', () => { zoom = 1; panX = panY = 0; draw(); });
+})();
+
+// ---------------------------------------------------------------- IMU dials
+function dialCtx(id){
+  const c = $(id);
+  if(!c.clientWidth) return null;      // hidden tab: nothing to draw on
+  const [g, w, h] = fitCanvas(c, true);
+  if(w < 2 || h < 2) return null;
+  return [g, w/2, h/2, Math.min(w,h)/2 - 6];
+}
+
+function drawCompass(){
+  const dc = dialCtx('compass');
+  if(!dc) return;
+  const [g, cx, cy, R] = dc;
+  g.strokeStyle = css('--border'); g.lineWidth = 1;
+  g.beginPath(); g.arc(cx,cy,R,0,6.2832); g.stroke();
+  if(yaw === null){
+    g.fillStyle = css('--text-3'); g.font = '11px ui-monospace,monospace';
+    g.textAlign='center'; g.textBaseline='middle'; g.fillText('no IMU', cx, cy);
+    return;
+  }
+  g.font = '10px ui-monospace,monospace'; g.textAlign='center'; g.textBaseline='middle';
+  // the card rotates, the robot stays pointing up — how a real compass reads
+  for(let a = 0; a < 360; a += 15){
+    const rad = (a - yaw - 90)*Math.PI/180;
+    const major = a % 90 === 0;
+    const r0 = R - (major ? 12 : 6);
+    g.strokeStyle = major ? css('--text-2') : css('--grid');
+    g.lineWidth = major ? 1.6 : 1;
+    g.beginPath();
+    g.moveTo(cx+Math.cos(rad)*r0, cy+Math.sin(rad)*r0);
+    g.lineTo(cx+Math.cos(rad)*R, cy+Math.sin(rad)*R); g.stroke();
+    if(major){
+      const lbl = {0:'N',90:'E',180:'S',270:'W'}[a];
+      g.fillStyle = a === 0 ? css('--imu') : css('--text-2');
+      g.fillText(lbl, cx+Math.cos(rad)*(R-22), cy+Math.sin(rad)*(R-22));
+    }
+  }
+  g.fillStyle = headingOk ? css('--imu') : css('--text-3');
+  g.beginPath(); g.moveTo(cx, cy-R+26); g.lineTo(cx-7, cy+9); g.lineTo(cx+7, cy+9);
+  g.closePath(); g.fill();
+  g.fillStyle = css('--text-3');
+  g.beginPath(); g.arc(cx,cy,3,0,6.2832); g.fill();
+}
+
+function drawHorizon(){
+  const dc = dialCtx('horizon');
+  if(!dc) return;
+  const [g, cx, cy, R] = dc;
+  g.save();
+  g.beginPath(); g.arc(cx,cy,R,0,6.2832); g.clip();
+  g.translate(cx, cy);
+  g.rotate(-roll*Math.PI/180);
+  const ppd = R/45;                       // pixels per degree of pitch
+  const yh = pitch*ppd;
+  g.fillStyle = css('--sky');    g.fillRect(-R*2, -R*2+yh, R*4, R*2);
+  g.fillStyle = css('--ground'); g.fillRect(-R*2, yh, R*4, R*2);
+  g.strokeStyle = css('--text-2'); g.lineWidth = 1.5;
+  g.beginPath(); g.moveTo(-R, yh); g.lineTo(R, yh); g.stroke();
+  g.strokeStyle = css('--text-3'); g.lineWidth = 1;
+  g.font = '8px ui-monospace,monospace'; g.textAlign='center'; g.textBaseline='middle';
+  for(const p of [-30,-20,-10,10,20,30]){
+    const y = yh - p*ppd, half = Math.abs(p) % 20 === 0 ? 20 : 11;
+    g.beginPath(); g.moveTo(-half, y); g.lineTo(half, y); g.stroke();
+  }
+  g.restore();
+  // fixed aircraft symbol
+  g.strokeStyle = css('--imu'); g.lineWidth = 2.5;
+  g.beginPath();
+  g.moveTo(cx-26, cy); g.lineTo(cx-9, cy); g.lineTo(cx, cy+7); g.lineTo(cx+9, cy);
+  g.lineTo(cx+26, cy); g.stroke();
+  g.strokeStyle = css('--border'); g.lineWidth = 1;
+  g.beginPath(); g.arc(cx,cy,R,0,6.2832); g.stroke();
+}
+
+// ---------------------------------------------------------------- input
+const keys = new Set();
+const MAP = {ArrowUp:'f',KeyW:'f',ArrowDown:'b',KeyS:'b',ArrowLeft:'l',KeyA:'l',ArrowRight:'r',KeyD:'r'};
+const PADS = {'p-f':'f','p-b':'b','p-l':'l','p-r':'r'};
+function paint(){ for(const [id,k] of Object.entries(PADS)) $(id).classList.toggle('on', keys.has(k)); }
+function sendDrive(){
+  const throttle = (keys.has('f')?1:0)-(keys.has('b')?1:0);
+  const steer = (keys.has('r')?1:0)-(keys.has('l')?1:0);
+  fetch('/drive',{method:'POST',headers:{'Content-Type':'application/json'},
+                  body:JSON.stringify({throttle,steer})});
+}
+addEventListener('keydown', e => {
+  if(e.code === 'Space'){ e.preventDefault(); cmd('/estop'); keys.clear(); paint(); return; }
+  const k = MAP[e.code]; if(!k || e.repeat) return;
+  e.preventDefault();                        // arrow keys must not scroll
+  keys.add(k); paint();
+  sendDrive();          // go now; waiting for the tick added up to 50 ms
+});
+addEventListener('keyup', e => { const k = MAP[e.code];
+  if(k){ e.preventDefault(); keys.delete(k); paint(); sendDrive(); } });
+addEventListener('blur', () => { keys.clear(); paint(); });   // never latch on
+for(const [id,k] of Object.entries(PADS)){
+  const el = $(id);
+  const on = e => { e.preventDefault(); keys.add(k); paint(); sendDrive(); };
+  const off = e => { e.preventDefault(); keys.delete(k); paint(); sendDrive(); };
+  el.addEventListener('pointerdown', on);
+  ['pointerup','pointerleave','pointercancel'].forEach(ev => el.addEventListener(ev, off));
+}
+$('p-s').addEventListener('click', () => { keys.clear(); paint(); cmd('/stop'); });
+let wasActive = false;
+setInterval(() => { const a = keys.size > 0; if(a || wasActive) sendDrive(); wasActive = a; }, 50);
+
+// ---------------------------------------------------------------- commands
+function cmd(u){ fetch(u,{method:'POST'}).then(poll); }
+function post(u,b){ return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},
+                                    body:JSON.stringify(b)}).then(poll); }
+function toggle(k){ post('/invert', {[k]: !$('t-'+k).classList.contains('on')}); }
+function toggleGuard(){ post('/guard', {enabled: !guardOn}); }
+
+// The <img> is created and destroyed rather than shown and hidden. An MJPEG
+// response never ends on its own, so a hidden <img> keeps its connection
+// open, keeps the Pi encoding for nobody, and keeps one of Chrome's six
+// per-host sockets busy — which is enough to make the drive commands queue.
+function applyCam(){
+  const want = camWant && camLive;
+  $('t-cam').classList.toggle('g-on', camWant);
+  if(want === camOn) return;                 // no needless reconnects
+  camOn = want;
+  const wrap = document.querySelector('.camwrap');
+  let img = wrap.querySelector('img');
+  if(want){
+    if(!img){ img = new Image(); img.alt = 'camera';
+              ($('camrot') || wrap).insertBefore(img, $('cliffgrid')); }
+    // Cache-buster: without it a browser will happily reuse the dead socket
+    // from the previous attempt and the picture never comes back.
+    img.src = '/camera.mjpg?t=' + Date.now();
+    $('camoff').style.display = 'none';
+    $('camdot').style.display = '';
+  } else {
+    if(img){ img.src = BLANK; img.remove(); }
+    $('camoff').style.display = '';
+    $('camdot').style.display = 'none';
+  }
+}
+function toggleCam(){ camWant = !camWant; applyCam(); }
+
+function setDetectUrl(){
+  post('/detect', {url: $('d-url').value.trim()})
+    .then(() => flash('Detection server set. Blank the box to go back on-board.'));
+}
+
+function setOverlay(v){
+  overlay = v;
+  try { localStorage.setItem('nav.overlay', v); } catch(e) {}
+  document.querySelectorAll('#overlays .chip').forEach(b =>
+    b.classList.toggle('sel', b.dataset.ov === v));
+  $('cliffgrid').style.display = v === 'floor' ? '' : 'none';
+  $('detboxes').style.display  = v === 'boxes' ? '' : 'none';
+}
+document.querySelectorAll('#overlays .chip').forEach(b =>
+  b.addEventListener('click', () => setOverlay(b.dataset.ov)));
+setOverlay(overlay);
+
+// Detection boxes over the live picture.
+//
+// Percentages, not pixels: the frame is letterboxed into a container of
+// unknown size and may be rotated a quarter turn, and a percentage rides
+// through both without this code knowing either.
+function drawBoxes(seen){
+  const el = $('detboxes');
+  if(overlay !== 'boxes'){ if(el.childElementCount) el.innerHTML = ''; return; }
+  if(!seen || !seen.length){ if(el.childElementCount) el.innerHTML = ''; return; }
+  el.innerHTML = seen.filter(o => o.box).map(o => {
+    const [x0,y0,x1,y1] = o.box;
+    // A box with no range behind it was seen but could not be placed.
+    const cls = o.placed ? 'detbox' : 'detbox noplace';
+    const tag = o.label.replace('_',' ') + ' ' + ((o.conf*100)|0) + '%'
+              + (o.range != null ? ' · ' + mm(o.range) : ' · no range');
+    return `<div class="${cls}" style="left:${(x0*100).toFixed(2)}%;`
+         + `top:${(y0*100).toFixed(2)}%;`
+         + `width:${((x1-x0)*100).toFixed(2)}%;`
+         + `height:${((y1-y0)*100).toFixed(2)}%"><b>${tag}</b></div>`;
+  }).join('');
+}
+
+// Prose off by default. It is what a new person needs and what everyone else
+// is scrolling past, so it gets one switch rather than a compromise.
+function toggleDocs(){
+  const on = document.body.classList.toggle('docs');
+  try { localStorage.setItem('nav.docs', on ? '1' : ''); } catch(e) {}
+  // The canvases are sized by the space left over, which just changed.
+  requestAnimationFrame(() => { draw(); drawMap(); });
+}
+try { if(localStorage.getItem('nav.docs')) document.body.classList.add('docs'); }
+catch(e) {}
+
+// The floor grid, drawn over the video as plain DOM rather than a canvas.
+// It sits on top of an <img> that is being replaced 15 times a second, and
+// a canvas would have to be composited against a stream it cannot read.
+function drawCliff(cf){
+  const el = $('cliffgrid');
+  if(overlay !== 'floor' || !cf || !cf.cells || !cf.cells.length || !cliffOn){
+    el.innerHTML = ''; return; }
+  const R = cf.rows, C = cf.cols;
+  if(el.dataset.k !== R+'x'+C){
+    el.style.gridTemplateColumns = `repeat(${C},1fr)`;
+    el.style.gridTemplateRows = `repeat(${R},1fr)`;
+    el.dataset.k = R+'x'+C;
+  }
+  el.innerHTML = cf.cells.flat().map(v =>
+    `<div class="${v===2?'cc2':v===1?'cc1':''}"></div>`).join('');
+}
+function snap(){
+  fetch('/camera/snap', {method:'POST'}).then(r => r.json()).then(d => {
+    $('camnote').textContent = d.ok ? ('Saved test/captures/' + d.file)
+                                    : ('Could not save — ' + (d.error || 'no frame'));
+  }).catch(() => { $('camnote').textContent = 'Could not reach the robot.'; });
+}
+$('lim').addEventListener('input', e => {
+  const v = e.target.value/100; $('limv').textContent = v.toFixed(2); post('/limit',{value:v}); });
+addEventListener('click', () => $('focusnote').classList.remove('show'), {once:true});
+
+
+// ---------------------------------------------------------------- map
+let autoOn = false;
+let calTouched = 0;
+// The scanner's mounting is now three ordinary tunables rendered into
+// #tune-mount, so there is one code path for every parameter instead of a
+// bespoke one for these three. The +-1 buttons remain because a degree at a
+// time against a wall is genuinely how you converge on the last bit.
+//
+// poll() re-syncs from the server every 150 ms, so a change needs a hold-off
+// or it can be reverted before its POST lands.
+const CAL_HOLD_MS = 1500;
+function nudgeYaw(step){
+  const it = tuneItems.find(t => t.key === 'lidar_yaw');
+  if(!it) return;
+  calTouched = Date.now();
+  const v = Math.max(-180, Math.min(180, it.value + step));
+  it.value = v;
+  LIDAR_YAW = v;                      // redraw instantly, then tell the server
+  $('lyawv').textContent = v.toFixed(0) + '°';
+  document.querySelectorAll('[data-v="lidar_yaw"]').forEach(nd =>
+    nd.textContent = v.toFixed(0) + ' deg');
+  document.querySelectorAll('[data-k="lidar_yaw"]').forEach(nd => nd.value = v);
+  draw();
+  tuneSet('lidar_yaw', v);
+}
+
+// --- measuring the mounting, instead of eyeballing it ----------------------
+//
+// Two presses with a push in between. The result carries a residual and a
+// quality, so "is it right yet" has an answer rather than a feeling.
+function pushStart(){
+  fetch('/calibrate/push', {method:'POST', headers:{'Content-Type':'application/json'},
+                            body: JSON.stringify({action:'start'})})
+    .then(r => r.json()).then(d => {
+      showCal(d.message || '', d.ok ? 'info' : 'warn');
+      if(d.ok){ $('cal-start').style.display = 'none';
+                $('cal-finish').style.display = ''; }
+    }).catch(() => showCal('Could not reach the robot.', 'warn'));
+}
+
+function pushFinish(){
+  fetch('/calibrate/push', {method:'POST', headers:{'Content-Type':'application/json'},
+                            body: JSON.stringify({action:'finish'})})
+    .then(r => r.json()).then(d => {
+      $('cal-start').style.display = ''; $('cal-finish').style.display = 'none';
+      let html = `<div>${d.message || ''}</div>`;
+      if(d.quality !== undefined){
+        html += `<div style="margin-top:6px">quality <b>${d.quality.toFixed(2)}</b>`
+              + ` &middot; residual <b>${d.residual_mm.toFixed(0)} mm</b>`
+              + ` &middot; ${d.bins} bearings</div>`;
+      }
+      if(d.ok){
+        html += `<div class="tog" style="margin-top:9px">`
+              + `<button onclick="pushApply('yaw')">Use ${d.nose_deg.toFixed(1)}&deg; rotation</button>`
+              + (d.implied_cpr
+                  ? `<button onclick="pushApply('cpr')">Use ${d.implied_cpr} counts/rev</button>` : '')
+              + `</div>`;
+      }
+      showCal(html, d.ok ? 'info' : 'warn', true);
+      fetchTune();
+    }).catch(() => showCal('Could not reach the robot.', 'warn'));
+}
+
+function pushApply(what){
+  fetch('/calibrate/push', {method:'POST', headers:{'Content-Type':'application/json'},
+                            body: JSON.stringify({action:'apply', what:what})})
+    .then(r => r.json()).then(() => { fetchTune(); calTouched = Date.now();
+      showCal('Applied. Press <b>Save</b> on the Tune tab to keep it.', 'info', true); });
+}
+
+function showCal(msg, kind, html){
+  const el = $('calresult');
+  el.style.display = '';
+  el.style.borderColor = kind === 'warn' ? 'var(--warning)' : 'var(--border)';
+  if(html) el.innerHTML = msg; else el.textContent = msg;
+}
+
+function savePlace(){
+  const n = $('pname').value.trim();
+  if(n){ post('/places',{name:n}); $('pname').value=''; }
+}
+function renderPlaces(d){
+  const list = Object.entries(d || {});
+  $('places').innerHTML = list.length
+    ? list.map(([k,v]) =>
+        `<span class="place">${k}` +
+        `<button class="b-auto" onclick="post('/goto',{name:'${k}'})">Go</button>` +
+        `<button class="x" onclick="post('/places',{name:'${k}',delete:true})">×</button>` +
+        `</span>`).join('')
+    : '<span class="note">no places saved yet</span>';
+}
+function refreshPlaces(){
+  fetch('/places').then(r=>r.json()).then(d=>renderPlaces(d.places)).catch(()=>{});
+}
+setInterval(refreshPlaces, 4000); refreshPlaces();
+
+function toggleAuto(){ post('/explore', autoOn ? {stop:true} : {start:true}); }
+let slamOn = true, matchOn = true, mapImg = null, trail = [], mapMeta = null;
+const mapBuf = document.createElement('canvas');
+
+function fetchMap(){
+  fetch('/map').then(r => r.json()).then(d => {
+    mapMeta = d; trail = d.trail || [];
+    const raw = atob(d.data), n = d.n;
+    mapBuf.width = n; mapBuf.height = n;
+    const ctx = mapBuf.getContext('2d');
+    const img = ctx.createImageData(n, n);
+    for(let i = 0; i < raw.length; i++){
+      const p = raw.charCodeAt(i);
+      // 128 = unknown -> grey; below = free (dark); above = occupied (white)
+      let v, a;
+      if(p === 128){ v = 40; a = 255; }
+      else if(p < 128){ v = 22 + (p/128)*14; a = 255; }
+      else { v = 90 + ((p-128)/127)*165; a = 255; }
+      const j = i*4;
+      img.data[j] = img.data[j+1] = img.data[j+2] = v; img.data[j+3] = a;
+    }
+    ctx.putImageData(img, 0, 0);
+    mapImg = true;
+    drawMap();
+  }).catch(() => {});
+}
+
+function drawMap(){
+  if(tab !== 'map') return;
+  const c = $('map');
+  const [g, w, h] = fitCanvas(c);
+  if(w < 2 || h < 2 || !mapMeta) return;
+  const n = mapMeta.n, S = Math.min(w,h)/n;      // pixels per cell
+  g.imageSmoothingEnabled = false;
+  // grid row 0 is -y, and canvas y grows downward, so flip to put +y up
+  g.save(); g.translate(0, h); g.scale(1, -1);
+  if(mapImg) g.drawImage(mapBuf, 0, 0, n*S, n*S);
+  g.restore();
+
+  const X = mx => (mx/mapMeta.res + mapMeta.half)*S;
+  const Y = my => h - (my/mapMeta.res + mapMeta.half)*S;
+
+  if(trail.length > 1){
+    g.strokeStyle = css('--imu'); g.lineWidth = 1.5; g.globalAlpha = .85;
+    g.beginPath();
+    trail.forEach(([x,y],i) => i ? g.lineTo(X(x),Y(y)) : g.moveTo(X(x),Y(y)));
+    g.stroke(); g.globalAlpha = 1;
+  }
+  const p = mapMeta.pose;
+  const px = X(p.x), py = Y(p.y), th = -p.deg*Math.PI/180;   // screen y is up
+  g.fillStyle = css('--good');
+  g.beginPath();
+  g.moveTo(px + Math.cos(th)*9, py + Math.sin(th)*9);
+  g.lineTo(px + Math.cos(th+2.5)*6, py + Math.sin(th+2.5)*6);
+  g.lineTo(px + Math.cos(th-2.5)*6, py + Math.sin(th-2.5)*6);
+  g.closePath(); g.fill();
+
+  // Known markers. Squares, because they are squares.
+  g.fillStyle = css('--cam');
+  knownTags.forEach(t => {
+    const x = X(t.x), y = Y(t.y);
+    g.fillRect(x-3.5, y-3.5, 7, 7);
+    g.font = '8px ui-monospace,monospace'; g.textAlign = 'center';
+    g.fillText(t.id, x, y-6);
+  });
+
+  // Object labels. Drawn before the photo pins so a pin stays clickable.
+  g.font = '9px ui-monospace,monospace'; g.textAlign = 'center';
+  objects.forEach(o => {
+    const x = X(o.x), y = Y(o.y);
+    g.fillStyle = css('--obj');
+    g.beginPath(); g.arc(x, y, 3.5, 0, 6.2832); g.fill();
+    g.globalAlpha = .9;
+    g.fillText(o.label.replace('_',' '), x, y - 7);
+    g.globalAlpha = 1;
+  });
+
+  // Photo pins, and where each one is on screen so a click can find it.
+  // Recorded here rather than recomputed on click: the map is pan-free but
+  // it does rescale with the window, and two copies of the projection would
+  // drift apart the first time one changed.
+  mapHit = [];
+  g.globalAlpha = .9;
+  shots.forEach(sh => {
+    if(sh.x === undefined) return;
+    const x = X(sh.x), y = Y(sh.y);
+    g.fillStyle = css('--cam');
+    g.beginPath(); g.arc(x, y, 2.6, 0, 6.2832); g.fill();
+    mapHit.push({x, y, file: sh.file});
+  });
+  g.globalAlpha = 1;
+}
+
+// Click a pin to open the picture taken there. 9 px of slack, because a
+// 2.6 px dot is not a realistic target on a phone.
+$('map').addEventListener('click', e => {
+  const r = $('map').getBoundingClientRect();
+  const cx = e.clientX - r.left, cy = e.clientY - r.top;
+  let best = null, bd = 9;
+  mapHit.forEach(h => {
+    const d = Math.hypot(h.x-cx, h.y-cy);
+    if(d < bd){ bd = d; best = h; }
+  });
+  if(best) window.open('/captures/' + encodeURIComponent(best.file));
+});
+
+function fetchShots(){
+  fetch('/captures').then(r => r.json()).then(d => {
+    shots = d.captures || [];
+    autoMm = d.auto_mm || 0;
+    $('shotcount').textContent = shots.length ? shots.length + ' stills' : 'none yet';
+    $('t-auto-mm').classList.toggle('g-on', autoMm > 0);
+    // Newest first, and capped: the map keeps every pin, but a few hundred
+    // thumbnails would be several megabytes of images on every refresh.
+    $('shots').innerHTML = shots.slice(-48).reverse().map(sh => {
+      const where = sh.x === undefined ? sh.why
+        : (sh.x/1000).toFixed(1) + ', ' + (sh.y/1000).toFixed(1) + ' m';
+      const f = encodeURIComponent(sh.file);
+      return `<a href="/captures/${f}" target="_blank" title="${sh.file}">`
+           + `<img src="/captures/${f}" loading="lazy" alt="">`
+           + `<div class="lbl">${where}</div></a>`;
+    }).join('');
+  }).catch(() => {});
+}
+function toggleAutoShots(){ post('/captures/auto', {mm: autoMm > 0 ? 0 : 500})
+                              .then(fetchShots); }
+setInterval(fetchShots, 5000);
+fetchShots();
+
+setInterval(fetchMap, 1000);
+fetchMap();
+addEventListener('resize', drawMap);
+
+function poll(){
+  fetch('/state').then(r => r.json()).then(d => {
+    const m = d.motors, l = d.lidar, gd = d.guard, im = d.imu;
+
+    $('badge').className = 'badge ' + (m.enabled ? 'on':'off');
+    $('badge').innerHTML = '<i class="dot"></i>' + (m.enabled ? 'ENABLED':'DISABLED');
+    $('lbadge').className = 'badge ' + (l.connected && l.count ? 'on':'off');
+    $('lbadge').innerHTML = '<i class="dot"></i>' + (l.connected && l.count ? 'SCANNING':'NO LIDAR');
+    $('trip').classList.toggle('show', !!m.tripped);
+
+    const cl = gd.clear || {};
+    clearance = cl;
+    $('cl-fwd').textContent  = cl.fwd  != null ? mm(cl.fwd)  : (gd.enabled ? 'clear' : '—');
+    $('cl-rev').textContent  = cl.rev  != null ? mm(cl.rev)  : (gd.enabled ? 'clear' : '—');
+    $('cl-turn').textContent = cl.turn != null ? mm(cl.turn) : (gd.enabled ? 'clear' : '—');
+
+    $('l-bad').textContent  = l.bad != null ? l.bad : '—';
+    $('l-port').textContent = l.port || (l.connected ? 'connected' : 'none');
+    $('s-lrpm').textContent = m.left_rpm.toFixed(1);
+    $('s-rrpm').textContent = m.right_rpm.toFixed(1);
+
+    guardBlocked = gd.blocked;
+    $('blocked').classList.toggle('show', gd.blocked);
+    $('blocked').textContent = '⛔ Forward blocked — ' + gd.reason;
+
+    rpmL = m.left_rpm; rpmR = m.right_rpm;
+    $('lr').textContent = m.left_rpm.toFixed(1);
+    $('rr').textContent = m.right_rpm.toFixed(1);
+    for(const k of ['left','right','swap']) $('t-'+k).classList.toggle('on', !!m.invert[k]);
+    guardOn = gd.enabled; stopMm = gd.stop_mm;
+    $('t-guard').className = guardOn ? 'g-on' : '';
+    $('t-guard').textContent = guardOn ? 'Guard ON' : 'Guard OFF';
+    if(document.activeElement !== $('lim')){
+      $('lim').value = Math.round(m.limit*100); $('limv').textContent = m.limit.toFixed(2); }
+    $('lim').max = Math.round(m.max_duty*100);
+
+    pts = l.points; clusters = l.clusters || [];
+    const gm = (d.guard && d.guard.geom) || {};
+    const calIdle = Date.now() - calTouched > CAL_HOLD_MS;
+    // The scanner's POSITION matters to the plot as much as its rotation: it
+    // sits on a corner, and drawing its returns from the body centre is what
+    // used to put the picture 250 mm away from what the guard was judging.
+    // Set unconditionally — unlike the input fields below, these are only
+    // ever written by the server, so there is no user edit to trample.
+    if(gm.lx !== undefined){ LIDAR_X = gm.lx; LIDAR_Y = gm.ly; }
+    if(gm.len !== undefined){ TRUCK.len = gm.len; TRUCK.wid = gm.wid; }
+    if(gm.sector !== undefined) SECTOR_LIVE = gm.sector;
+    if(gm.margin !== undefined) GUARD_MARGIN = gm.margin;
+    if(gm.yaw !== undefined && calIdle){
+      LIDAR_YAW = gm.yaw;
+      $('lyawv').textContent = gm.yaw.toFixed(0)+'°';
+    }
+    $('hz').textContent = l.hz.toFixed(1)+' Hz';
+    $('count').textContent = l.count;
+    $('ahead').textContent = mm(l.ahead);
+    $('objs').innerHTML = clusters.filter(c => c.near <= maxRange).map((c,i) =>
+        `<tr><td><span class="idx">${i+1}</span></td><td class="n">${c.bearing.toFixed(0)}°</td>`
+      + `<td class="n">${mm(c.near)}</td><td>${mm(c.width)}</td>`
+      + `<td>${c.span.toFixed(0)}°</td><td>${c.points}</td></tr>`).join('');
+
+    // --- IMU ---
+    const live = im.present && im.ready;
+    $('ibadge').className = 'badge ' + (live ? (im.heading_ok ? 'on':'warn') : 'off');
+    $('ibadge').innerHTML = '<i class="dot"></i>' +
+      (live ? (im.heading_ok ? 'IMU OK' : 'IMU — HDG DRIFT') : 'NO IMU');
+    $('imuname').textContent = im.name || (im.error || 'not detected');
+
+    if(live){
+      yaw = im.yaw; roll = im.roll; pitch = im.pitch; headingOk = im.heading_ok;
+      $('yaw').textContent = im.yaw.toFixed(0)+'°';
+      $('rp').textContent = im.roll.toFixed(0)+'° / '+im.pitch.toFixed(0)+'°';
+      $('s-roll').textContent = im.roll.toFixed(1)+'°';
+      $('s-pitch').textContent = im.pitch.toFixed(1)+'°';
+      const gz = im.gyro[2];
+      $('s-gz').textContent = gz.toFixed(1)+' °/s';
+      $('s-enc').textContent = m.enc_yaw_rate.toFixed(1)+' °/s';
+      const slip = Math.abs(gz - m.enc_yaw_rate);
+      const moving = Math.abs(m.left_rpm) + Math.abs(m.right_rpm) > 10;
+      $('s-slip').textContent = moving ? slip.toFixed(1)+' °/s' : '—';
+      $('s-slip').style.color = (moving && slip > 15) ? css('--warning') : '';
+      $('s-temp').textContent = im.temp != null ? im.temp.toFixed(0)+' °C' : '—';
+
+      const tilt = Math.max(Math.abs(im.roll), Math.abs(im.pitch));
+      $('tilt').classList.toggle('show', tilt > TILT_WARN);
+      $('tilt').textContent = '⚠ Tilted ' + tilt.toFixed(0) + '° — a skid-steer loses traction well before it tips.';
+
+      $('imunote').textContent = im.heading_ok
+        ? (im.fused ? 'Fused on-chip.' : 'Complementary filter: gravity sets roll/pitch, magnetometer sets heading.')
+        : 'No magnetometer fix — heading is gyro-only and will drift. Run imu_test.py --calibrate.';
+    } else {
+      yaw = null;
+      for(const id of ['yaw','rp','s-roll','s-pitch','s-gz','s-enc','s-slip','s-temp'])
+        $(id).textContent = '—';
+      $('tilt').classList.remove('show');
+      $('imunote').textContent = im.error || 'No IMU detected. i2cdetect -y 1, then WIRING.md §11.';
+    }
+    const sl = d.slam;
+    slamOn = sl.enabled; matchOn = sl.matching;
+    $('t-slam').className = slamOn ? 'g-on' : '';
+    $('t-slam').textContent = slamOn ? 'SLAM ON' : 'SLAM OFF';
+    $('t-match').className = matchOn ? 'g-on' : '';
+    $('t-match').textContent = matchOn ? 'Match ON' : 'Match OFF';
+    $('px').textContent = mm(sl.pose.x);
+    $('py').textContent = mm(sl.pose.y);
+    $('pth').textContent = sl.pose.deg.toFixed(0)+'°';
+    $('pdist').textContent = mm(sl.distance_mm);
+    $('pscans').textContent = sl.scans;
+    $('pcorr').textContent = sl.correction.x.toFixed(0)+', '+sl.correction.y.toFixed(0)
+                           +' mm / '+sl.correction.deg.toFixed(1)+'°';
+    $('pms').textContent = sl.ms.toFixed(1)+' ms';
+    $('pcnt').textContent = sl.counts[0]+' / '+sl.counts[1];
+    $('slamnote').textContent = sl.imu_heading
+      ? 'Heading from the IMU; scan matching correcting the rest.'
+      : 'No IMU heading fix — heading is coming from wheel difference, which slip corrupts fast.';
+
+    const ex = d.explore || {};
+    autoOn = !!ex.running;
+    $('b-auto').classList.toggle('on', autoOn);
+    $('b-auto').textContent = autoOn ? 'STOP AUTO-MAP' : 'START AUTO-MAP';
+    $('autostate').textContent = autoOn
+      ? `${ex.state}${ex.goal ? ' → '+ex.goal : ''}  ·  `
+        + `${ex.cal_stage && ex.cal_stage!=='done' ? ex.cal_stage : ex.message}`
+        + `  ·  frontiers ${ex.frontiers}  path ${ex.path_len}  ${ex.elapsed}s`
+      : (ex.message || 'idle');
+    const cr = ex.cal_results || {}, cn = ex.cal_notes || [];
+    if(Object.keys(cr).length || cn.length){
+      $('calbox').style.display = 'block';
+      $('calbox').innerHTML = 'calibration: '
+        + Object.entries(cr).map(([k,v]) => `${k} <b>${v}</b>`).join(' &nbsp; ')
+        + cn.map(n => `<div class="calnote">⚠ ${n}</div>`).join('');
+    } else { $('calbox').style.display = 'none'; }
+
+    // --- camera ---
+    const cm = d.camera || {present:false};
+    camLive = !!(cm.present && cm.live);
+    $('cbadge').className = 'badge ' + (camLive ? 'on' : (cm.present ? 'warn':'off'));
+    $('cbadge').innerHTML = '<i class="dot"></i>' +
+      (camLive ? 'CAMERA' : (cm.present ? 'CAM STALLED' : 'NO CAM'));
+    $('camname').textContent = cm.name || (cm.error || 'not detected');
+
+    // Bearing drives the wedge on the plot; rotation only turns the picture.
+    if(cm.yaw !== undefined) CAM_YAW = cm.yaw;
+    const rot = ((cm.rotation || 0) % 360 + 360) % 360;
+    const rr = $('camrot');
+    if(rr && rr.dataset.rot !== String(rot)){
+      rr.dataset.rot = String(rot);
+      rr.className = 'camrot' + (rot ? ' r' + rot : '');
+    }
+    // A sideways camera makes the floor check measure the wrong direction:
+    // it reads the raw frame and assumes the bottom row is the nearest
+    // floor. Say so instead of letting it report confident nonsense.
+    const rotBad = (rot === 90 || rot === 270) && cliffOn;
+    $('cliffwarn').classList.toggle('show', rotBad);
+    if(cm.present){
+      $('c-size').textContent = cm.size ? cm.size.join('×') : '—';
+      // Asked-for rate next to measured. They diverge when something else on
+      // the Pi is eating the CPU, which is the fault this panel exists to
+      // make visible before it turns into a frozen picture mid-drive.
+      $('c-hz').textContent = cm.hz.toFixed(1) + ' / ' + cm.fps + ' fps';
+      $('c-frames').textContent = cm.frames;
+      $('c-enc').textContent = cm.encoder || '—';
+      $('c-fov').textContent = cm.hfov.toFixed(0) + '°'
+        + (cm.yaw ? ' @ ' + cm.yaw.toFixed(0) + '°' : '');
+      if(!camLive)
+        $('camnote').textContent = 'Camera opened but stopped delivering '
+          + 'frames — usually a ribbon seated well enough to enumerate but '
+          + 'not to stream.';
+      else if($('camnote').textContent.startsWith('Camera opened'))
+        $('camnote').textContent = '';
+    } else {
+      $('c-size').textContent = $('c-hz').textContent =
+        $('c-frames').textContent = $('c-fov').textContent =
+        $('c-enc').textContent = '—';
+      $('camoff').textContent = cm.error
+        || 'No CSI camera detected. Check the ribbon, then run '
+           + 'python test/camera_test.py --list';
+    }
+    applyCam();
+
+    // --- floor check ---
+    const cf = d.cliff || {};
+    cliffOn = !!cf.enabled;
+    $('t-cliff').classList.toggle('g-on', cliffOn);
+    const fbad = cliffOn && cf.blocked;
+    $('fbadge').className = 'badge ' + (!cliffOn ? 'off' : (fbad ? 'warn':'on'));
+    $('fbadge').innerHTML = '<i class="dot"></i>' +
+      (!cliffOn ? 'FLOOR OFF' : (fbad ? (cf.cliff ? 'DROP-OFF':'OBSTACLE') : 'FLOOR OK'));
+    $('cliffstate').textContent = cf.error ? cf.error
+      : (!cliffOn ? 'off' : (cf.ready ? (cf.reason || 'clear') : 'learning'));
+    $('f-near').textContent = cf.clear_mm != null ? mm(cf.clear_mm) : '—';
+    $('f-geom').textContent = (cf.pitch != null)
+      ? cf.pitch.toFixed(0)+'° down, '+cf.height.toFixed(0)+' mm up' : '—';
+    $('f-ms').textContent = cf.ms != null ? cf.ms.toFixed(1)+' ms' : '—';
+    $('cliffbanner').classList.toggle('show', fbad);
+    $('cliffbanner').textContent = (cf.cliff ? '⚠ Drop-off — ' : '⚠ Low obstacle — ')
+      + cf.reason + '. The LiDAR cannot see this; forward is vetoed.';
+    drawCliff(cf);
+
+    // --- markers ---
+    const mk = d.markers || {};
+    mkOn = !!mk.enabled; mkLearn = !!mk.learn;
+    knownTags = mk.known || [];
+    $('t-mk').classList.toggle('g-on', mkOn);
+    $('t-learn').classList.toggle('on', mkLearn);
+    const nseen = (mk.seen || []).length;
+    $('mbadge').className = 'badge ' + (!mk.ok ? 'off' : (nseen ? 'on':'warn'));
+    $('mbadge').innerHTML = '<i class="dot"></i>' +
+      (!mk.ok ? 'NO ARUCO' : (nseen ? nseen+' TAG'+(nseen>1?'S':'') : 'TAGS 0'));
+    $('tagcount').textContent = mk.ok
+      ? (mk.tags||0) + ' known' + (mkLearn ? ' · learning' : '') : (mk.error||'—');
+    // In view now, then the rest of what is on the map.
+    const seenIds = new Set((mk.seen||[]).map(t => t.id));
+    $('taglist').innerHTML = (mk.seen||[]).map(t =>
+        `<span class="tag ${t.used?'fix':'on'}" title="${t.known?'known':'unknown'}">`
+        + `${t.id} · ${mm(t.dist)} · ${t.bearing}°</span>`).join('')
+      + knownTags.filter(t => !seenIds.has(t.id)).map(t =>
+        `<span class="tag" title="seen ${t.n}x">${t.id}</span>`).join('');
+    $('m-fix').textContent = mk.fixes != null ? mk.fixes : '—';
+    $('m-rej').textContent = mk.rejected ? mk.rejected + ' ⚠' : (mk.ok ? '0' : '—');
+    $('m-last').textContent = mk.last_fix
+      ? mm(mk.last_fix.err) + ' from tag ' + mk.last_fix.tags.join(',') : '—';
+    $('m-ms').textContent = mk.ms != null ? mk.ms.toFixed(1)+' ms' : '—';
+    if(mk.last_reject) $('mknote').dataset.warn = mk.last_reject;
+
+    // --- top bar and the Tune tab's live-effect panel ---
+    // `sl` is the d.slam bound further up this callback; redeclaring it here
+    // was a SyntaxError that took the whole page down with it.
+    if(sl.pose){
+      $('toppose').innerHTML =
+        `<b>${(sl.pose.x/1000).toFixed(2)}, ${(sl.pose.y/1000).toFixed(2)}</b> m`
+        + ` · <b>${sl.pose.deg.toFixed(0)}°</b>`;
+    }
+    if(sl.counts){
+      $('s-cnt').textContent = sl.counts[0] + ' / ' + sl.counts[1];
+    }
+    $('pconf').textContent = sl.conf != null ? sl.conf.toFixed(2) : '—';
+    if(sl.conf != null)
+      $('pconf').style.color = sl.conf < 0.25 ? css('--warning') : '';
+    $('prej').textContent  = sl.rejected != null
+      ? sl.rejected + (sl.scans ? ' of ' + (sl.scans + sl.rejected) : '') : '—';
+    $('ploop').textContent = sl.loops != null
+      ? sl.loops + (sl.keys ? ' · ' + sl.keys + ' keyframes' : '') : '—';
+    $('tu-ms').textContent    = sl.ms != null ? sl.ms.toFixed(1)+' ms' : '—';
+    $('tu-corr').textContent  = sl.correction
+      ? `${sl.correction.x.toFixed(0)}, ${sl.correction.y.toFixed(0)} mm · ${sl.correction.deg.toFixed(1)}°` : '—';
+    $('tu-hz').textContent    = l.hz != null ? l.hz.toFixed(1)+' Hz' : '—';
+    $('tu-pts').textContent   = l.count != null ? l.count : '—';
+    $('tu-scans').textContent = sl.scans != null ? sl.scans : '—';
+    $('tu-dist').textContent  = sl.distance_mm != null ? mm(sl.distance_mm) : '—';
+
+    // A drop-off is worth noticing from any tab.
+    $('pip-vision').classList.toggle('show', !!(d.cliff && d.cliff.blocked));
+
+    // --- object labels ---
+    const dt = d.detect || {};
+    detOn = !!dt.enabled;
+    objects = dt.objects || [];
+    $('t-detect').classList.toggle('g-on', detOn && dt.ok);
+    $('objstate').textContent = !dt.ok ? (dt.error || 'not available')
+      : (detOn ? (dt.committed + ' placed') : 'off');
+    $('d-obj').textContent    = dt.committed != null ? dt.committed : '—';
+    $('d-frames').textContent = dt.frames != null ? dt.frames : '—';
+    $('d-skip').textContent   = dt.skipped != null ? dt.skipped : '—';
+    $('d-ms').textContent     = dt.ms ? dt.ms.toFixed(0)+' ms' : '—';
+    $('d-backend').textContent = dt.backend || '—';
+    if(dt.backend) $('d-backend').style.color =
+      dt.backend.indexOf('down') >= 0 ? css('--warning')
+        : (dt.backend === 'remote' ? css('--good') : '');
+    // Do not fight someone typing a URL into the box.
+    if(document.activeElement !== $('d-url') && dt.url !== undefined
+       && $('d-url').value !== dt.url) $('d-url').value = dt.url;
+    // What is in view now, then what has been committed to the map.
+    drawBoxes(dt.seen);
+    $('detlist').innerHTML = (dt.seen || []).map(o =>
+        `<span class="tag ${o.placed?'fix':'on'}">${o.label} ${(o.conf*100)|0}%`
+        + (o.range != null ? ' · '+mm(o.range) : ' · no range') + `</span>`).join('')
+      + (dt.objects || []).slice(0,10).map(o =>
+        `<span class="tag" title="${o.n} sightings">${o.label}</span>`).join('');
+
+    drawCompass(); drawHorizon();
+  }).catch(() => {
+    $('badge').className = 'badge off';
+    $('badge').innerHTML = '<i class="dot"></i>NO LINK';
+    camLive = false; applyCam();      // tear the stream down with everything else
+  });
+}
+setInterval(poll, 150);
+setInterval(draw, 40);          // redraw faster than we poll, for smooth wheels
+addEventListener('resize', () => { draw(); drawCompass(); drawHorizon(); });
+poll();
+
+// ---------------------------------------------------------------- tabs
+//
+// One panel is in the document at a time. That is not only tidiness: the
+// canvases redraw at 25 Hz and the Pi is already spending ~100 ms of every
+// 200 on scan matching, so drawing a plot nobody is looking at is CPU taken
+// straight from SLAM.
+//
+// The camera is a single DOM node that gets MOVED between the Drive rail and
+// the Vision viewport. Two .camwrap elements would be two <img> tags on
+// /camera.mjpg, which is two MJPEG connections off one Pi for one picture.
+
+let tab = 'drive';
+
+function showTab(name){
+  tab = name;
+  document.querySelectorAll('.tab').forEach(b =>
+    b.classList.toggle('on', b.dataset.tab === name));
+  document.querySelectorAll('.tabpanel').forEach(p =>
+    p.classList.toggle('on', p.id === 'tab-' + name));
+
+  const slot = $(name === 'vision' ? 'camslot-vision' : 'camslot-drive');
+  const cam = $('camwrap');
+  if(cam && slot && cam.parentElement !== slot) slot.appendChild(cam);
+
+  try { localStorage.setItem('nav.tab', name); } catch(e) {}
+  // The canvases were display:none a moment ago, so clientWidth was 0 and
+  // any draw during that time was a no-op. Redraw now they have a size.
+  requestAnimationFrame(() => { draw(); drawMap(); drawCompass(); drawHorizon(); });
+}
+
+try {
+  const saved = localStorage.getItem('nav.tab');
+  if(saved) showTab(saved);
+} catch(e) {}
+
+// Keep the tab strip under the top bar however tall the bar wraps to.
+function fitTabs(){
+  const tb = document.querySelector('.topbar');
+  if(tb) document.documentElement.style.setProperty('--tabtop', tb.offsetHeight + 'px');
+}
+addEventListener('resize', fitTabs); fitTabs();
+
+// ---------------------------------------------------------------- tuning
+//
+// The panel renders itself from /tuning. Adding a knob is one line in
+// tuning.py and no change here at all - which is the point, because the last
+// version of this page grew a bespoke control per feature and became the
+// stack of cards this replaced.
+
+let tuneItems = [], tuneTimer = null, tunePending = {};
+// Fetched once at load rather than when the Tune tab opens, because
+// most of the controls now live on the other tabs.
+setTimeout(fetchTune, 250);
+
+function fetchTune(){
+  fetch('/tuning').then(r => r.json()).then(renderTune).catch(() => {
+    $('tunemsg').textContent = 'could not reach the robot';
+  });
+}
+
+// Where each group of knobs appears. THIS is the point of the registry:
+// a parameter belongs next to the thing it changes, not in a list somewhere
+// else. You cannot judge the scanner's rotation without the plot in front of
+// you, or a guard margin without the clearances it produces - so the sliders
+// go there, and the Tune tab is the complete index rather than the only way in.
+const TUNE_SLOTS = [
+  ['tunegrid',     null],                                    // everything
+  ['tune-vehicle', ['Vehicle']],                             // Drive, by the plot
+  ['tune-mount',   ['LiDAR mounting']],                      // Drive, by the plot
+  ['tune-guard',   ['Collision guard']],                     // Drive, by the wedge
+  ['tune-slam',    ['Scan matching','Loop closure','Occupancy grid','Mapping gate']], // Map
+  ['tune-odom',    ['Odometry']],                            // Map, by the scale
+  ['tune-expl',    ['Explorer']],                            // Map, by auto-map
+  ['tune-cam',     ['Camera mounting']],                     // Vision, by the picture
+  ['tune-vision',  ['Vision']],                              // Vision, by the grid
+  ['tune-detect',  ['Object detection']],                    // Vision, by the labels
+];
+
+function renderTune(snap){
+  tuneItems = snap.items || [];
+  const d = (snap.dirty || []).length;
+  const b = $('b-save');
+  b.classList.toggle('dirty', d > 0);
+  b.textContent = d ? ('SAVE ' + d) : 'SAVED';
+  b.title = d
+    ? d + ' value' + (d>1?'s':'') + ' would be lost on restart — click to write them to tuning.json on the Pi'
+    : 'Everything matches tuning.json on the Pi';
+  TUNE_SLOTS.forEach(([id, groups]) => {
+    const el = $(id);
+    if(el) el.innerHTML = tuneHTML(snap, groups);
+  });
+}
+
+function tuneHTML(snap, only){
+  const byGroup = {};
+  (snap.items || []).forEach(it => (byGroup[it.group] = byGroup[it.group] || []).push(it));
+  const groups = (snap.groups || []).filter(g => byGroup[g] && (!only || only.includes(g)));
+  return groups.map(g => {
+    const rows = byGroup[g].map(it => {
+      const dirty = it.default !== null && it.value !== it.default;
+      const shown = it.kind === 'bool' ? (it.value ? 'on' : 'off')
+                                       : fmtTune(it.value, it);
+      const ctl = it.kind === 'bool'
+        ? `<div class="swrow">
+             <button class="${it.value?'g-on':''}" onclick="tuneSet('${it.key}',${it.value?0:1})">${it.value?'On':'Off'}</button>
+           </div>`
+        : `<input type="range" min="${it.lo}" max="${it.hi}" step="${it.step}"
+                  value="${it.value}" data-k="${it.key}"
+                  oninput="tuneSlide(this)">`;
+      // The value id is prefixed per slot: the same knob can be on screen
+      // twice (inline and on the Tune tab) and duplicate ids would leave one
+      // of them silently not updating.
+      return `<div class="tunerow">
+          <div class="tunehd">
+            <span class="lb">${it.label}</span>
+            <button class="q" onclick="this.closest('.tunerow').classList.toggle('open')">?</button>
+            <span class="vv${dirty?' dirty':''}" data-v="${it.key}">${shown}${it.unit?' '+it.unit:''}</span>
+          </div>
+          ${ctl}
+          <div class="doc">${it.doc || ''}${it.default !== null
+              ? ` <b>Default ${fmtTune(it.default, it)}${it.unit?' '+it.unit:''}.</b>` : ''}</div>
+        </div>`;
+    }).join('');
+    // Three renderings, because an inline strip is already inside a card and
+    // nesting one in another looks like a mistake.
+    if(!only) return `<div class="card"><h2>${g}</h2>${rows}</div>`;  // Tune tab
+    if(only.length === 1) return rows;                                // bare
+    return `<div class="tunesub">${g}</div>${rows}`;                  // subheading
+  }).join('');
+}
+
+function fmtTune(v, it){
+  if(it.kind === 'int' || it.step >= 1) return Math.round(v).toString();
+  return (+v).toFixed(it.step >= 0.1 ? 2 : 3);
+}
+
+// Slider drag fires oninput continuously. Show the number immediately so it
+// feels live, but batch the POSTs - a drag across a range is otherwise fifty
+// requests, each of which rebuilds the scan-match window.
+function tuneSlide(el){
+  const key = el.dataset.k;
+  // Mounting values are mirrored into the plot immediately and re-synced from
+  // /state every 150 ms, so a drag needs the same hold-off the old bespoke
+  // controls had or it fights the poll.
+  if(key.startsWith('lidar_')){
+    calTouched = Date.now();
+    if(key === 'lidar_yaw') LIDAR_YAW = +el.value;
+    if(key === 'lidar_x')   LIDAR_X   = +el.value;
+    if(key === 'lidar_y')   LIDAR_Y   = +el.value;
+    draw();
+  }
+  const it = tuneItems.find(t => t.key === key);
+  if(it) document.querySelectorAll(`[data-v="${key}"]`).forEach(n =>
+    n.textContent = fmtTune(el.value, it) + (it.unit ? ' '+it.unit : ''));
+  tunePending[key] = +el.value;
+  clearTimeout(tuneTimer);
+  tuneTimer = setTimeout(flushTune, 180);
+}
+
+function tuneSet(key, v){ tunePending[key] = v; flushTune(); }
+
+function flushTune(){
+  const vals = tunePending; tunePending = {};
+  if(!Object.keys(vals).length) return;
+  fetch('/tuning', {method:'POST', headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({values: vals})})
+    .then(r => r.json())
+    .then(d => { renderTune(d.snapshot);
+                 $('tunemsg').textContent = 'applied — not saved yet'; })
+    .catch(() => { $('tunemsg').textContent = 'could not reach the robot'; });
+}
+
+function tuneSave(){
+  const b = $('b-save');
+  b.textContent = 'SAVING';
+  fetch('/tuning', {method:'POST', headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({save:true})})
+    .then(r => r.json()).then(d => {
+      const n = Object.keys(d.saved || {}).length;
+      const msg = n
+        ? `saved ${n} value${n>1?'s':''} to tuning.json on the Pi`
+        : 'nothing differs from the code defaults — file cleared';
+      $('tunemsg').textContent = msg;
+      // The button is in the sticky bar and the message is on the Tune tab,
+      // so confirm on the button too - otherwise pressing Save from Drive
+      // gives no feedback at all.
+      renderTune(d.snapshot);
+      b.textContent = 'SAVED';
+      flash(msg);
+    })
+    .catch(() => { b.textContent = 'SAVE FAILED'; flash('Could not reach the robot.'); });
+}
+
+// A short-lived confirmation, for actions taken from a tab that cannot show
+// the result. Reuses the focus banner slot rather than adding chrome.
+function flash(msg){
+  const el = $('focusnote');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(flash._t);
+  flash._t = setTimeout(() => el.classList.remove('show'), 3000);
+}
+
+function tuneRevert(){
+  fetch('/tuning', {method:'POST', headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({revert:true})})
+    .then(r => r.json()).then(d => {
+      $('tunemsg').textContent = 'back to code defaults, and saved';
+      renderTune(d.snapshot);
+    });
+}
+
+function tuneDocs(){
+  const open = document.querySelectorAll('.tunerow.open').length;
+  document.querySelectorAll('.tunerow').forEach(r => r.classList.toggle('open', !open));
+}
+
+</script>
+</body>
+</html>"""
+
+PAGE = (PAGE.replace("%%LEN%%", str(TRUCK_LEN_MM))
+            .replace("%%WID%%", str(TRUCK_WIDTH_MM))
+            .replace("%%SECTOR%%", str(GUARD_SECTOR_DEG))
+            .replace("%%MARGIN%%", str(SAFETY_MARGIN_MM))
+            .replace("%%LX%%", str(LIDAR_OFFSET_X))
+            .replace("%%LY%%", str(LIDAR_OFFSET_Y))
+            .replace("%%IMUX%%", str(IMU_OFFSET_X))
+            .replace("%%IMUY%%", str(IMU_OFFSET_Y))
+            .replace("%%CAMX%%", str(CAM_OFFSET_X))
+            .replace("%%CAMY%%", str(CAM_OFFSET_Y))
+            .replace("%%HFOV%%", str(CAM_HFOV))
+            .replace("%%CAMYAW%%", str(CAM_YAW_OFFSET))
+            .replace("%%TILT%%", str(TILT_WARN_DEG))
+            .replace("%%LYAW%%", str(LIDAR_YAW_OFFSET)))
+
+
+@app.route("/")
+def index():
+    """The cockpit.
+
+    Explicitly no-store: the page is a single self-contained document with no
+    versioned filename, so a browser that caches it happily serves yesterday's
+    UI after a sync and leaves you wondering why nothing changed. It has
+    already cost one debugging session.
+    """
+    return Response(render_template_string(PAGE), mimetype="text/html",
+                    headers={"Cache-Control": "no-store, must-revalidate"})
+
+
+_last_survey = [0.0]
+
+
+@app.route("/state")
+def state():
+    # The page polls this at ~7 Hz. Surveying sweeps ~200 points three times,
+    # which is wasted work at that rate and steals CPU from the SLAM thread.
+    now = time.monotonic()
+    if now - _last_survey[0] > 0.3:
+        _last_survey[0] = now
+        guard.survey(lidar)
+    pts = lidar.scan()
+    return jsonify(
+        motors=robot.state,
+        lidar={
+            "points": pts, "count": len(pts),
+            "clusters": cluster_points(pts),
+            "ahead": Lidar.sector_min(pts, 0, GUARD_SECTOR_DEG),
+            "hz": round(lidar.hz(), 1), "bad": lidar.bad,
+            "connected": lidar.connected, "error": lidar.error,
+            "port": lidar.port,
+        },
+        imu=imu.state,
+        guard={"enabled": guard.enabled, "stop_mm": guard.stop_mm,
+               "blocked": guard.blocked, "reason": guard.reason,
+               "creeping": guard.creeping, "clear": guard.clear,
+               "geom": {"len": TRUCK_LENGTH_MM, "wid": TRUCK_WIDTH_MM,
+                        "lx": lidar_cal.x, "ly": lidar_cal.y,
+                        "yaw": lidar_cal.yaw,
+                        "sector": GUARD_SECTOR_DEG,
+                        "margin": SAFETY_MARGIN_MM}},
+        slam=slam.state,
+        explore=explorer.status,
+        camera=dict(camera.state, rotation=CAM_ROTATION,
+                    yaw=CAM_YAW_OFFSET),
+        markers=markers.state,
+        cliff=cliff.state,
+        detect=detector.state,
+    )
+
+
+@app.route("/map")
+def map_():
+    """The grid as base64 bytes plus the trail. Polled far slower than
+    /state — 57k cells is ~76 kB of base64, cheap at 1 Hz, wasteful at 7."""
+    g = slam.slam.grid
+    payload = g.as_payload()
+    payload["trail"] = [[round(x), round(y)] for x, y in slam.slam.trail[-600:]]
+    payload["pose"] = slam.slam.pose.as_dict()
+    return jsonify(payload)
+
+
+@app.route("/snapshot")
+def snapshot():
+    """Everything worth knowing in one call, without the point cloud or the
+    map bitmap. Small enough to read over curl while the robot is driving."""
+    pts = lidar.scan()
+    return jsonify(
+        motors=robot.state, imu=imu.state, slam=slam.state,
+        guard={"enabled": guard.enabled, "blocked": guard.blocked,
+               "reason": guard.reason},
+        explore=explorer.status,
+        camera=camera.state,
+        cliff={"blocked": cliff.blocked, "cliff": cliff.is_cliff,
+               "reason": cliff.reason, "enabled": cliff.enabled},
+        markers={"known": len(markers.map.tags), "fixes": markers.fixes,
+                 "seen": [m["id"] for m in markers.seen]},
+        lidar={"count": len(pts), "hz": round(lidar.hz(), 1), "bad": lidar.bad,
+               "connected": lidar.connected,
+               "ahead": Lidar.sector_min(pts, 0, GUARD_SECTOR_DEG),
+               "nearest_objects": cluster_points(pts)[:5]},
+    )
+
+
+@app.route("/camera.mjpg")
+def camera_mjpg():
+    """The live view. One multipart response per client, held open for as
+    long as the browser wants it.
+
+    Flask must be threaded=True for this — it is, in main() — or this single
+    never-ending response would block every other request and freeze the
+    drive controls. That is the failure worth knowing about here.
+    """
+    if camera.cam is None:
+        return Response(camera.error or "no camera", status=503,
+                        mimetype="text/plain")
+    from camera import MJPEG_MIME
+    return Response(camera.stream(), mimetype=MJPEG_MIME)
+
+
+@app.route("/camera/still.jpg")
+def camera_still():
+    """One frame, as a plain JPEG. For curl, and for anything that wants a
+    picture without holding a stream open."""
+    jpeg = camera.frame()
+    if jpeg is None:
+        return Response("no frame", status=503, mimetype="text/plain")
+    return Response(jpeg, mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.route("/camera/snap", methods=["POST"])
+def camera_snap():
+    """Save the current view to test/captures/, tagged with the pose."""
+    path = camera.snap(slam.slam.pose)
+    if path is None:
+        return jsonify(ok=False, error=camera.error or "no frame"), 503
+    return jsonify(ok=True, file=os.path.basename(path))
+
+
+@app.route("/captures")
+def captures_list():
+    """Every still with the pose it was taken from. The map panel draws these
+    as pins; clicking one opens the picture."""
+    return jsonify(captures=camera.captures[-300:], auto_mm=camera.auto_mm)
+
+
+@app.route("/captures/<path:name>")
+def capture_file(name):
+    """Serve one still.
+
+    send_from_directory, not an open() on a joined path: `name` arrives from
+    the network, and this is the one route here that turns a client-supplied
+    string into a filename. It refuses anything that escapes the directory.
+    """
+    from flask import send_from_directory
+    return send_from_directory(camera.CAPTURE_DIR, name,
+                               mimetype="image/jpeg")
+
+
+@app.route("/captures/auto", methods=["POST"])
+def captures_auto():
+    d = request.get_json(force=True, silent=True) or {}
+    camera.auto_mm = max(0.0, float(d.get("mm", 0)))
+    return jsonify(ok=True, auto_mm=camera.auto_mm)
+
+
+@app.route("/markers", methods=["POST"])
+def markers_ctl():
+    d = request.get_json(force=True, silent=True) or {}
+    if "enabled" in d:
+        markers.enabled = bool(d["enabled"])
+    if "learn" in d:
+        markers.learn = bool(d["learn"])
+    if d.get("forget") is not None:
+        markers.map.forget(d["forget"] if d["forget"] != "all" else None)
+        markers.map.save()
+    if d.get("save"):
+        markers.map.save()
+    return jsonify(ok=True, tags=len(markers.map.tags),
+                   enabled=markers.enabled, learn=markers.learn)
+
+
+@app.route("/markers/sheet.svg")
+def markers_sheet():
+    """Printable tags, as SVG so they come off the printer at exactly
+    MARKER_SIZE_MM. A scaled bitmap will not, and a tag whose real size
+    differs from the constant puts every distance out by that ratio."""
+    from markers import sheet_svg
+    try:
+        ids = [int(v) for v in request.args.get("ids", "0,1,2,3,4,5").split(",")]
+        svg = sheet_svg(ids)
+    except Exception as e:                                    # noqa: BLE001
+        return Response(str(e), status=503, mimetype="text/plain")
+    return Response(svg, mimetype="image/svg+xml",
+                    headers={"Content-Disposition":
+                             "inline; filename=aruco-sheet.svg"})
+
+
+@app.route("/calibrate/push", methods=["POST"])
+def calibrate_push():
+    """Measure the scanner's nose bearing and the odometry scale from one
+    straight push of the robot.
+
+    Two calls: "start" grabs the before-scan, "finish" grabs the after-scan
+    and fits. See calibrate.py for why this beats dragging a slider until the
+    plot looks square.
+    """
+    d = request.get_json(force=True, silent=True) or {}
+    act = d.get("action")
+    if act == "start":
+        pts = lidar.scan()
+        if len(pts) < 40:
+            return jsonify(ok=False, message="No LiDAR scan to start from."), 503
+        nb = pusher.start(pts, [robot.enc_left.steps, robot.enc_right.steps],
+                          time.monotonic())
+        return jsonify(ok=True, armed=True, points=nb,
+                       message="Captured. Now push the robot straight forward "
+                               "about half a metre, then press Finish.")
+    if act == "finish":
+        res = pusher.finish(lidar.scan(),
+                            [robot.enc_left.steps, robot.enc_right.steps],
+                            slam.slam.odom.mm_per_count,
+                            lidar_cal.yaw, slam.slam.odom.cpr)
+        return jsonify(**res)
+    if act == "apply":
+        last = pusher.last or {}
+        done = {}
+        if d.get("what") in ("yaw", "both") and last.get("nose_deg") is not None:
+            done.update(tuning.apply({"lidar_yaw": last["nose_deg"]}))
+        if d.get("what") in ("cpr", "both") and last.get("implied_cpr"):
+            done.update(tuning.apply({"counts_per_rev": last["implied_cpr"]}))
+        return jsonify(ok=bool(done), applied=done)
+    return jsonify(ok=False, message="unknown action"), 400
+
+
+@app.route("/calibrate/push")
+def calibrate_push_state():
+    return jsonify(armed=pusher.armed, last=pusher.last)
+
+
+@app.route("/tuning")
+def tuning_get():
+    """The whole registry with live values. The Tune tab renders itself from
+    this, so a tunable added to tuning.py needs no UI change at all."""
+    return jsonify(tuning.snapshot())
+
+
+@app.route("/tuning", methods=["POST"])
+def tuning_set():
+    """Apply values, and optionally persist them.
+
+    Applied live but NOT saved unless asked. Tuning is mostly trying things,
+    and most of what you try is worse than what you had — a value should have
+    to earn its place in the file.
+    """
+    d = request.get_json(force=True, silent=True) or {}
+    done = {}
+    if d.get("revert"):
+        done = tuning.revert()
+    else:
+        done = tuning.apply(d.get("values") or {})
+    saved = tuning.save() if d.get("save") or d.get("revert") else None
+    return jsonify(ok=True, applied=done, saved=saved,
+                   snapshot=tuning.snapshot())
+
+
+@app.route("/detect", methods=["POST"])
+def detect_ctl():
+    d = request.get_json(force=True, silent=True) or {}
+    if "enabled" in d:
+        detector.enabled = bool(d["enabled"])
+    if d.get("forget") is not None:
+        detector.map.forget(None if d["forget"] == "all" else d["forget"])
+        detector.map.save()
+    if d.get("save"):
+        detector.map.save()
+    if "url" in d:
+        detector.set_url(d["url"])
+    return jsonify(ok=True, enabled=detector.enabled, url=detector.url,
+                   backend=detector.backend,
+                   committed=len(detector.map.committed()))
+
+
+@app.route("/cliff", methods=["POST"])
+def cliff_ctl():
+    d = request.get_json(force=True, silent=True) or {}
+    if "enabled" in d:
+        cliff.enabled = bool(d["enabled"])
+    if d.get("relearn"):
+        cliff.relearn()
+    return jsonify(ok=True, enabled=cliff.enabled)
+
+
+@app.route("/slam", methods=["POST"])
+def slam_ctl():
+    d = request.get_json(force=True, silent=True) or {}
+    if d.get("reset"):
+        slam.slam.reset()
+    if "enabled" in d:
+        slam.enabled = bool(d["enabled"])
+    if "matching" in d:
+        slam.slam.match_enabled = bool(d["matching"])
+    return jsonify(slam.state)
+
+
+@app.route("/lidar", methods=["POST"])
+def lidar_ctl():
+    d = request.get_json(force=True, silent=True) or {}
+    lidar_cal.set(d.get("yaw"), d.get("x"), d.get("y"))
+    return jsonify(lidar_cal.as_dict)
+
+
+@app.route("/places", methods=["GET", "POST"])
+def places_ctl():
+    """List, save or delete named places. Saving uses the CURRENT pose."""
+    places = load_places()
+    if request.method == "POST":
+        d = request.get_json(force=True, silent=True) or {}
+        name = (d.get("name") or "").strip()[:40]
+        if d.get("delete") and name:
+            places.pop(name, None)
+            save_places(places)
+        elif name:
+            p = slam.slam.pose
+            places[name] = [round(d.get("x", p.x), 1), round(d.get("y", p.y), 1)]
+            save_places(places)
+    return jsonify(places=places, pose=slam.slam.pose.as_dict())
+
+
+@app.route("/goto", methods=["POST"])
+def goto_ctl():
+    d = request.get_json(force=True, silent=True) or {}
+    if d.get("stop"):
+        explorer.stop()
+        return jsonify(explorer.status)
+    name = (d.get("name") or "").strip()
+    places = load_places()
+    if name and name in places:
+        x, y = places[name]
+    elif "x" in d and "y" in d:
+        x, y, name = float(d["x"]), float(d["y"]), name or "a point"
+    else:
+        return jsonify(error="unknown place: %r" % name), 400
+    robot.enable()
+    explorer.goto(x, y, name)
+    return jsonify(explorer.status)
+
+
+@app.route("/map/save", methods=["POST"])
+def map_save():
+    try:
+        n = slam.slam.save(MAP_FILE)
+    except OSError as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(saved=MAP_FILE, bytes=n, scans=slam.slam.scans)
+
+
+@app.route("/map/load", methods=["POST"])
+def map_load():
+    """Load a saved map. The explorer is stopped first: resuming teleports the
+    pose, and a path planned in the old frame is nonsense in the new one."""
+    explorer.stop("map reloaded")
+    try:
+        blob = slam.slam.load(MAP_FILE)
+    except (OSError, ValueError) as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(loaded=MAP_FILE, scans=blob.get("scans"),
+                   pose=slam.slam.pose.as_dict())
+
+
+@app.route("/explore", methods=["POST"])
+def explore_ctl():
+    """Start or stop autonomous mapping.
+
+    Starting enables the drivers: an explorer that cannot raise STBY would
+    plan beautifully and never move, which looks like a planner bug.
+    """
+    d = request.get_json(force=True, silent=True) or {}
+    if d.get("stop"):
+        explorer.stop()
+    elif d.get("start"):
+        robot.enable()
+        explorer.start(calibrate=bool(d.get("calibrate", True)))
+    return jsonify(explorer.status)
+
+
+@app.route("/drive", methods=["POST"])
+def drive():
+    d = request.get_json(force=True, silent=True) or {}
+    # A manual command wins. Two controllers writing to the same motors at
+    # once is how a robot ends up doing neither thing.
+    if explorer.running and (d.get("throttle") or d.get("steer")):
+        explorer.stop("manual override")
+    # Record and return. No guard evaluation, no GPIO, nothing that can block
+    # behind the SLAM thread - the control loop picks this up within 20 ms.
+    intent.set(d.get("throttle", 0), d.get("steer", 0), "manual")
+    return "", 204
+
+
+@app.route("/guard", methods=["POST"])
+def set_guard():
+    d = request.get_json(force=True, silent=True) or {}
+    if "enabled" in d:
+        guard.enabled = bool(d["enabled"])
+    if "stop_mm" in d:
+        guard.stop_mm = max(100, min(2000, float(d["stop_mm"])))
+    return jsonify(enabled=guard.enabled, stop_mm=guard.stop_mm)
+
+
+@app.route("/invert", methods=["POST"])
+def invert():
+    robot.set_invert(request.get_json(force=True, silent=True) or {})
+    return jsonify(robot.invert)
+
+
+@app.route("/limit", methods=["POST"])
+def limit():
+    d = request.get_json(force=True, silent=True) or {}
+    robot.set_limit(d.get("value", MAX_DUTY))
+    return jsonify(limit=robot.limit)
+
+
+@app.route("/enable", methods=["POST"])
+def enable():
+    robot.enable()
+    return "", 204
+
+
+@app.route("/estop", methods=["POST"])
+def estop():
+    intent.set(0, 0, "stop")
+    robot.estop()
+    return "", 204
+
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    intent.set(0, 0, "stop")
+    robot.stop()
+    return "", 204
+
+
+def lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.168.1.1", 1))      # no packet is sent for UDP connect
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def main():
+    global robot, lidar, imu, slam, explorer, camera, markers, cliff, detector
+    ap = argparse.ArgumentParser(description="drive + lidar + imu")
+    ap.add_argument("-p", "--lidar-port", help="serial port (default: auto-detect)")
+    ap.add_argument("-b", "--baud", type=int, default=LIDAR_BAUD)
+    ap.add_argument("--http-port", type=int, default=HTTP_PORT)
+    ap.add_argument("--no-guard", action="store_true")
+    ap.add_argument("--learn-markers", action="store_true",
+                    help="record unknown tags at the current pose")
+    ap.add_argument("--no-cliff", action="store_true",
+                    help="do not let the camera veto forward motion")
+    ap.add_argument("--no-detect", action="store_true",
+                    help="do not run object detection")
+    ap.add_argument("--detect-url", default=None,
+                    help="off-board detection server, e.g. "
+                         "http://192.168.1.5:8000/detect — bigger model "
+                         "on your PC. Remembered between runs.")
+    args = ap.parse_args()
+
+    if args.no_guard:
+        guard.enabled = False
+
+    try:
+        robot = Robot()
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"\n  GPIO setup failed: {exc}")
+        print("  Is web_pilot.py, web_drive.py or web_dashboard.py running?")
+        print("  Only one script can own these pins at a time.\n")
+        raise
+
+    lidar = Lidar(args.lidar_port or autodetect_lidar(), args.baud)
+    imu = ImuReader()
+    camera = CameraReader()
+    slam = SlamRunner(robot, lidar, imu)
+    threading.Thread(target=control_loop, daemon=True).start()
+    globals()["lidar_cal"] = LidarCal()
+    slam.slam = Slam(COUNTS_PER_REV, WHEEL_DIAM_MM, TRACK_WIDTH_MM,
+                     lidar_off=(lidar_cal.x, lidar_cal.y, lidar_cal.yaw),
+                     body=(TRUCK_LENGTH_MM, TRUCK_WIDTH_MM))
+
+    def guarded_drive(throttle, steer):
+        """The explorer publishes intent like everything else, so there is one
+        writer to the motors and one place the guard is applied."""
+        intent.set(throttle, steer, "explore")
+
+    explorer = Explorer(
+        robot, lidar, slam, guard,
+        {"len": TRUCK_LENGTH_MM, "wid": TRUCK_WIDTH_MM,
+         "margin": SAFETY_MARGIN_MM, "wheel": WHEEL_DIAM_MM,
+         "cpr": COUNTS_PER_REV, "track": TRACK_WIDTH_MM},
+        guarded_drive)
+
+    # Vision, after SLAM: the marker locator writes pose fixes into it and
+    # the cliff detector is read by the guard, so both need their consumers
+    # to exist first.
+    from cliff import CliffDetector                           # noqa: PLC0415
+    cliff = CliffDetector(camera,
+                          enabled=camera.cam is not None and not args.no_cliff)
+    from markers import MarkerLocator                         # noqa: PLC0415
+    markers = MarkerLocator(camera, slam, learn=args.learn_markers)
+
+    # Object labels. Last, because it is the one thing here that yields to
+    # everything else: it skips a cycle whenever SLAM is over budget.
+    from detect import Detector                                # noqa: PLC0415
+    detector = Detector(camera, lidar, slam, enabled=not args.no_detect,
+                        url=args.detect_url)
+
+    # Hand the tuning registry the live objects it points at. After this,
+    # every number in docs/TUNING.md is reachable from the Tune tab.
+    #
+    # Objects and modules go in separately: "slam" is the Slam object in some
+    # targets and the slam module in others, and both are wanted.
+    import cliff as cliff_mod                                 # noqa: PLC0415
+    import detect as detect_mod                               # noqa: PLC0415
+    import explore as explore_mod                             # noqa: PLC0415
+    import markers as markers_mod                             # noqa: PLC0415
+    import slam as slam_mod                                   # noqa: PLC0415
+    _defaults, _missing = tuning.bind(
+        objects={"slam": slam.slam, "slamr": slam,
+                 "matcher": slam.slam.matcher, "grid": slam.slam.grid,
+                 "odom": slam.slam.odom, "lidar_cal": lidar_cal,
+                 "guard": guard, "explorer": explorer},
+        modules={"slam": slam_mod, "explore": explore_mod,
+                 "cliff": cliff_mod, "markers": markers_mod,
+                 "detect": detect_mod,
+                 # __name__ is "__main__" when run as a script, so this
+                 # module has to hand itself over by object rather than name.
+                 "web_nav": sys.modules[__name__]})
+    _loaded = tuning.load()
+
+    print("\n  Speaker Truck — nav")
+    print(f"  http://{lan_ip()}:{args.http_port}   (click the page, then arrow keys)")
+    print(f"  lidar: {lidar.port or 'NONE'} @ {args.baud}")
+    print(f"  imu:   {imu.name or 'NONE — ' + (imu.error or 'not detected')}")
+    print(f"  cam:   {camera.name or 'NONE — ' + camera.error}")
+    print(f"  tags:  {len(markers.map.tags)} known"
+          f"{' — ' + markers.error if markers.error else ''}"
+          f"{' · LEARNING' if markers.learn else ''}")
+    print(f"  tune:  {len(_defaults)} tunables"
+          f"{f' · {len(_loaded)} from tuning.json' if _loaded else ''}"
+          f"{f' · {len(_missing)} UNBOUND: ' + ','.join(_missing) if _missing else ''}")
+    print(f"  yolo:  {detector.backend}"
+          f"{' · ' + detector.url if detector.url else ''}"
+          f"{' — ' + detector.error if detector.error else ''}"
+          f"{f' · {len(detector.map.committed())} objects on the map'}")
+    print(f"  cliff: {'on' if cliff.enabled else 'off'}"
+          f" · camera {CAM_PITCH_DEG:.0f}° down at {CAM_HEIGHT_MM:.0f} mm")
+    print(f"  guard: {'on' if guard.enabled else 'off'} at {guard.stop_mm:.0f} mm")
+    print(f"  slam:  {slam.slam.grid.n}x{slam.slam.grid.n} cells @ "
+          f"{slam.slam.grid.res} mm, matching on")
+    print(f"  MAX_DUTY {MAX_DUTY:.2f} · watchdog {WATCHDOG_S}s")
+    print("\n  *** WHEELS OFF THE GROUND ***\n")
+    try:
+        app.run(host="0.0.0.0", port=args.http_port, threaded=True)
+    finally:
+        # Runs on Ctrl-C and on any exception, so the motors never stay on.
+        if explorer:
+            explorer.stop("shutting down")
+        robot.close()
+        camera.close()
+        print("\nMotors stopped, STBY low, pins released.")
+
+
+if __name__ == "__main__":
+    main()

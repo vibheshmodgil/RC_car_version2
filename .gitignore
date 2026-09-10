@@ -1,0 +1,31 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Pi-side artifacts
+*.log
+uploads/
+drive_invert.json
+imu_calib.json
+house_map.json
+places.json
+lidar_cal.json
+captures/
+marker_map.json
+tuning.json
+objects.json
+# Model weights. Downloaded on demand, hundreds of megabytes, and GitHub
+# hard-rejects anything over 100 MB — yolov8x-worldv2.pt alone is 146 MB.
+# tools/detect_server.py fetches whatever it needs on first run.
+*.onnx
+*.pt
+*.engine
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

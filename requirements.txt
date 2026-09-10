@@ -1,0 +1,57 @@
+# Pip packages for the Pi venv.
+#
+# gpiozero and lgpio are NOT here on purpose. Raspberry Pi OS ships both as
+# prebuilt apt packages:
+#
+#     sudo apt install -y python3-gpiozero python3-lgpio
+#
+# and the venv must be created with --system-site-packages to see them:
+#
+#     python3 -m venv --system-site-packages .venv
+#
+# Installing lgpio from pip instead makes it compile from source, which needs
+# swig + python3-dev and gains you nothing. See CLAUDE.md.
+#
+# Same reasoning for pyserial (test/lidar_probe.py):
+#
+#     sudo apt install -y python3-serial
+#
+# It is pure Python so pip would work, but apt keeps every
+# hardware-touching package on one install path.
+#
+# And picamera2 (test/camera.py), which is the strongest case of the three:
+#
+#     sudo apt install -y python3-picamera2
+#
+# pip would try to build libcamera from source, which needs meson, ninja and
+# a long wait, and the result is not the version Raspberry Pi OS tests
+# against. The apt package is already built against this system's libcamera.
+#
+# And opencv (test/markers.py), for the same reason plus one more:
+#
+#     sudo apt install -y python3-opencv
+#
+# aruco lives in opencv_contrib upstream, so `pip install opencv-python` gets
+# you an OpenCV with no aruco module and a confusing failure much later.
+# Debian builds contrib into python3-opencv, so the apt package is not just
+# easier here, it is the one that actually works.
+
+# Web dashboard / control page (test/web_dashboard.py,
+# test/web_control.py). Pure Python, no compilation.
+flask
+
+# Object detection (test/detect.py). Unlike everything above, this one really
+# is pip: onnxruntime ships prebuilt aarch64 wheels and has no apt package on
+# Raspberry Pi OS.
+#
+#     pip install onnxruntime
+#
+# The MODEL is not installed by pip. Export it on a laptop, because
+# ultralytics drags in torch and you do not want that on the Pi:
+#
+#     pip install ultralytics
+#     yolo export model=yolov8n.pt format=onnx imgsz=320 opset=12
+#
+# then copy yolov8n.onnx into test/. Detection is skipped with a clear message
+# if either the runtime or the model is missing; nothing else stops working.
+onnxruntime
