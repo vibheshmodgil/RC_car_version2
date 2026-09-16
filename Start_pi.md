@@ -88,11 +88,12 @@ sudo apt install -y python3-gpiozero python3-lgpio \
                     alsa-utils ffmpeg \
                     python3-serial \
                     i2c-tools python3-smbus2 \
-                    python3-picamera2 python3-opencv
+                    python3-picamera2 python3-opencv \
+                    python3-spidev python3-pil python3-numpy
 
 python3 -m venv --system-site-packages .venv    # --system-site-packages is required
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt                 # includes piper-tts (speech)
 ```
 
 Enable I2C for the IMU:
@@ -112,6 +113,16 @@ Audio overlay, in `/boot/firmware/config.txt` (already done on this Pi):
 dtparam=audio=off
 dtoverlay=max98357a,no-sdmode
 ```
+
+SPI for the LCD, same file — **both lines**, then `sudo reboot`:
+
+```
+dtparam=spi=on
+dtoverlay=spi0-1cs
+```
+
+The second line is the one people miss: without it the kernel keeps GPIO7 as
+a second SPI chip select, and GPIO7 is the display's `DC` wire.
 
 ---
 
@@ -182,12 +193,34 @@ you do.
 
 ```bash
 speaker-test -t sine -f 440 -c 2 -D plughw:1,0     # bypasses all our code
-python test/speaker_test.py                        # tone + sweep
-python test/web_dashboard.py                       # :5000, tones + MP3
+python test/speaker_test.py                        # tone + steps + sweep + beeps
+python test/speaker_test.py --beep horn            # one beep
+python test/speaker_test.py --play ~/song.mp3      # one song (needs ffmpeg)
+python test/web_nav.py                             # :5004, Audio tab
 ```
 
-In the UI set **Output device → `plughw:1,0 — MAX98357A`**. It is not the
-default — ALSA still picks HDMI as card 0.
+Speech — once per Pi, then one voice (~60 MB):
+
+```bash
+pip install "piper-tts>=1.3"                                  # in the venv
+python test/speaker_test.py --download en_US-lessac-medium    # or from the Audio tab
+python test/speaker_test.py --say "Hello, I am the speaker truck"
+python test/speaker_test.py --voices                          # what else there is
+```
+
+The **Audio tab** also has a **Speak** box: type, press Speak (or Ctrl+Enter).
+Pick the voice, speed and volume there; download more voices from the list
+under it. The Drive tab has a one-line **Say** box. Speech holds a playing
+song and resumes it afterwards.
+
+The **Audio tab** in `web_nav.py` has the tone test, beeps, and an MP3 library:
+upload songs from the browser, play / pause / seek / next, play-all or repeat,
+volume, bass and treble. The Drive tab has a **HORN** button (key **H**).
+Songs are stored in `test/uploads/`; settings in `test/audio.json`.
+
+The MAX98357A is chosen as the output device automatically when ALSA lists
+it. If it is not, pick **Output device → `plughw:1,0 — MAX98357A`** on the
+Audio tab — ALSA still puts HDMI at card 0.
 
 > `plughw:` not `hw:` — the raw device only accepts stereo, so a mono tone is
 > rejected outright.
@@ -284,6 +317,39 @@ to cover ground the lens cannot see.
 A camera that lists but delivers no frames is almost always a ribbon seated
 well enough to enumerate and not well enough to stream. Power down, reseat
 both ends, retry.
+
+### 5.7b Display
+
+```bash
+python test/display_test.py --check    # SPI config + packages, no wiring needed
+python test/display_test.py            # colours, test card, speed
+python test/display_test.py --ip       # leaves the Pi's address on the screen
+```
+
+Wiring (full table in `WIRING.md` §14):
+
+| LCD | Header | | LCD | Header |
+|---|---|---|---|---|
+| GND | 25 | | RES | 3V3 — jumper to VCC |
+| VCC | 17 (3V3) | | DC | 26 (GPIO7) |
+| SCL | 23 (GPIO11) | | CS | 24 (GPIO8) |
+| SDA | 19 (GPIO10) | | BLK | 3V3 — jumper to VCC |
+
+Checks:
+
+| Test | Expected |
+|---|---|
+| `--check` | only `/dev/spidev0.0`, all ✓ |
+| fills | red, green, blue, white, black — in that order |
+| test card | arrow marked TOP at the top, black background |
+| speed | ~20 fps or more |
+
+Red shows blue → `LCD_BGR = True`. White background → `LCD_INVERT = False`.
+Upside down or sideways → `LCD_ROTATION`. All in `test/pins.py`. Stop
+`web_nav.py` first — it drives the display too.
+
+Once `web_nav.py` runs, the screen shows the address to open, so you no
+longer need `arp -a` to find the Pi.
 
 ### 5.8 Markers
 
@@ -421,6 +487,95 @@ curl -s http://<pi-ip>:5004/camera/still.jpg -o view.jpg
 
 ---
 
+### 5.12 Talking to the truck — and Claude at the wheel
+
+Two ways an AI drives and talks through the truck:
+
+| | Voice assistant (`brain.py`) | Claude Code + MCP (`truck_mcp.py`) |
+|---|---|---|
+| Thinks on | **Ollama on your PC** — free, local, no keys | Claude, in your Claude Code session |
+| You talk | into the phone; it **answers out loud by itself** | in Claude Code |
+| Needs | PC on, Ollama reachable from the Pi | Claude Code on the PC |
+
+```
+ phone mic ──https──► web_nav.py (Pi): Ears → brain.py → Piper → speaker
+                                              │  HTTP, your wifi
+                                              ▼
+                                  PC: Ollama  (qwen3-vl:4b-instruct on the GTX 1650)
+```
+
+The Pi listens, speaks and drives; the PC only thinks. PC off = the truck
+says "my brain computer is not reachable" and everything else still works.
+
+**Voice assistant — on the PC, once (PowerShell):**
+
+```powershell
+ollama pull qwen3-vl:4b-instruct                     # vision + tools, fits a 4 GB GPU
+[Environment]::SetEnvironmentVariable("OLLAMA_HOST", "0.0.0.0:11434", "User")
+```
+
+Quit Ollama from the system-tray icon and start it again, so it listens on the
+network instead of only on the PC itself. Then, in an **Administrator**
+PowerShell:
+
+```powershell
+New-NetFirewallRule -DisplayName "Ollama (Speaker Truck)" -Direction Inbound -Protocol TCP -LocalPort 11434 -Action Allow -Profile Private
+Get-NetConnectionProfile          # your wifi must say NetworkCategory : Private
+```
+
+**Check from the Pi:**
+
+```bash
+curl -s http://192.168.1.12:11434/api/tags | head -c 200     # the PC's IP
+```
+
+A JSON list of models = reachable. Then start web_nav as usual; the Audio
+tab's **Assistant** card shows the PC address, the model, and whether the
+model can see and use tools — change either there if the PC's IP changes.
+
+Keep the PC awake while you talk to the truck (Settings → Power → Sleep:
+Never while plugged in). Anyone on your wifi can use that Ollama, so do this
+on a home network, not a public one.
+
+**Claude Code + MCP —**
+
+**On the PC, once:**
+
+```powershell
+pip install "mcp>=1.2"
+claude mcp add truck -e TRUCK_URL=http://shiv.local:5004 -- python C:\Users\vibhe\OneDrive\Desktop\Speaker_truck\tools\truck_mcp.py
+```
+
+**On the Pi:** just `python test/web_nav.py`. The start-up print shows
+`talk:  https://<ip>:5443/talk`.
+
+**On the phone:** open that address in Chrome (Android) or Safari (iPhone).
+It warns about the certificate the first time — **Advanced → Proceed**. Allow
+the microphone, tap the mic button.
+
+**In Claude Code**, start a new session in this folder and ask, e.g.:
+
+- "check the truck's status and look around"
+- "drive forward half a metre, carefully"
+- "let's talk through the truck — listen to me on the phone and answer out loud"
+
+Safety, by design rather than by trust:
+
+| | |
+|---|---|
+| **A person presses ENABLE** | there is no tool to arm the motors; moves are refused until you do |
+| Moves are short | at most 3 s each, always ending in a stop |
+| Guard, floor check, speed limit | all still apply — Claude drives through the same `/drive` as the arrow keys |
+| Link dies mid-move | web_nav's 0.6 s watchdog stops the motors |
+| **E-STOP** / space bar | always wins |
+
+Wheels off the ground until the drivers are replaced (§8).
+
+Why HTTPS: browsers only give a web page the microphone over https. The
+certificate is self-signed and made once, into `test/talk_cert.pem`.
+Android's speech recognition uses Google's service, so the phone needs
+internet; the truck does not.
+
 ## 6. Ports — only one GPIO owner at a time
 
 | Script | Port | Uses GPIO |
@@ -430,6 +585,7 @@ curl -s http://<pi-ip>:5004/camera/still.jpg -o view.jpg
 | `lidar_view.py` | 5002 | **no** — runs alongside anything |
 | `web_pilot.py` | 5003 | yes |
 | `web_nav.py` | 5004 | yes |
+| `web_nav.py` https | 5443 | same process — the phone-mic `/talk` page |
 | `camera_test.py --stream` | 5005 | **no** — but it does claim the camera |
 | `marker_test.py` | — | **no** — but it does claim the camera |
 

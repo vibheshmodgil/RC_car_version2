@@ -36,6 +36,13 @@
 # Debian builds contrib into python3-opencv, so the apt package is not just
 # easier here, it is the one that actually works.
 
+# And the LCD (test/display.py):
+#
+#     sudo apt install -y python3-spidev python3-pil python3-numpy
+#
+# spidev is a C extension — same story as lgpio. Pillow and numpy are very
+# likely already there as picamera2 / opencv dependencies.
+
 # Web dashboard / control page (test/web_dashboard.py,
 # test/web_control.py). Pure Python, no compilation.
 flask
@@ -55,3 +62,14 @@ flask
 # then copy yolov8n.onnx into test/. Detection is skipped with a clear message
 # if either the runtime or the model is missing; nothing else stops working.
 onnxruntime
+
+# Text to speech (test/tts.py). pip, like onnxruntime, which it runs on:
+# piper-tts ships a prebuilt aarch64 abi3 wheel, so nothing compiles.
+# 1.3 or newer — 1.2 needs piper-phonemize, which has no wheel for the
+# Python 3.13 on Trixie. Voices (~60 MB each) are downloaded from the
+# Audio tab into test/voices/, not installed by pip.
+piper-tts>=1.3
+
+# The on-board voice assistant (test/brain.py) needs nothing from pip: it talks
+# to Ollama on your PC over plain HTTP with the standard library. The model
+# runs on the PC — see Start_pi.md §5.12.

@@ -200,6 +200,121 @@ A ribbon seated well enough to enumerate but not to stream. Power down, reseat
 Something else has it. `web_nav.py` and `camera_test.py` cannot share the
 camera. Stop the other one.
 
+### The mic hears me but the truck never answers
+
+Look at the line above the mic button on the phone page, or the Audio tab's
+**Assistant** card in the cockpit:
+
+- **"The brain PC is not reachable"** — in order: is the PC on and awake? Is
+  Ollama running (tray icon)? Was it restarted after setting
+  `OLLAMA_HOST=0.0.0.0:11434`? Is the firewall rule there, and the wifi
+  profile Private? From the Pi, `curl http://<pc-ip>:11434/api/tags` must
+  answer. If the PC's IP changed, fix it on the Assistant card.
+- **"Brain model missing"** — on the PC: `ollama pull qwen3-vl:4b-instruct` (or pick an
+  installed model on the Assistant card).
+- **"Waking up the brain"** — the model is loading into the GPU; the first
+  time after the PC starts this takes up to a minute.
+- **"Assistant is off"** — press **Assistant OFF** on the Audio tab.
+- Nothing at all, and no `brain:` line at web_nav start-up — the Pi is
+  running old code; sync `test/*.py` again.
+
+Words that are obviously background noise are ignored on purpose.
+
+### Answers are slow
+
+Watch **Heard → first word** on the Assistant card. The model must fit in the
+GPU's memory: on the PC run `ollama ps` while it is answering — `100% GPU` is
+right; any CPU share means it is too big and every answer crawls. On a 4 GB
+card use `qwen3-vl:4b-instruct` or `qwen3-vl:2b-instruct`, not 7–8B models.
+
+**Always an `-instruct` build.** The plain `qwen3-vl:2b` / `:4b` tags are the *thinking* variants: they reason silently before every answer, even when told not to — measured 78 s of silence for a one-line joke. The Assistant card warns when the model does this.
+
+### Phone mic button does nothing
+
+The status line under the button now says why. In order of likelihood:
+
+1. **Use the IP, not `shiv.local`.** Chrome on Android usually cannot
+   resolve `.local` names. The cockpit's Audio tab and web_nav's start-up
+   print show the right link, e.g. `https://192.168.1.10:5443/talk`.
+2. **It must be https on 5443.** Over plain http the browser refuses the
+   microphone; the page shows a yellow box with the link.
+3. **Certificate warning:** tap **Advanced → Proceed** once.
+4. **"Microphone blocked":** tap the icon left of the address → Permissions →
+   Microphone → Allow, then tap the mic again.
+5. **"needs internet":** Android's speech recognition runs on Google's
+   service; the phone needs mobile data or wifi with internet.
+
+If Chrome on the phone will not allow the microphone on the self-signed
+https page at all, skip https instead: on the phone open
+`chrome://flags/#unsafely-treat-insecure-origin-as-secure`, add
+`http://192.168.1.10:5004`, Enable, Relaunch — then use
+`http://192.168.1.10:5004/talk`. The page detects the change by itself.
+
+### Claude says "cannot reach the truck"
+
+`web_nav.py` must be running, and `TRUCK_URL` in the `claude mcp add` line
+must match — try the IP instead of `shiv.local`:
+`claude mcp remove truck`, then add it again with `TRUCK_URL=http://192.168.1.11:5004`.
+
+### Claude says the motors are disabled
+
+Working as intended: press **ENABLE** in the cockpit. The AI cannot arm
+the motors on its own.
+
+### Claude answers itself / repeats what the truck said
+
+The phone is transcribing the speaker. The page pauses the mic while the
+truck talks and the Pi drops anything heard up to 1 s after, but a phone
+right against the speaker can still catch the tail — move it further away.
+
+### `speech: Piper MISSING`
+
+In the venv: `pip install "piper-tts>=1.3"`, then restart `web_nav.py`. If pip
+tries to *build* something, it picked an old 1.2 release — the version pin
+matters, 1.2 has no wheel for Python 3.13.
+
+### Speak does nothing / "no voice downloaded yet"
+
+Open **Voices** under the Speak box and press Download on one, or
+`python test/speaker_test.py --download en_US-lessac-medium`. The Pi needs
+internet for that one step; after it, speech works offline.
+
+### A voice download fails with 404
+
+That voice was renamed or removed on the Piper voice server. Pick another;
+the full list is at huggingface.co/rhasspy/piper-voices.
+
+### Speech is slow
+
+The first sentence after starting or changing voice loads the model — a few
+seconds, once. After that a medium voice takes about a second per sentence.
+`high` voices take roughly as long as the speech itself on a Pi 4; use a
+medium one. Synthesis runs at low priority so SLAM always comes first — a
+heavy mapping session makes speech wait, by design.
+
+### `lcd:   NONE — GPIO7 busy`
+
+The SPI driver owns GPIO7 as chip select 1. Add `dtoverlay=spi0-1cs` under
+`dtparam=spi=on` in `/boot/firmware/config.txt` and reboot.
+`ls /dev/spidev*` must then list only `spidev0.0`.
+
+### `lcd:   NONE — /dev/spidev0.0 missing`
+
+SPI is off. Add both `dtparam=spi=on` and `dtoverlay=spi0-1cs`, reboot.
+
+### LCD lit but white, or shows nothing but the backlight
+
+Power is fine and no data is arriving. In order: `SDA` on header 19 and `SCL`
+on 23 (not swapped); `CS` on 24 and `DC` on 26 (easy to swap — they are
+neighbours); `GND` connected; `python test/display_test.py --check` all ✓.
+
+### LCD colours wrong, upside down, or a noise band on one edge
+
+`python test/display_test.py` and read the test card: red shows blue →
+`LCD_BGR`; negative picture → `LCD_INVERT`; arrow not at the top →
+`LCD_ROTATION`; noise band → try the rotation 180° from the one you want and
+flip the module instead. All in `test/pins.py`.
+
 ---
 
 ## Mapping is wrong

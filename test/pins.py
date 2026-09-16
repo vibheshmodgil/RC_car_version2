@@ -314,6 +314,59 @@ MARKER_SANITY_MM = 1500.0
 #     AngularServo(SERVO, pin_factory=PiGPIOFactory())
 SERVO = 17      # header 11
 
+# --- 1.54" 240x240 IPS LCD, ST7789, SPI --------------------------------------
+# On SPI0, the bus the header has always reserved for SPI, so nothing above
+# moves. Full wiring and the reasoning in WIRING.md section 14.
+#
+#   GND -> header 25          VCC -> header 17 (3V3, NOT 5 V)
+#   SCL -> header 23 GPIO11   SDA -> header 19 GPIO10 (MOSI)
+#   CS  -> header 24 GPIO8    DC  -> header 26 GPIO7
+#   RES -> 3V3 (jumper to VCC at the display)
+#   BLK -> 3V3 (jumper to VCC at the display)
+#
+# Needs, in /boot/firmware/config.txt, then a reboot:
+#     dtparam=spi=on
+#     dtoverlay=spi0-1cs
+# Without spi0-1cs the SPI driver claims GPIO7 as a second chip select and
+# DC cannot be opened ("GPIO busy").
+#
+# Why DC is on GPIO7 and RES/BLK have no pin: every other free-looking GPIO
+# already has an owner. GPIO17 = SERVO above. GPIO4 = the MAX98357A's SD
+# (the max98357a overlay claims it unless `no-sdmode` is set, and WIRING.md
+# section 7 keeps it for software mute). GPIO14/15 = the ESP32 UART (section
+# 10). GPIO0/1 = the HAT ID EEPROM, read by the firmware at boot. GPIO9 =
+# MISO, owned by the SPI driver even though the display never reads.
+# CE1 is the one pin that becomes free, because the display is the only SPI
+# device, so DC takes it. RES is not needed (the driver sends a software
+# reset) and BLK tied high just means the backlight is always on.
+LCD_SPI_BUS = 0
+LCD_SPI_DEV = 0          # CE0 -> GPIO8, header 24
+LCD_DC = 7               # header 26 — was CE1, freed by dtoverlay=spi0-1cs
+LCD_RST = None           # None = RES tied to 3V3. A BCM number if ever wired.
+LCD_BLK = None           # None = BLK tied to 3V3. A BCM number gives dimming.
+
+# 32 MHz asks the Pi 4 for 31.25 MHz (125 MHz / 4): a full frame in ~40 ms.
+# If the picture tears or shows speckles, the wires are too long for it —
+# drop to 16_000_000 before blaming the display.
+LCD_SPI_HZ = 32_000_000
+LCD_SPI_MODE = 0         # modules WITH a CS pin; CS-less ones need 3
+LCD_SIZE = (240, 240)
+
+# 0, 90, 180 or 270 — whichever way up the display is mounted. Check with
+# `python test/display_test.py`: the arrow marked TOP should point up.
+LCD_ROTATION = 0
+
+# IPS panels are inverted at the glass. True for this module; if the test
+# screen shows a WHITE background, set False.
+LCD_INVERT = True
+
+# Red and blue swapped on the test bars (R shows blue)? Set True.
+LCD_BGR = False
+
+# Status screen refresh, Hz. It only sends a frame when something changed,
+# and 2 is plenty for an address, a heading and a song title.
+LCD_FPS = 2.0
+
 # --- Tuning ----------------------------------------------------------------
 PWM_HZ = 1000   # 1 kHz. Audible whine but well inside the TB6612's range.
                 # Raise toward 20 kHz to move the whine above hearing; the

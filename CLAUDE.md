@@ -37,6 +37,7 @@ pin map and header diagram in `PINOUT.md`.** Those two files are authoritative
 | Orientation | 1 × **9-axis IMU** on I2C (BNO055 / ICM-20948 / MPU-9250) |
 | Vision | 1 × **Camera Module 1 (ov5647)**, CSI ribbon — no GPIO, 53.5° HFOV |
 | Audio | **MAX98357A** I2S amp (5 V, buck rail) + 12 W 4 Ω speaker |
+| Display | **1.54" 240×240 IPS, ST7789**, SPI0 — status screen (`WIRING.md` §14) |
 | Power | 3S Li-ion 11.1 V nom / 12.6 V full, + 5 V buck for logic |
 
 ### GPIO (BCM)
@@ -47,11 +48,21 @@ pin map and header diagram in `PINOUT.md`.** Those two files are authoritative
 | `LEFT_IN1` | 23 | 16 | `RIGHT_IN1` | 27 | 13 |
 | `LEFT_IN2` | 24 | 18 | `RIGHT_IN2` | 22 | 15 |
 | `STBY` (both drivers) | 25 | 22 | | | |
+| `SERVO` | 17 | 11 | `LCD_DC` | 7 | 26 |
+| LCD `SCL` (SCLK) | 11 | 23 | LCD `SDA` (MOSI) | 10 | 19 |
+| LCD `CS` (CE0) | 8 | 24 | LCD `RES`, `BLK` | 3V3 | 17 |
 
 Defined once in `test/pins.py` — import from there, never hardcode.
 
 Reserved, do not reuse: **18/19/20/21** (I2S audio), **2/3** (I2C — IMU),
-**14/15** (UART), **7–11** (SPI), **5/6/16/26** (motor encoders).
+**14/15** (UART — ESP32), **7–11** (SPI — LCD; 7 is its `DC`, 9 is owned by
+the SPI driver), **5/6/16/26** (motor encoders), **17** (servo), **4** (amp
+`SD` mute), **0/1** (HAT EEPROM). **Every GPIO now has an owner** — a new
+device goes on I2C or USB.
+
+The LCD needs `dtparam=spi=on` **and** `dtoverlay=spi0-1cs` in
+`/boot/firmware/config.txt`. Without the overlay the kernel holds GPIO7 as
+SPI CE1 and the display fails with "GPIO busy".
 
 The CSI camera is **not** in that list and never will be: it has its own
 ribbon connector and consumes no header pin, so it cannot collide with the
@@ -101,6 +112,9 @@ at 0.40 in `test/pins.py` for exactly this.
 - ⚠ `MARKER_SIZE_MM` must equal the size of the tags actually printed
   (black square only, measured with a ruler). Every marker distance scales
   linearly with it, and nothing else in the system can catch the error.
+- ⚠ LCD orientation and colour — run `python test/display_test.py` and set
+  `LCD_ROTATION`, `LCD_BGR`, `LCD_INVERT` in `pins.py` from what it shows.
+  Module variants differ; the defaults suit the common IPS board.
 - ⚠ MAX98357A `SD` pin — meter it against ground with Vin applied.
   **> 1.4 V** = mono, amp on. Near 0 V = the board has a pull-down and
   the amp is shut down until `SD` is jumpered to Vin. `WIRING.md` §7.
@@ -133,10 +147,17 @@ Speaker_truck/
 ├── test/                 # all hardware scripts live here
 │   ├── pins.py           # GPIO map — single source of truth
 │   ├── motor_test.py     # TB6612 × 2 differential drive
-│   ├── speaker_test.py   # amp + speaker via ALSA
+│   ├── speaker_test.py   # amp + speaker: tones, sweep, beeps, --play
+│   ├── audio.py          # speaker player — tones, beeps, MP3 (shared library)
+│   ├── tts.py            # text to speech, Piper neural voices (shared library)
+│   ├── voice.py          # phone as microphone: /talk page over https :5443 (shared library)
+│   ├── brain.py          # voice assistant: phone mic -> Ollama on the PC -> speaker
+│   ├── truck_api.py      # AI-facing actions (look/drive/horn...) over web_nav HTTP — shared by brain + MCP
 │   ├── imu.py            # 9-axis IMU driver (shared library)
 │   ├── camera.py         # CSI camera driver (shared library)
 │   ├── camera_test.py    # identify, time, and aim the camera
+│   ├── display.py        # ST7789 LCD driver + status screen (shared library)
+│   ├── display_test.py   # colours, orientation, speed, --ip
 │   ├── markers.py        # ArUco absolute position fix (shared library)
 │   ├── marker_test.py    # print tags, check detection range
 │   ├── cliff.py          # camera floor check — stairs the LiDAR cannot see
@@ -145,12 +166,20 @@ Speaker_truck/
 │   ├── detect.py         # YOLOv8n furniture labels pinned to the map
 │   ├── slam.py           # occupancy grid + scan matching
 │   ├── explore.py        # frontier explorer
-│   ├── web_nav.py        # the cockpit — drive, LiDAR, IMU, camera, map
+│   ├── web_nav.py        # the cockpit — drive, LiDAR, IMU, camera, map, audio, LCD
 │   ├── captures/         # stills saved from the camera — never synced back
 │   ├── marker_map.json   # learned tag positions — Pi-side, never synced
 │   ├── tuning.json       # values saved from the Tune tab — Pi-side
+│   ├── uploads/          # songs uploaded from the Audio tab — Pi-side
+│   ├── audio.json        # speaker device, volume, play mode — Pi-side
+│   ├── voices/           # Piper voice models, ~60 MB each — Pi-side, never synced
+│   ├── tts.json          # chosen voice, speed, recent phrases — Pi-side
+│   ├── talk_cert.pem     # self-signed https cert for /talk, made on first run — Pi-side
 │   ├── objects.json      # voted object labels — Pi-side
 │   └── yolov8n.onnx      # detection model — copied in, never synced
+├── tools/                # runs on the PC, not the Pi
+│   ├── detect_server.py  # bigger detection model, reached over the LAN
+│   └── truck_mcp.py      # MCP server for Claude Code — thin wrapper over test/truck_api.py
 └── .venv/                # Python venv — created ON THE PI, never synced
 ```
 

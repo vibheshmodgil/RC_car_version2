@@ -2,164 +2,207 @@
 Audio / amplifier test.
 
     cd ~/Desktop/Speaker_truck && source .venv/bin/activate
-    python test/speaker_test.py             # list devices, then tone + sweep
-    python test/speaker_test.py --list      # just show what ALSA sees
-    python test/speaker_test.py -d hw:1,0   # force a specific device
+    python test/speaker_test.py                 # list devices, then tone + sweep + beeps
+    python test/speaker_test.py --list          # just show what ALSA sees
+    python test/speaker_test.py --beep horn     # one beep: beep double horn chirp reverse alert
+    python test/speaker_test.py --play song.mp3 # play a file (path, or a name in test/uploads/)
+    python test/speaker_test.py -d plughw:1,0   # force a specific device
+    python test/speaker_test.py --voices        # text-to-speech voices, installed or not
+    python test/speaker_test.py --download en_US-lessac-medium
+    python test/speaker_test.py --say "Hello, I am the speaker truck"
 
-No Python audio libraries needed — this drives the ALSA command-line tools
-that ship with Raspberry Pi OS (`aplay`, `speaker-test`, `amixer`).
+No Python audio libraries needed — the player (audio.py, shared with the web
+pages) drives `aplay` for tones and `ffmpeg` for music:
 
-START WITH THE AMP VOLUME LOW. A full-scale sine into a class-D amp at high
+    sudo apt install -y alsa-utils ffmpeg
+
+The MAX98357A is picked automatically when ALSA lists it. HDMI is card 0 on
+this Pi, so "first device" would be the wrong default.
+
+Speech needs Piper in the venv (tts.py):  pip install "piper-tts>=1.3"
+
+START WITH THE AMP GAIN LOW. A full-scale sine into a class-D amp at high
 gain is loud enough to damage a small speaker, and your ears.
 """
 
 import argparse
+import os
 import shutil
-import subprocess
 import sys
 
-TOOLS = ("aplay", "speaker-test")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import audio  # noqa: E402
 
 
-def run(cmd, **kw):
-    """Run a command, return CompletedProcess. Never raises on non-zero."""
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+def list_devices(player):
+    devs = player.devices(fresh=True)
+    print("=== ALSA playback devices ===")
+    if not devs:
+        print("  (none)\n")
+        print("No sound card found. Check:")
+        print("  - `dtoverlay=max98357a` and `dtparam=audio=off` in")
+        print("    /boot/firmware/config.txt, then a reboot. WIRING.md section 7.")
+        return
+    for d in devs:
+        mark = "  <- speaker" if d["dev"] == player.device else ""
+        print(f"  {d['dev']:<14} {d['name']}{mark}")
+    print(f"\n  ffmpeg: {'ok' if player.have_ffmpeg else 'MISSING — no MP3'}")
+    print("  The MAX98357A has no mixer control — volume is software only.")
 
 
-def check_tools():
-    missing = [t for t in TOOLS if shutil.which(t) is None]
-    if missing:
-        print(f"Missing: {', '.join(missing)}")
-        print("Install with:  sudo apt install -y alsa-utils")
-        sys.exit(1)
+def speech(args):
+    import time                                                # noqa: PLC0415
+    import tts                                                 # noqa: PLC0415
+
+    class Silent:                     # voice management needs no sound card
+        _kind = None
+    talker = tts.Tts(Silent(), warm=False)       # listing voices loads no model
+    missing = 'MISSING — pip install "piper-tts>=1.3"'
+    print("Piper:", "installed" if talker.have_piper else missing)
+    if args.download:
+        talker.download(args.download)
+        state = talker.downloads.get(args.download) or {}
+        print(f"  from {tts.voice_urls(args.download)[0]}")
+        while args.download in talker.downloads and state.get("pct", 100) < 100:
+            mb, tot = state.get("got", 0) / 1e6, state.get("total", 0) / 1e6
+            size = f"{mb:5.1f} / {tot:.0f} MB" if tot else f"{mb:5.1f} MB"
+            print(f"\r  {state.get('stage', '')}: {state['pct']:3d}%  {size}   ",
+                  end="", flush=True)
+            time.sleep(0.5)
+        err = state.get("error")
+        print("\n  " + ("FAILED: " + err if err else "done"))
+    print("\n=== voices ===")
+    for v in talker.voices():
+        mark = "*" if v["id"] == talker.voice and v["installed"] else " "
+        have = "installed " if v["installed"] else f"{v['mb'] or '?':>3} MB    "
+        print(f" {mark} {v['id']:<36} {have} {v['label']}")
+    talker.close()
 
 
-def list_devices():
-    print("=== ALSA playback devices (aplay -l) ===")
-    r = run(["aplay", "-l"])
-    out = (r.stdout or r.stderr).strip()
-    print(out if out else "  (none)")
-
-    if "no soundcards" in out.lower() or not out:
-        print("\nNo sound card found. Check:")
-        print("  - Analog amp? The 3.5 mm jack needs `dtparam=audio=on`")
-        print("    in /boot/firmware/config.txt")
-        print("  - I2S amp?  Needs e.g. `dtoverlay=max98357a` in the same")
-        print("    file, then a reboot. See WIRING.md section 6.")
-        return []
-
-    # Lines look like: card 0: Headphones [bcm2835 Headphones], device 0: ...
-    devices = []
-    for line in out.splitlines():
-        if line.startswith("card "):
-            try:
-                card = line.split("card ")[1].split(":")[0].strip()
-                dev = line.split("device ")[1].split(":")[0].strip()
-                name = line.split("[")[1].split("]")[0]
-                devices.append((f"hw:{card},{dev}", name))
-            except (IndexError, ValueError):
-                continue
-
-    print("\n=== Usable device strings ===")
-    for d, name in devices:
-        print(f"  {d:<10} {name}")
-    return devices
-
-
-def show_mixer():
-    print("\n=== Mixer ===")
-    r = run(["amixer", "scontrols"])
-    controls = (r.stdout or "").strip()
-    print(controls if controls else "  (no controls — common on I2S amps)")
-    if "PCM" in controls:
-        print("\n  Set volume to 80%:  amixer set PCM 80%")
-    elif "Master" in controls:
-        print("\n  Set volume to 80%:  amixer set Master 80%")
-
-
-def tone(device, freq, seconds):
-    print(f"\n--- {freq} Hz sine, {seconds}s, on {device or 'default'} ---")
-    cmd = ["speaker-test", "-t", "sine", "-f", str(freq), "-l", "1",
-           "-P", "2", "-s", "1"]
-    if device:
-        cmd += ["-D", device]
-    # speaker-test with -l 1 still runs until killed on some versions,
-    # so bound it with a timeout rather than trusting it to exit.
-    try:
-        subprocess.run(cmd, timeout=seconds, capture_output=True, text=True)
-    except subprocess.TimeoutExpired:
-        pass  # expected — the timeout IS the duration control
-    print("  done")
-
-
-def sweep(device):
-    """Step through the band a small speaker can actually reproduce.
-
-    If low tones are inaudible but high ones are fine, that is the speaker
-    or the amp's coupling caps, not the Pi.
-    """
-    print("\n--- frequency sweep ---")
-    for f in (110, 220, 440, 880, 1760, 3520):
-        print(f"  {f} Hz")
-        tone(device, f, 1.2)
-
-
-def noise_check(device):
-    print("\n--- stereo channel check (front left / front right) ---")
-    cmd = ["speaker-test", "-t", "wav", "-c", "2", "-l", "1"]
-    if device:
-        cmd += ["-D", device]
-    r = run(cmd, timeout=20)
-    if r.returncode != 0:
-        # -t wav needs the sample files; fall back to pink noise.
-        print("  wav samples unavailable, using pink noise")
-        cmd = ["speaker-test", "-t", "pink", "-c", "2", "-l", "1"]
-        if device:
-            cmd += ["-D", device]
-        try:
-            subprocess.run(cmd, timeout=10, capture_output=True)
-        except subprocess.TimeoutExpired:
-            pass
-    print("  done")
+def play_and_wait(fn, label):
+    print(f"  {label}")
+    fn()
+    player.wait()
 
 
 def main():
+    global player
     ap = argparse.ArgumentParser(description="Speaker / amplifier test")
-    ap.add_argument("-d", "--device", help="ALSA device, e.g. hw:0,0")
+    ap.add_argument("-d", "--device", help="ALSA device, e.g. plughw:1,0")
     ap.add_argument("--list", action="store_true", help="list devices and exit")
     ap.add_argument("--freq", type=int, default=440, help="tone Hz")
+    ap.add_argument("--level", type=float, default=0.25,
+                    help=f"tone level 0-{audio.MAX_TONE_LEVEL}")
+    ap.add_argument("--beep", choices=list(audio.BEEPS), help="play one beep and exit")
+    ap.add_argument("--play", metavar="FILE", help="play an audio file and exit")
+    ap.add_argument("--volume", type=float, default=0.8, help="music volume 0-1.5")
+    ap.add_argument("--say", metavar="TEXT", action="append",
+                    help="speak TEXT with a Piper voice; repeat to say several — "
+                         "the second one shows the real, warm speed")
+    ap.add_argument("--voice", help="voice id for --say (default: the one last chosen)")
+    ap.add_argument("--voices", action="store_true", help="list speech voices")
+    ap.add_argument("--download", metavar="VOICE", help="download a Piper voice")
     args = ap.parse_args()
 
-    check_tools()
-    devices = list_devices()
-    show_mixer()
+    if args.voices or args.download:
+        speech(args)
+        return
 
+    if shutil.which("aplay") is None:
+        print("Missing: aplay.  Install with:  sudo apt install -y alsa-utils")
+        sys.exit(1)
+
+    player = audio.Audio()
+    if args.device:
+        player.device = args.device        # not saved: a one-off override
+    list_devices(player)
     if args.list:
         return
 
-    device = args.device
-    if not device and devices:
-        device = devices[0][0]
-        print(f"\nUsing first device: {device}")
-        print("Override with -d if that is the wrong one "
-              "(HDMI is often card 0).")
-
-    print("\n" + "=" * 58)
-    print("  TURN THE AMP VOLUME DOWN before continuing.")
-    print("=" * 58)
-    if input("  Enter to start, Ctrl-C to abort: ") is None:
-        return
-
     try:
-        tone(device, args.freq, 3)
-        sweep(device)
-        noise_check(device)
+        if args.say:
+            import tts                                         # noqa: PLC0415
+            import time                                        # noqa: PLC0415
+            # warm=False: this process speaks straight away, so a separate
+            # warm-up would only be cut off by the first sentence anyway.
+            talker = tts.Tts(player, warm=False)
+            print(f"  voice {args.voice or talker.voice}")
+            print("  A fresh process loads the model first; web_nav.py does that once, at start-up.")
+            for i, text in enumerate(args.say):
+                print(f"\n  [{i + 1}] {text[:70]}")
+                talker.say(text, voice=args.voice)
+                # Report each stage as it happens: a silent 15 s of model
+                # loading looks exactly like a hang.
+                t0, last = time.monotonic(), None
+                while talker.busy:
+                    if talker.status != last:
+                        last = talker.status
+                        print(f"  {time.monotonic() - t0:5.1f} s  {last}")
+                    time.sleep(0.05)
+                print(f"  {time.monotonic() - t0:5.1f} s  done"
+                      + (f" · first sound after {talker.first_sound_ms} ms" if talker.first_sound_ms else ""))
+                if i == 0 and talker.startup:
+                    st = talker.startup
+                    print(f"         start-up: import piper {st['import_ms']} ms · "
+                          f"load voice {st['load_ms']} ms · first inference {st['first_inference_ms']} ms")
+                if talker.error:
+                    print("\n  Speech failed: " + talker.error)
+                    sys.exit(1)
+            player.wait()
+            return
+        if args.beep:
+            play_and_wait(lambda: player.beep(args.beep), f"beep: {args.beep}")
+            return
+        if args.play:
+            path = os.path.abspath(args.play)
+            if os.path.isfile(path):
+                # The player only plays from test/uploads/, so a file given
+                # by path is copied in — it then shows up in the web UI too.
+                name = audio._safe_name(os.path.basename(path))
+                dest = os.path.join(audio.AUDIO_DIR, name)
+                if os.path.abspath(dest) != path:
+                    shutil.copyfile(path, dest)
+            else:
+                name = args.play
+            play_and_wait(lambda: player.play(name, volume=args.volume),
+                          f"playing {name} — Ctrl-C to stop")
+            return
+
+        print("\n" + "=" * 58)
+        print("  TURN THE AMP GAIN DOWN before continuing.")
+        print("=" * 58)
+        input("  Enter to start, Ctrl-C to abort: ")
+
+        print(f"\n--- {args.freq} Hz tone, 3 s ---")
+        play_and_wait(lambda: player.tone(args.freq, 3, args.level), "tone")
+
+        # If low tones are inaudible but high ones are fine, that is the
+        # speaker or its enclosure, not the Pi.
+        print("\n--- frequency steps ---")
+        for f in (110, 220, 440, 880, 1760, 3520):
+            play_and_wait(lambda f=f: player.tone(f, 1.0, args.level), f"{f} Hz")
+
+        print("\n--- log sweep 40 Hz - 15 kHz, 8 s ---")
+        play_and_wait(lambda: player.sweep(40, 15000, 8, args.level), "sweep")
+
+        print("\n--- beeps ---")
+        for kind in audio.BEEPS:
+            play_and_wait(lambda k=kind: player.beep(k), kind)
+
         print("\nAudio test complete.")
-        print("Heard nothing? Check, in order: amp power, amp gain, speaker")
-        print("wiring, then `-d` device choice, then config.txt overlay.")
+        print("Heard nothing? Check, in order: amp Vin at 5 V, SD pin > 1.4 V,")
+        print("speaker wiring, then `-d` device choice, then config.txt overlay.")
+    except RuntimeError as e:
+        print(f"\n  Player failed: {e}")
+        sys.exit(1)
     except KeyboardInterrupt:
         print("\nInterrupted.")
+    finally:
+        player.stop()
 
+
+player = None
 
 if __name__ == "__main__":
     main()

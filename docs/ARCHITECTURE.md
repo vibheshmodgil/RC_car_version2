@@ -70,15 +70,23 @@ measure rotation and field, both independent of where on a rigid body they sit.
 | `markers.py` | ArUco detection, the learned tag map, pose fixes |
 | `cliff.py` | Floor appearance check — drops and low obstacles |
 | `tuning.py` | The registry of every live-tunable value |
+| `audio.py` | Speaker player: tones, beeps, MP3 via ffmpeg, the `/audio/*` Flask routes |
+| `tts.py` | Text to speech: Piper in a nice-10 worker process, sentence queue, voice downloads, `/tts/*` routes |
+| `display.py` | ST7789 SPI driver and the status screen thread (renders at 2 Hz, sends only on change) |
 | `calibrate.py` | Measuring scanner rotation and odometry scale from a push |
 | `detect.py` | YOLOv8n furniture labels, placed on the map with LiDAR range |
+| `voice.py` | Phone as microphone: `/talk` page, heard-speech queue with echo suppression, https server |
+| `brain.py` | Voice assistant: heard text -> Ollama on the PC (streamed, tools, vision) -> spoken sentence by sentence |
+| `truck_api.py` | The AI-facing actions over web_nav's HTTP API — one implementation for brain.py and the MCP server |
 | `../tools/detect_server.py` | **Runs on your PC.** A bigger model, reached over the LAN |
+| `../tools/truck_mcp.py` | **Runs on your PC.** MCP server for Claude Code — a thin wrapper over `truck_api.py` |
 
 ### Programs
 
 | File | Port | Owns GPIO |
 |---|---|---|
 | `web_nav.py` | 5004 | yes — **the cockpit; this is the one you want** |
+| `web_nav.py` (https) | 5443 | same process — only so a phone may use its microphone on `/talk` |
 | `web_pilot.py` | 5003 | yes — superseded by web_nav |
 | `web_drive.py` | 5001 | yes — superseded |
 | `web_dashboard.py` | 5000 | yes — superseded |

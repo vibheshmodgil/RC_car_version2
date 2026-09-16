@@ -31,6 +31,8 @@ motor drivers. 2D LiDAR = primary perception sensor.
       │             speaker
       ├── USB ──── 2D LiDAR
       │
+      ├── SPI0 ─── 1.54" ST7789 LCD (3.3 V)
+      │
       └── GPIO ─── TB6612 #1 + #2 logic (3.3 V)
 
         ALL GROUNDS COMMON — battery, buck, drivers, Pi, amp
@@ -143,7 +145,8 @@ sudo systemctl enable --now pigpiod
 | I2S | 18, 19, 20, 21 | I2S audio amp (MAX98357A etc.) |
 | I2C | 2, 3 | **9-axis IMU** — in use, see §11 / OLED |
 | UART | 14, 15 | serial LiDAR, if not USB |
-| SPI | 7, 8, 9, 10, 11 | spare |
+| SPI | 8, 9, 10, 11 | **ST7789 LCD** — in use, see §14 (9 = MISO, unused but owned by the driver) |
+| SPI CE1 | 7 | **ST7789 `DC`** — freed by `dtoverlay=spi0-1cs`, §14 |
 
 The motor pins above deliberately avoid all of these, so the I2S amp (§7)
 and the IMU (§11) both dropped in without moving a single motor pin.
@@ -447,7 +450,7 @@ You should see one card, named something like `MAX98357A` or
 
 The MAX98357A has no volume register — it plays whatever samples reach it, so
 `amixer scontrols` comes back empty. **Every level control has to be in
-software.** `test/web_dashboard.py` does this in the player (ffmpeg's `volume`,
+software.** `test/audio.py` does this in the player (ffmpeg's `volume`,
 `bass` and `treble` filters), so it needs nothing extra.
 
 If you want `amixer` to work anyway, add a softvol plugin in `~/.asoundrc`:
@@ -465,8 +468,8 @@ pcm.softvol {
 
 ```bash
 sudo apt install -y alsa-utils ffmpeg     # ffmpeg only needed for MP3
-python test/speaker_test.py               # tone + sweep from the terminal
-python test/web_dashboard.py              # tone, sweep, MP3 upload in the UI
+python test/speaker_test.py               # tone, sweep, beeps from the terminal
+python test/web_nav.py                    # Audio tab: tone test, beeps, MP3 upload
 ```
 
 Silent? Work down this list in order — it is roughly most to least likely:
@@ -1174,3 +1177,121 @@ contrib into `python3-opencv`.
 | Floor panel, open floor | all cells clear | press Relearn, on floor not wall |
 | Floor panel, shoe ahead | amber cells, forward vetoed | camera not tilted down enough |
 | Drive at a step down | red cells, forward vetoed | **test this on a kerb before stairs** |
+
+---
+
+## 14. Display — 1.54" 240×240 IPS, ST7789, SPI
+
+A status screen on the truck itself: the address to open the cockpit at,
+drive state, LiDAR / IMU / camera, the guard, the pose and the song playing.
+Driven by `test/display.py`, started by `web_nav.py`, tested by
+`test/display_test.py`.
+
+### Connections
+
+| LCD pin | Meaning | Pi header | BCM | Notes |
+|---|---|---|---|---|
+| `GND` | ground | **25** | — | any GND; 25 sits beside the SPI pins |
+| `VCC` | power | **17** | 3V3 | **3.3 V, not 5 V** — see below |
+| `SCL` | SPI clock | **23** | GPIO11 `SCLK` | |
+| `SDA` | SPI data (MOSI) | **19** | GPIO10 `MOSI` | not I2C, despite the name |
+| `RES` | reset | **3V3** | — | jumper to `VCC` at the display |
+| `DC` | data / command | **26** | GPIO7 | was `CE1`, freed by the overlay |
+| `CS` | chip select | **24** | GPIO8 `CE0` | |
+| `BLK` | backlight | **3V3** | — | jumper to `VCC` at the display — always on |
+
+```
+ LCD                     Pi 4 header
+ GND ─────────────────── 25  GND
+ VCC ──┬──────────────── 17  3V3
+ RES ──┤  (jumpered at the display)
+ BLK ──┘
+ SCL ─────────────────── 23  GPIO11 SCLK
+ SDA ─────────────────── 19  GPIO10 MOSI
+ DC  ─────────────────── 26  GPIO7
+ CS  ─────────────────── 24  GPIO8  CE0
+```
+
+Keep the wires short — under ~15 cm. The clock runs at 31.25 MHz, and long
+loose jumpers show up as speckles or a torn picture long before anything
+else goes wrong. If you see that, drop `LCD_SPI_HZ` to `16_000_000`.
+
+### Why these pins — nothing else moves
+
+Checked against every assignment in this file:
+
+| Wanted | Why not |
+|---|---|
+| GPIO17 | `SERVO` (§3) |
+| GPIO4 | MAX98357A `SD` — the `max98357a` overlay claims GPIO4 unless `no-sdmode` is set, and §7 keeps it for software mute |
+| GPIO14 / 15 | the ESP32 UART link (§10) |
+| GPIO0 / 1 | HAT ID EEPROM, probed by the firmware at every boot |
+| GPIO9 | MISO — owned by the SPI driver even though the display never reads |
+| GPIO5, 6, 16, 26 | encoders |
+| GPIO12, 13, 22–25, 27 | motors |
+| GPIO2, 3 | IMU I2C |
+| GPIO18–21 | I2S audio |
+
+SPI0's MOSI / SCLK / CE0 were reserved for SPI from the start, so they cost
+nothing. That leaves **exactly one** free GPIO — CE1, which the display does
+not need because it is the only SPI device — and `DC` is the one line that
+must be a GPIO. `RES` and `BLK` are not:
+
+- **RES** high means "never hardware-reset". `display.py` sends the ST7789
+  software reset (`0x01`) at start-up, which clears the same registers.
+- **BLK** high means the backlight is always on. The panel can still be
+  blanked from the Sensors tab; the backlight just stays lit behind black.
+
+If a pin is ever freed, set `LCD_RST` / `LCD_BLK` in `pins.py` to its BCM
+number and the driver uses it (BLK then gets brightness control).
+
+The camera (CSI ribbon) and the LiDAR (USB) use no header pins, so neither
+is affected.
+
+### Power
+
+**`VCC` to 3.3 V.** Most of these modules carry a regulator and tolerate 5 V
+on `VCC`, but `RES` and `BLK` are jumpered to `VCC` here — at 5 V that puts
+5 V on the controller's reset input. At 3.3 V everything on the board sits at
+the Pi's logic level. Draw is ~20–40 mA, mostly backlight, well inside what
+the 3V3 pins supply alongside the TB6612 logic, encoders and IMU.
+
+### Enabling SPI — two lines, both required
+
+```ini
+# /boot/firmware/config.txt
+dtparam=spi=on
+dtoverlay=spi0-1cs
+```
+
+then `sudo reboot`.
+
+`dtparam=spi=on` alone is **not enough**. It gives SPI0 two chip selects, and
+the kernel claims GPIO8 **and GPIO7** for them — so `DC` fails to open with
+`GPIO busy`. `spi0-1cs` keeps CE0 on GPIO8 and releases GPIO7.
+
+`sudo raspi-config` → Interface Options → SPI writes only the first line.
+Add the overlay by hand either way.
+
+```bash
+sudo apt install -y python3-spidev python3-pil python3-numpy
+```
+
+apt, not pip, like every other hardware package here.
+
+### Verify
+
+| Check | Expected | If wrong |
+|---|---|---|
+| `ls /dev/spidev*` | **only** `/dev/spidev0.0` | none: SPI off · `spidev0.1` too: overlay missing |
+| `pinctrl get 7` | an input or output, **not** `SPI0_CE1_N` | overlay missing, reboot |
+| `python test/display_test.py --check` | all ✓ | follow the ✗ line |
+| `python test/display_test.py` fills | red, green, blue, white, black | red is blue → `LCD_BGR = True` · negative → `LCD_INVERT = False` |
+| test card | TOP arrow at the top | `LCD_ROTATION` 90 / 180 / 270 |
+| speed line | ~20 fps or more | speckles → shorter wires or lower `LCD_SPI_HZ` |
+| motors running, wheels up | picture steady | shared 3V3 or ground sag — separate ground wire |
+| `web_nav.py` start-up | `lcd:   ST7789 on SPI0 · 31.25 MHz` | the reason is printed instead |
+
+Blank white screen with the backlight on = power and backlight fine, no SPI
+data arriving: check `SDA`/`SCL` are not swapped, `CS` is on 24 not 26, and
+`DC` is on 26.

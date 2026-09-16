@@ -140,10 +140,11 @@ order on a fresh build — stop at the first failure:
 |---|---|
 | `python test/pin_hold.py` | GPIO pins, no motor power |
 | `python test/motor_test.py` | TB6612 drivers and motors |
-| `python test/speaker_test.py` | I2S amp and speaker |
+| `python test/speaker_test.py` | I2S amp and speaker — tones, sweep, beeps, `--play song.mp3`, `--say "hello"` |
 | `python test/lidar_probe.py` | LiDAR serial, raw frames |
 | `python test/imu_test.py` | IMU detect, live readings, calibration |
 | `python test/camera_test.py` | Camera detect, frame timing, aiming |
+| `python test/display_test.py` | ST7789 LCD: SPI config, colours, orientation, speed |
 | `python test/marker_test.py` | ArUco tags: print a sheet, check range |
 
 `test/calibrate.py` has no test script — it is driven from the Drive tab,
@@ -164,8 +165,13 @@ Full detail and what each result should look like: **[Start_pi.md](Start_pi.md)*
 | Mapping / scan matching internals | `test/slam.py` |
 | Autonomous exploration | `test/explore.py` |
 | Camera, markers, cliff detection | `test/camera.py`, `test/markers.py`, `test/cliff.py` |
+| The truck's status screen | `test/display.py` (`render_status`) — wiring in [WIRING.md §14](WIRING.md) |
+| Text to speech (voices, queue) | `test/tts.py` — Piper, `pip install "piper-tts>=1.3"` |
+| Speaker playback, beeps, the horn | `test/audio.py` — shared by `web_nav.py`, `web_dashboard.py`, `speaker_test.py` |
 | Object detection | `test/detect.py` — needs `yolov8n.onnx` in `test/` |
 | Better detection, off-board | `tools/detect_server.py` — run it on your PC, paste the URL into the Objects panel |
+| Talking to the truck (it answers out loud) | `test/brain.py` — a free local model in Ollama on your PC; phone mic in `test/voice.py` — [Start_pi.md §5.12](Start_pi.md) |
+| What the AI can do to the truck (look, drive, horn…) | `test/truck_api.py` — shared by `brain.py` and `tools/truck_mcp.py` |
 
 Never hardcode a pin number. Import it from `pins.py`.
 
@@ -207,6 +213,7 @@ Details in [WIRING.md §8](WIRING.md).
 | Orientation | BNO055 9-axis IMU on I2C |
 | Vision | Camera Module 1 (ov5647) on CSI — no GPIO cost |
 | Audio | MAX98357A I2S amp + 12 W 4 Ω speaker |
+| Display | 1.54" 240×240 IPS LCD, ST7789, SPI — shows the Pi's address |
 | Power | 3S Li-ion 11.1 V, 5 V buck for logic |
 
 ---

@@ -33,12 +33,16 @@ GPIO17              │ 11  ●  ◆ │ 12   GPIO18  PCM_CLK   ◄── MAX983
 GPIO27              │ 13  ◆  ● │ 14   GND
    ◄── RIGHT_IN1    │        ◆ │ 15   GPIO22            ◄── RIGHT_IN2
 GPIO22              │ 15  ◆  ◆ │ 16   GPIO23            ◄── LEFT_IN1
-        3V3  power  │ 17  ●  ◆ │ 18   GPIO24            ◄── LEFT_IN2
+        3V3  power  │ 17  ◆  ◆ │ 18   GPIO24            ◄── LEFT_IN2
    ◄── TB6612 VCC   │          │
-GPIO10  MOSI  SPI   │ 19  ●  ● │ 20   GND
+   ◄── LCD VCC/RES/BLK         │
+GPIO10  MOSI  SPI   │ 19  ◆  ● │ 20   GND
+   ◄── LCD SDA      │          │
 GPIO9   MISO  SPI   │ 21  ●  ◆ │ 22   GPIO25            ◄── STBY
-GPIO11  SCLK  SPI   │ 23  ●  ● │ 24   GPIO8   CE0
-        GND         │ 25  ●  ● │ 26   GPIO7   CE1
+GPIO11  SCLK  SPI   │ 23  ◆  ◆ │ 24   GPIO8   CE0       ◄── LCD CS
+   ◄── LCD SCL      │          │
+        GND         │ 25  ◆  ◆ │ 26   GPIO7   CE1       ◄── LCD DC
+   ◄── LCD GND      │          │
 GPIO0   ID_SD       │ 27  ●  ● │ 28   GPIO1   ID_SC
 GPIO5               │ 29  ●  ● │ 30   GND
 GPIO6               │ 31  ●  ◆ │ 32   GPIO12  PWM0      ◄── LEFT_PWM
@@ -67,6 +71,12 @@ GPIO26              │ 37  ●  ● │ 38   GPIO20  PCM_DIN
 | 31 | GPIO6 | `LEFT_ENC_B` | front-left encoder, **green** |
 | 36 | GPIO16 | `RIGHT_ENC_A` | front-right encoder, **yellow** |
 | 37 | GPIO26 | `RIGHT_ENC_B` | front-right encoder, **green** |
+| 19 | GPIO10 | `MOSI` | LCD `SDA` |
+| 23 | GPIO11 | `SCLK` | LCD `SCL` |
+| 24 | GPIO8 | `LCD_SPI_DEV` (CE0) | LCD `CS` |
+| 26 | GPIO7 | `LCD_DC` | LCD `DC` — needs `dtoverlay=spi0-1cs` |
+| 17 | — | 3V3 | LCD `VCC`, with `RES` and `BLK` jumpered to it |
+| 25 | — | GND | LCD `GND` |
 | 1 or 17 | — | 3V3 | TB6612 VCC ×2 **and encoder VCC (blue)** |
 | 6, 9, 14, 20, 25, 30, 34, 39 | — | GND | common ground, incl. encoder **black** |
 
@@ -95,7 +105,13 @@ Both mistakes are destructive — see `WIRING.md` §4.
 | 38 | 20 | `PCM_DIN` — I2S input side, unused for playback |
 | 3, 5 | 2, 3 | **9-axis IMU** — SDA / SCL (in use, WIRING.md §11) |
 | 8, 10 | 14, 15 | UART — serial LiDAR |
-| 19, 21, 23, 24, 26 | 7–11 | SPI |
+| 19, 21, 23, 24, 26 | 7–11 | **ST7789 LCD** on SPI0 (in use, WIRING.md §14). 21 / GPIO9 is MISO: unused, but owned by the SPI driver |
+| 7 | 4 | MAX98357A `SD` — software mute, and claimed by the `max98357a` overlay unless `no-sdmode` |
+| 11 | 17 | `SERVO` (in use above) |
+| 27, 28 | 0, 1 | HAT ID EEPROM — never use |
+
+**The header is now full.** Every GPIO has an owner. The next device needs
+I2C (shares GPIO2/3 with the IMU) or USB.
 
 ## Not on this header: the CSI camera
 
@@ -104,8 +120,8 @@ table above. It plugs into the Pi 4's own 15-pin CSI ribbon socket — the
 narrow white one between the HDMI ports and the audio jack, labelled
 **CAMERA** — and consumes **zero header pins**.
 
-So it can never conflict with the motors, the encoders, the I2S amp or the
-I2C IMU, and adding it frees you from re-checking anything above. The socket
+So it can never conflict with the motors, the encoders, the I2S amp, the
+I2C IMU or the SPI display, and adding it frees you from re-checking anything above. The socket
 on the Ethernet side marked **DISPLAY** is DSI, looks almost the same, and a
 ribbon in that one enumerates nothing.
 

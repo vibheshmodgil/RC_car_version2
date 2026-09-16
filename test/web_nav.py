@@ -28,11 +28,51 @@ What the IMU adds beyond a pretty dial
                the wheels are slipping and the encoder odometry is lying.
                That is a thing only having both sensors can tell you.
 
-Every part degrades on its own: no IMU still gives drive + LiDAR, no LiDAR
-still gives drive + IMU. Nothing here refuses to start because a sensor is
-missing — it says so on the page instead.
+Speaker
+-------
+  Audio tab    Upload MP3s from the browser and play them — pause, seek, next,
+               play-all or repeat, volume/bass/treble — plus the tone and
+               sweep test for bringing the amp up.
+  Horn         Beep, horn, chirp, reverse and alert on the Drive tab, and the
+               H key. A beep over a song holds the song and resumes it.
 
-Needs:  sudo apt install -y python3-serial i2c-tools python3-smbus2
+The player is audio.py, shared with web_dashboard.py and speaker_test.py.
+Songs live in test/uploads/ on the Pi.
+
+Speech
+------
+Type on the Audio tab (or the Say box on Drive) and the truck speaks it with
+a Piper neural voice — offline, on the Pi, in a low-priority worker process
+so SLAM keeps its CPU. Speech holds a playing song like a beep does. tts.py.
+
+Claude at the wheel
+-------------------
+tools/truck_mcp.py (runs on the PC) gives Claude tools to look through the
+camera, read the obstacles around the truck, drive in short bounded moves,
+speak and beep — all through this server's HTTP API, with the guard and the
+watchdog still in charge. /ai/status is the compact view it reads. A person
+still has to press ENABLE: the AI can drive the motors, never arm them.
+
+A phone is the microphone: https://<pi-ip>:5443/talk (voice.py). What is
+said there is answered out loud by brain.py — the on-board assistant, which
+asks a free local model in Ollama on your PC and streams the reply into the
+speaker sentence by sentence. No API keys. Turn it off on the Audio tab to
+talk through Claude Code and the MCP `listen` tool instead.
+
+Display
+-------
+The 1.54" ST7789 on the truck shows the address to open this page at, drive
+state, sensors, the guard, the pose and the song playing. The Sensors tab
+mirrors it and can blank it or show the test card. display.py; wiring in
+WIRING.md section 14. --no-display leaves the panel alone.
+
+Every part degrades on its own: no IMU still gives drive + LiDAR, no LiDAR
+still gives drive + IMU, no sound card still gives everything else. Nothing
+here refuses to start because a sensor is missing — it says so on the page
+instead.
+
+Needs:  sudo apt install -y python3-serial i2c-tools python3-smbus2 alsa-utils ffmpeg \
+                            python3-spidev python3-pil python3-numpy
 """
 
 import argparse
@@ -66,6 +106,11 @@ from pins import (  # noqa: E402
 )
 
 import tuning  # noqa: E402
+import audio  # noqa: E402
+import display  # noqa: E402
+import tts  # noqa: E402
+import voice  # noqa: E402
+import brain  # noqa: E402
 from slam import Slam  # noqa: E402
 from explore import Explorer  # noqa: E402
 from gpiozero import DigitalOutputDevice, PWMOutputDevice, RotaryEncoder  # noqa: E402
@@ -1137,7 +1182,14 @@ def control_loop():
 
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = audio.MAX_UPLOAD_MB * 1024 * 1024
 robot = lidar = imu = slam = explorer = camera = None
+speaker = None
+screen = None
+talker = None
+ears = None
+assistant = None
+http_port = HTTP_PORT
 markers = cliff = detector = None
 intent = Intent()
 guard = Guard()
@@ -1174,6 +1226,7 @@ PAGE = r"""<!DOCTYPE html>
   --point:#3987e5; --obj:#199e70; --imu:#9085e9; --cam:#2bb3c0;
   --good:#3fb950; --warning:#d29922; --critical:#f85149;
   --sky:#1d3a57; --ground:#3d2d1c;
+  --audio:#d670c0;
   --rail: 330px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1535,6 +1588,86 @@ td.n{color:var(--text-1);font-weight:600}
 .tuneact .msg{font-size:.68rem;color:var(--text-3)}
 .swrow{display:flex;gap:8px;align-items:center}
 .swrow button{flex:1}
+
+/* --- audio --------------------------------------------------------------- */
+.b-audio{background:color-mix(in srgb,var(--audio) 22%,var(--surface-2));
+         border-color:color-mix(in srgb,var(--audio) 50%,transparent);color:var(--audio)}
+.beeps{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.beeps button{padding:10px 4px;font-size:.72rem}
+.beeps .horn{grid-column:span 3;padding:13px;font-size:.84rem;letter-spacing:.1em}
+.nowplay{display:flex;align-items:center;gap:8px;font-size:.74rem;color:var(--text-2);
+         min-width:0;margin:10px 0 4px}
+.nowplay b{color:var(--text-1);font-weight:600;overflow:hidden;text-overflow:ellipsis;
+           white-space:nowrap;min-width:0}
+.eqbars{display:inline-flex;align-items:flex-end;gap:2px;height:12px;flex:none}
+.eqbars i{width:3px;height:30%;background:var(--text-3);border-radius:1px}
+.eqbars.on i{background:var(--audio);animation:eqb .9s ease-in-out infinite}
+.eqbars.on i:nth-child(2){animation-delay:-.3s}
+.eqbars.on i:nth-child(3){animation-delay:-.6s}
+@keyframes eqb{0%,100%{height:25%}50%{height:100%}}
+.prog{position:relative;height:8px;border-radius:99px;background:var(--surface-2);
+      border:1px solid var(--border);cursor:pointer;margin:8px 0 4px;overflow:hidden}
+.prog i{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--audio)}
+.times{display:flex;justify-content:space-between;font-size:.62rem;color:var(--text-3)}
+.transport{display:flex;gap:6px;margin:10px 0}
+.transport button{flex:1;font-size:.8rem;padding:8px 0}
+.drop{display:block;border:1.5px dashed var(--border);border-radius:9px;padding:18px 10px;
+      text-align:center;font-size:.76rem;color:var(--text-2);cursor:pointer;
+      transition:border-color .12s,color .12s}
+.drop:hover,.drop.over{border-color:var(--audio);color:var(--audio)}
+.drop input{display:none}
+.drop small{display:block;color:var(--text-3);font-size:.62rem;margin-top:4px}
+.upbar{height:4px;border-radius:99px;background:var(--surface-2);overflow:hidden;
+       margin-top:8px;display:none}
+.upbar.show{display:block}
+.upbar i{display:block;height:100%;width:0;background:var(--audio)}
+.songs{display:flex;flex-direction:column;margin-top:10px}
+.song{display:flex;align-items:center;gap:8px;padding:6px 2px;
+      border-bottom:1px solid var(--border);font-size:.73rem}
+.song:last-child{border-bottom:none}
+.song .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.song .sz{color:var(--text-3);font-size:.64rem;white-space:nowrap}
+.song button{padding:4px 9px;font-size:.68rem}
+.song .x{background:none;border:none;color:var(--text-3);min-width:24px}
+.song .x:hover,.song .x.arm{color:var(--critical);filter:none}
+.song.cur .nm{color:var(--audio);font-weight:650}
+.songs .empty{color:var(--text-3);font-size:.72rem;padding:10px 0}
+.arng input[type=range]{accent-color:var(--audio)}
+.arng .ctl-hd{margin-top:8px}
+.arng .ctl-hd span{font-size:.7rem;color:var(--text-2)}
+select{width:100%;background:var(--surface-2);border:1px solid var(--border);
+       color:var(--text-1);padding:6px 9px;border-radius:6px;font-size:.76rem}
+.aerr{color:var(--warning);font-size:.7rem;margin-top:8px;line-height:1.5}
+.aerr:empty{display:none}
+
+/* --- speech ------------------------------------------------------------- */
+textarea{width:100%;background:var(--surface-2);border:1px solid var(--border);
+         color:var(--text-1);padding:8px 10px;border-radius:6px;font:inherit;
+         font-size:.82rem;line-height:1.45;resize:vertical;min-height:74px}
+#t-text:focus,#d-say:focus{outline:1px solid var(--audio);outline-offset:0}
+.tcount{margin-left:auto;font-size:.62rem;color:var(--text-3)}
+.chip.hist{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+details.voices{margin-top:12px}
+details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
+                       letter-spacing:.1em;color:var(--text-3);font-weight:650;padding:4px 0}
+.vrow{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);
+      font-size:.68rem}
+.vrow:last-child{border-bottom:none}
+.vrow .vn{flex:1;min-width:0}
+.vrow .vn b{display:block;font-family:ui-monospace,monospace;font-size:.67rem;color:var(--text-1);
+            overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.vrow .vn span{color:var(--text-3)}
+.vrow button{padding:4px 9px;font-size:.66rem;white-space:nowrap}
+.vrow .ok{color:var(--good);font-weight:650;white-space:nowrap}
+.vrow .bad{color:var(--warning)}
+.vrow button.arm{color:var(--critical)}
+.tsay{margin-top:8px;flex-wrap:nowrap}
+.tsay input{flex:1;width:auto !important;min-width:0}
+
+/* --- LCD mirror ---------------------------------------------------------- */
+.lcdwrap{display:flex;justify-content:center;margin-bottom:10px}
+.lcdwrap img{width:100%;max-width:240px;aspect-ratio:1;display:block;border-radius:8px;
+             background:#000;border:6px solid #05070a;box-sizing:content-box}
 </style>
 </head>
 <body>
@@ -1574,6 +1707,7 @@ td.n{color:var(--text-1);font-weight:600}
     <button class="tab" data-tab="map" onclick="showTab('map')">Map</button>
     <button class="tab" data-tab="sensors" onclick="showTab('sensors')">Sensors</button>
     <button class="tab" data-tab="vision" onclick="showTab('vision')">Vision<i class="pip" id="pip-vision"></i></button>
+    <button class="tab" data-tab="audio" onclick="showTab('audio')">Audio<i class="pip" id="pip-audio"></i></button>
     <button class="tab" data-tab="tune" onclick="showTab('tune')">Tune</button>
   </div>
 </div>
@@ -1651,6 +1785,32 @@ td.n{color:var(--text-1);font-weight:600}
           <div class="rd"><div class="hd"><i class="sw" style="background:var(--series-2)"></i>RIGHT</div>
             <div class="v num mono" id="rr">0.0</div><div class="s">RPM</div></div>
         </div>
+      </div>
+
+      <!-- The horn sits under the drive pad because that is where your hand
+           already is when something walks in front of the robot. -->
+      <div class="card">
+        <h2>Speaker <span class="hint"><kbd>H</kbd> horn &middot; songs on Audio</span></h2>
+        <div class="beeps">
+          <button class="b-audio horn" onclick="beep('horn')">HORN</button>
+          <button onclick="beep('beep')">Beep</button>
+          <button onclick="beep('double')">Double</button>
+          <button onclick="beep('chirp')">Chirp</button>
+          <button onclick="beep('reverse')">Reverse</button>
+          <button onclick="beep('alert')">Alert</button>
+        </div>
+        <div class="nowplay"><span class="eqbars" id="d-eq"><i></i><i></i><i></i></span><b id="d-now">Idle</b></div>
+        <div class="transport">
+          <button onclick="apost('/audio/skip',{back:true})" title="Previous song">&#9664;&#9664;</button>
+          <button id="d-pp" class="b-audio" onclick="apost('/audio/pause')" title="Play / pause">&#9654;</button>
+          <button onclick="apost('/audio/skip',{})" title="Next song">&#9654;&#9654;</button>
+          <button onclick="apost('/audio/stop')" title="Stop">&#9632;</button>
+        </div>
+        <div class="row2 tsay">
+          <input type="text" id="d-say" maxlength="1000" placeholder="Say something&hellip;">
+          <button class="b-audio" onclick="speakFrom('d-say')">Say</button>
+        </div>
+        <div class="aerr" id="d-err"></div>
       </div>
 
       <!-- Mounting sits next to the plot because that is the only place you
@@ -1899,6 +2059,28 @@ td.n{color:var(--text-1);font-weight:600}
         <div class="stat"><span class="k">Encoder</span><span class="v mono" id="c-enc">&mdash;</span></div>
         <div class="stat"><span class="k">Field of view</span><span class="v num mono" id="c-fov">&mdash;</span></div>
       </div>
+
+      <div class="card">
+        <h2>Display &middot; ST7789 240&times;240 <span class="hint" id="lcd-st">&mdash;</span></h2>
+        <div class="lcdwrap"><img id="lcd-img" alt="what the truck's screen shows"></div>
+        <div class="stat"><span class="k">Frames sent</span><span class="v num mono" id="lcd-frames">&mdash;</span></div>
+        <div class="stat"><span class="k">Render + send</span><span class="v num mono" id="lcd-ms">&mdash;</span></div>
+        <div class="stat"><span class="k">SPI clock</span><span class="v num mono" id="lcd-hz">&mdash;</span></div>
+        <div class="tog" style="margin-top:10px">
+          <button id="t-lcd" onclick="post('/display',{on:!lcdOn})">Screen</button>
+          <button onclick="post('/display',{test:true})">Test card</button>
+        </div>
+        <div class="aerr" id="lcd-err"></div>
+        <p class="note">
+          The picture above is rendered by the Pi, so it is exactly what the
+          truck's own screen shows &mdash; including when no display is wired,
+          which lets you judge the layout first. A frame is only sent when
+          something on it changed. <b>Test card</b>: the TOP arrow should
+          point up (else <b>LCD_ROTATION</b>), bars read R&nbsp;G&nbsp;B&nbsp;W
+          (red shows blue &rarr; <b>LCD_BGR</b>), black background (white
+          &rarr; <b>LCD_INVERT</b>). All in pins.py. Wiring: WIRING.md &sect;14.
+        </p>
+      </div>
     </div>
   </div>
 
@@ -2062,6 +2244,217 @@ td.n{color:var(--text-1);font-weight:600}
           the map. Stills live in <b>test/captures/</b> on the Pi.
         </p>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================================================== AUDIO ========== -->
+<div class="tabpanel" id="tab-audio">
+  <div class="work even">
+
+    <div class="stack">
+      <div class="card">
+        <h2>Now playing <span class="hint" id="a-card">&mdash;</span></h2>
+        <div class="nowplay"><span class="eqbars" id="a-eq"><i></i><i></i><i></i></span><b id="a-now">Nothing playing</b></div>
+        <div class="prog" id="a-prog" title="Click to jump"><i id="a-bar"></i></div>
+        <div class="times mono num"><span id="a-pos">0:00</span><span id="a-dur">&mdash;</span></div>
+        <div class="transport">
+          <button onclick="apost('/audio/skip',{back:true})" title="Previous song">&#9664;&#9664;</button>
+          <button id="a-pp" class="b-audio" onclick="apost('/audio/pause')" title="Play / pause">&#9654;</button>
+          <button onclick="apost('/audio/skip',{})" title="Next song">&#9654;&#9654;</button>
+          <button onclick="apost('/audio/stop')" title="Stop">&#9632;</button>
+        </div>
+        <div class="chips" id="a-modes">
+          <button class="chip" data-mode="single">Stop after song</button>
+          <button class="chip" data-mode="all">Play all</button>
+          <button class="chip" data-mode="repeat">Repeat song</button>
+        </div>
+        <div class="arng">
+          <div class="ctl-hd"><label for="a-vol">Volume</label><span class="num mono" id="a-volv">80%</span></div>
+          <input type="range" id="a-vol" min="0" max="150" step="5" value="80">
+          <div class="ctl-hd"><label for="a-bass">Bass</label><span class="num mono" id="a-bassv">0 dB</span></div>
+          <input type="range" id="a-bass" min="-12" max="12" step="1" value="0">
+          <div class="ctl-hd"><label for="a-treble">Treble</label><span class="num mono" id="a-treblev">0 dB</span></div>
+          <input type="range" id="a-treble" min="-12" max="12" step="1" value="0">
+        </div>
+        <p class="note">
+          The MAX98357A has <b>no volume register</b> &mdash; it plays whatever
+          samples arrive &mdash; so volume, bass and treble are ffmpeg filters.
+          They are fixed when a song starts, so letting go of a slider restarts
+          the song at the same spot with the new levels: a short gap, not a
+          bug. Above 100% loud passages clip. Settings and the chosen device
+          are remembered in <b>test/audio.json</b>.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Beeps &amp; horn <span class="hint"><kbd>H</kbd> horn</span></h2>
+        <div class="beeps">
+          <button class="b-audio horn" onclick="beep('horn')">HORN</button>
+          <button onclick="beep('beep')">Beep</button>
+          <button onclick="beep('double')">Double</button>
+          <button onclick="beep('chirp')">Chirp</button>
+          <button onclick="beep('reverse')">Reverse</button>
+          <button onclick="beep('alert')">Alert</button>
+        </div>
+        <div class="arng">
+          <div class="ctl-hd"><label for="a-blvl">Beep level <span style="color:var(--text-3);font-weight:400">&middot; horn is always full</span></label><span class="num mono" id="a-blvlv">50%</span></div>
+          <input type="range" id="a-blvl" min="5" max="80" step="5" value="50">
+        </div>
+        <p class="note">
+          A beep over a song <b>holds the song</b> for the length of the beep
+          and then picks it up where it left off &mdash; the I2S device plays
+          one stream at a time, so the two cannot be mixed. Letting go of the
+          level slider plays a beep at the new level.
+          <br><br>
+          <b>HORN</b> is an Indian truck pressure horn &mdash; two brassy horns
+          slightly out of tune, &ldquo;paa-paa-paaaam&rdquo; &mdash; and always
+          plays at <b>full volume</b>, whatever the slider says. For more
+          still, the amp's GAIN pin (WIRING.md &sect;7). <b>Reverse</b> sounds
+          once a second for 8&nbsp;s; Stop cuts it short.
+        </p>
+      </div>
+    </div>
+
+    <div class="stack">
+    <div class="card">
+      <h2>Assistant <span class="hint" id="as-status">&mdash;</span></h2>
+      <div class="tog">
+        <button id="as-toggle" onclick="post('/assistant', {enabled: !asOn})">Assistant</button>
+        <button onclick="post('/assistant', {forget: true})">Forget conversation</button>
+      </div>
+      <div class="stat"><span class="k">Heard</span><span class="v" id="as-heard" style="max-width:70%">&mdash;</span></div>
+      <div class="stat"><span class="k">Said</span><span class="v" id="as-reply" style="max-width:70%">&mdash;</span></div>
+      <div class="stat"><span class="k">Heard &rarr; first word</span><span class="v num mono" id="as-latency">&mdash;</span></div>
+      <div class="stat"><span class="k">Can see / use tools</span><span class="v mono" id="as-caps">&mdash;</span></div>
+      <label class="lbl" for="as-url" style="margin-top:10px">Ollama on the PC</label>
+      <div class="row2" style="margin-top:0">
+        <input type="text" id="as-url" placeholder="http://192.168.1.12:11434" style="flex:1;width:auto">
+      </div>
+      <label class="lbl" for="as-model" style="margin-top:8px">Model</label>
+      <select id="as-model"></select>
+      <div class="tog" style="margin-top:8px">
+        <button onclick="post('/assistant', {ollama_url: $('as-url').value, model: $('as-model').value})">Apply</button>
+      </div>
+      <div class="stat"><span class="k">Answering now</span><span class="v mono" id="as-active">&mdash;</span></div>
+      <label class="lbl" for="as-pull" style="margin-top:10px">Download a model onto the PC</label>
+      <div class="row2 tsay" style="margin-top:0">
+        <input type="text" id="as-pull" list="as-suggest" placeholder="qwen3-vl:2b-instruct">
+        <button onclick="post('/assistant', {pull: $('as-pull').value})">Download</button>
+      </div>
+      <datalist id="as-suggest">
+        <option value="qwen3-vl:4b-instruct">sees + tools, 3.3 GB — smartest that fits 4 GB</option>
+        <option value="qwen3-vl:2b-instruct">sees + tools, 1.9 GB — fastest</option>
+        <option value="llama3.2:3b">tools, no vision, 2.0 GB</option>
+      </datalist>
+      <div class="upbar" id="as-pullbar" style="margin-top:6px"><i id="as-pullfill"></i></div>
+      <div class="stat" id="as-pullrow" style="display:none"><span class="k" id="as-pullname">&mdash;</span>
+        <span class="v num mono" id="as-pullpct">&mdash;</span></div>
+      <div class="aerr" id="as-err"></div>
+      <p class="note">
+        Talk into the phone page and the truck answers out loud on its own. The
+        thinking happens in a <b>free local model in Ollama on your PC</b>
+        &mdash; no API keys, no credits &mdash; and the reply is spoken sentence by
+        sentence as it streams back. It can look through the camera (vision
+        models), check its surroundings, sound the horn, play songs and drive
+        short guarded moves (only after you press <b>ENABLE</b>). The PC must
+        be on with Ollama listening on the network: Start_pi.md &sect;5.12.
+        Turn it <b>off</b> to talk through Claude Code and the MCP
+        <b>listen</b> tool instead.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Speak <span class="hint" id="t-status">&mdash;</span></h2>
+      <textarea id="t-text" maxlength="1000"
+                placeholder="Type something for the truck to say&hellip;   Ctrl+Enter speaks"></textarea>
+      <div class="row2">
+        <button class="b-audio" onclick="speakFrom('t-text')">&#128266; Speak</button>
+        <button class="b-stop" onclick="tpost('/tts/stop')">Stop</button>
+        <span class="tcount mono num" id="t-count">0 / 1000</span>
+      </div>
+      <div class="chips" id="t-history" style="margin-top:10px"></div>
+      <label class="lbl" for="t-voice" style="margin-top:12px">Voice</label>
+      <select id="t-voice"></select>
+      <div class="arng">
+        <div class="ctl-hd"><label for="t-speed">Speed</label><span class="num mono" id="t-speedv">1.00&times;</span></div>
+        <input type="range" id="t-speed" min="50" max="200" step="5" value="100">
+        <div class="ctl-hd"><label for="t-vol">Speech volume</label><span class="num mono" id="t-volv">100%</span></div>
+        <input type="range" id="t-vol" min="10" max="200" step="5" value="100">
+      </div>
+      <details class="voices" id="t-voicebox">
+        <summary>Voices &mdash; download more</summary>
+        <div id="t-voices"></div>
+      </details>
+      <div class="aerr" id="t-err"></div>
+      <div class="stat" style="margin-top:10px"><span class="k">Phone microphone</span>
+        <span class="v"><a id="t-phone" target="_blank" rel="noopener" style="color:var(--audio)"></a></span></div>
+      <p class="note">
+        <b>Piper</b> neural voices, synthesised on the Pi itself &mdash; no
+        internet needed once a voice is downloaded. <b>medium</b> voices are
+        the sweet spot on a Pi 4: natural, and a sentence is ready in about a
+        second. <b>high</b> sounds a little richer but takes roughly as long
+        as the speech itself. The first sentence after choosing a voice waits
+        a few seconds while the model loads. Audio streams as it is made, so
+        long text starts talking after its first phrase. <b>Speaking again
+        cuts off whatever is still talking</b> &mdash; nothing queues up. Speech
+        holds a playing song and resumes it afterwards.
+        Voices are stored in <b>test/voices/</b>.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Library <span class="hint" id="a-count"></span></h2>
+      <label class="drop" id="a-drop">
+        Choose songs, or drop them here
+        <small id="a-limit">mp3 &middot; wav &middot; ogg &middot; flac &middot; m4a &middot; aac</small>
+        <input type="file" id="a-file" accept=".mp3,.wav,.ogg,.flac,.m4a,.aac,audio/*" multiple>
+      </label>
+      <div class="upbar" id="a-up"><i id="a-upbar"></i></div>
+      <div class="songs" id="a-songs"></div>
+      <p class="note">
+        Songs are stored on the Pi in <b>test/uploads/</b>. For a whole album,
+        scp them straight in there instead &mdash; they appear here on the next
+        refresh. Names are reduced to letters, digits, dot, dash and
+        underscore.
+      </p>
+    </div>
+    </div>
+
+    <div class="card">
+      <h2>Speaker test</h2>
+      <label class="lbl" for="a-dev">Output device</label>
+      <select id="a-dev"></select>
+      <div class="chips" id="a-freqs" style="margin:12px 0 10px"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <div><label class="lbl" for="a-freq">Frequency Hz</label>
+          <input type="number" id="a-freq" min="20" max="20000" step="10" value="440"></div>
+        <div><label class="lbl" for="a-secs">Seconds</label>
+          <input type="number" id="a-secs" min="0.2" max="10" step="0.5" value="2"></div>
+      </div>
+      <div class="arng">
+        <div class="ctl-hd"><label for="a-lvl">Tone level</label><span class="num mono" id="a-lvlv">30%</span></div>
+        <input type="range" id="a-lvl" min="0" max="100" step="5" value="30">
+      </div>
+      <div class="tog" style="margin-top:10px">
+        <button class="b-audio" onclick="playTone()">Play tone</button>
+        <button onclick="playSweep()">Sweep 40&nbsp;Hz&ndash;15&nbsp;kHz</button>
+        <button class="b-stop" onclick="apost('/audio/stop')">Stop</button>
+      </div>
+      <div class="aerr" id="a-err"></div>
+      <p class="note">
+        Pick <b>plughw:&hellip; MAX98357A</b> above &mdash; ALSA still lists
+        HDMI as card 0, and playing to it is silent with no error. It is
+        chosen automatically when the card is found. Tone level is capped in
+        software: a full-scale sine into a class-D amp damages a small
+        speaker. If the sweep is audible up high but vanishes below ~150&nbsp;Hz,
+        that is the speaker enclosure, not the amp.
+        <br><br>
+        <b>Silent?</b> In order: no card listed &rarr; overlay not loaded
+        (<b>config.txt</b>); amp <b>SD</b> pin near 0&nbsp;V &rarr; jumper it
+        to Vin; Vin not 5&nbsp;V at the amp; wrong device above.
+        WIRING.md &sect;7.
+      </p>
     </div>
   </div>
 </div>
@@ -3055,6 +3448,16 @@ addEventListener('resize', drawMap);
 function poll(){
   fetch('/state').then(r => r.json()).then(d => {
     const m = d.motors, l = d.lidar, gd = d.guard, im = d.imu;
+    renderAudio(d.audio);
+    renderLcd(d.display);
+    renderTtsBrief(d.tts);
+    renderAssistantCard(d.assistant);
+    if(d.voice){
+      // The Pi's IP, not location.hostname: a phone cannot open shiv.local.
+      const url = d.voice.talk_url || `https://${location.hostname}:5443/talk`;
+      $('t-phone').href = url;
+      $('t-phone').textContent = d.voice.phone ? 'phone connected' : 'on the phone, open ' + url;
+    }
 
     $('badge').className = 'badge ' + (m.enabled ? 'on':'off');
     $('badge').innerHTML = '<i class="dot"></i>' + (m.enabled ? 'ENABLED':'DISABLED');
@@ -3368,6 +3771,8 @@ function showTab(name){
   if(cam && slot && cam.parentElement !== slot) slot.appendChild(cam);
 
   try { localStorage.setItem('nav.tab', name); } catch(e) {}
+  if(name === 'audio'){ audioPoll(); ttsPoll(); }
+  if(name === 'sensors') refreshLcd();
   // The canvases were display:none a moment ago, so clientWidth was 0 and
   // any draw during that time was a no-op. Redraw now they have a size.
   requestAnimationFrame(() => { draw(); drawMap(); drawCompass(); drawHorizon(); });
@@ -3560,6 +3965,477 @@ function tuneDocs(){
   document.querySelectorAll('.tunerow').forEach(r => r.classList.toggle('open', !open));
 }
 
+// ---------------------------------------------------------------- audio
+//
+// Two feeds. /state (7 Hz) carries a small `audio` summary - enough for the
+// now-playing lines and the progress bar - and costs the Pi no forks.
+// /audio/state adds the library and device list, which run ffprobe and
+// `aplay -l`, so it is only polled while the Audio tab is open.
+
+let aBrief = null, aErr = '', aSetup = '', aLastErr = '';
+let aSongSig = null, aDevSig = null, aTouched = 0, maxTone = 0.5;
+const FREQS = [110, 220, 440, 1000, 4000, 10000];
+const fmtT = s => s == null ? '—'
+  : Math.floor(s / 60) + ':' + String(Math.floor(s % 60)).padStart(2, '0');
+
+function apost(u, b){
+  return fetch(u, {method:'POST', headers:{'Content-Type':'application/json'},
+                   body: JSON.stringify(b || {})})
+    .then(r => r.json().catch(() => ({})))
+    .then(d => {
+      aErr = (d && d.error) || '';
+      if(d && 'playing' in d) renderAudio(d);
+      if(tab === 'audio') audioPoll();
+      showAErr();
+    })
+    .catch(() => { aErr = 'Request failed — is web_nav.py still running?'; showAErr(); });
+}
+function beep(kind){ apost('/audio/beep', {kind}); }
+
+function showAErr(){
+  const msg = aSetup || aErr || aLastErr;
+  $('a-err').textContent = msg;
+  $('d-err').textContent = aSetup ? 'Speaker not ready — see the Audio tab.' : (aErr || aLastErr);
+  $('pip-audio').classList.toggle('show', !!msg);
+}
+
+function renderAudio(b){
+  if(!b) return;
+  aBrief = b;
+  const song = b.track;
+  let label;
+  if(b.kind === 'beep')      label = song ? song + '  (held for beep)' : 'Beep: ' + b.now;
+  else if(b.kind === 'speech') label = '🗣 “' + b.now + '”' + (song ? '  (song held)' : '');
+  else if(b.kind === 'tone') label = b.now;
+  else if(song)              label = b.paused ? song + '  — paused' : song;
+  else                       label = 'Nothing playing';
+  const going = b.kind === 'music';
+  for(const id of ['d', 'a']){
+    $(id + '-eq').classList.toggle('on', !!b.playing);
+    $(id + '-pp').innerHTML = going ? '&#10074;&#10074;' : '&#9654;';
+  }
+  $('d-now').textContent = song || b.playing ? label : 'Idle';
+  $('a-now').textContent = label;
+  const pos = b.pos || 0, dur = b.dur;
+  $('a-pos').textContent = song ? fmtT(pos) : '0:00';
+  $('a-dur').textContent = song && dur ? fmtT(dur) : '—';
+  $('a-bar').style.width = song && dur ? Math.min(100, pos / dur * 100) + '%' : '0';
+  if(Date.now() - aTouched > 2000 && b.volume != null){
+    $('a-vol').value = Math.round(b.volume * 100); fmtA();
+  }
+}
+
+function audioPoll(){
+  fetch('/audio/state').then(r => r.json()).then(d => {
+    renderAudio(d);
+    const devs = d.devices || [], files = d.files || [];
+    $('a-card').textContent = d.card || 'no sound card';
+    renderDevices(devs, d.device);
+    renderSongs(files, d.track);
+    $('a-count').textContent = files.length + (files.length === 1 ? ' song' : ' songs');
+    $('a-limit').textContent = 'mp3 · wav · ogg · flac · m4a · aac — up to '
+                             + d.max_upload_mb + ' MB each';
+    document.querySelectorAll('#a-modes .chip').forEach(c =>
+      c.classList.toggle('sel', c.dataset.mode === d.mode));
+    maxTone = d.max_tone_level || 0.5;
+    if(Date.now() - aTouched > 2000){
+      $('a-bass').value = d.bass; $('a-treble').value = d.treble;
+      $('a-blvl').value = Math.round(d.beep_level * 100);
+      fmtA();
+    }
+    const miss = [];
+    if(!d.have_aplay)  miss.push('alsa-utils');
+    if(!d.have_ffmpeg) miss.push('ffmpeg');
+    aSetup = miss.length
+      ? 'Missing: ' + miss.join(' + ') + ' — sudo apt install -y ' + miss.join(' ')
+      : !devs.length
+        ? 'No ALSA playback device — the I2S overlay has not loaded. Check dtoverlay '
+          + 'in /boot/firmware/config.txt (WIRING.md §7).'
+        : '';
+    aLastErr = d.last_error || '';
+    showAErr();
+  }).catch(() => {});
+}
+setInterval(() => { if(tab === 'audio') audioPoll(); }, 2000);
+
+// Rebuilding a <select> on every poll fights the user mid-click, so only
+// when the set of devices actually changes.
+function renderDevices(devs, cur){
+  const sig = devs.map(d => d.dev).join('|'), sel = $('a-dev');
+  if(sig !== aDevSig){
+    aDevSig = sig;
+    sel.innerHTML = '<option value="">ALSA default</option>'
+      + devs.map(d => `<option value="${d.dev}">${d.dev} — ${d.name}</option>`).join('');
+  }
+  if(document.activeElement !== sel) sel.value = cur || '';
+}
+$('a-dev').addEventListener('change', e => apost('/audio/device', {device: e.target.value}));
+
+// Names are reduced to [A-Za-z0-9._-] on the Pi, so they interpolate safely.
+// Same signature trick as the devices: a list rebuilt under the cursor
+// swallows the click that was on its way to a button.
+function renderSongs(files, cur){
+  const sig = files.map(f => f.name + ':' + f.kb).join('|') + '#' + cur;
+  if(sig === aSongSig) return;
+  aSongSig = sig;
+  $('a-songs').innerHTML = files.length ? files.map(f =>
+      `<div class="song${f.name === cur ? ' cur' : ''}">`
+    + `<button class="b-audio" onclick="apost('/audio/play',{file:'${f.name}'})" title="Play">&#9654;</button>`
+    + `<span class="nm" title="${f.name}">${f.name}</span>`
+    + `<span class="sz mono num">${f.dur ? fmtT(f.dur) + ' · ' : ''}${(f.kb / 1024).toFixed(1)} MB</span>`
+    + `<button class="x" onclick="delSong(this,'${f.name}')" title="Delete">&times;</button>`
+    + `</div>`).join('')
+    : '<div class="empty">No songs yet — upload one above.</div>';
+}
+
+// Two clicks to delete, no dialog: a confirm() box blocks the page, and with
+// it the polling that keeps the drive watchdog fed.
+function delSong(el, name){
+  if(el.classList.contains('arm')){ apost('/audio/delete', {file: name}); return; }
+  el.classList.add('arm'); el.textContent = 'delete?';
+  setTimeout(() => { el.classList.remove('arm'); el.innerHTML = '&times;'; }, 3000);
+}
+
+// XHR rather than fetch, for upload progress - an MP3 over the Pi's wifi
+// takes long enough that a silent wait looks like a hang.
+function uploadFiles(list){
+  const files = [...list];
+  let i = 0;
+  const next = () => {
+    if(i >= files.length){
+      $('a-up').classList.remove('show'); aSongSig = null; audioPoll(); return;
+    }
+    const f = files[i++], fd = new FormData(), x = new XMLHttpRequest();
+    fd.append('file', f);
+    $('a-count').textContent = `uploading ${i} of ${files.length}…`;
+    $('a-up').classList.add('show'); $('a-upbar').style.width = '0';
+    x.upload.onprogress = e => {
+      if(e.lengthComputable) $('a-upbar').style.width = (e.loaded / e.total * 100) + '%';
+    };
+    x.onload = () => {
+      let d = {};
+      try { d = JSON.parse(x.responseText); } catch(e) {}
+      aErr = d.error ? f.name + ': ' + d.error : '';
+      showAErr(); next();
+    };
+    x.onerror = () => {
+      aErr = f.name + ': upload failed — larger than the size limit, or the Pi dropped off wifi';
+      showAErr(); next();
+    };
+    x.open('POST', '/audio/upload');
+    x.send(fd);
+  };
+  next();
+}
+$('a-file').addEventListener('change', e => { uploadFiles(e.target.files); e.target.value = ''; });
+const aDrop = $('a-drop');
+['dragenter', 'dragover'].forEach(ev => aDrop.addEventListener(ev, e => {
+  e.preventDefault(); aDrop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(ev => aDrop.addEventListener(ev, e => {
+  e.preventDefault(); aDrop.classList.remove('over'); }));
+aDrop.addEventListener('drop', e => uploadFiles(e.dataTransfer.files));
+
+$('a-prog').addEventListener('click', e => {
+  if(!aBrief || !aBrief.track || !aBrief.dur) return;
+  const r = e.currentTarget.getBoundingClientRect();
+  apost('/audio/seek', {pos: (e.clientX - r.left) / r.width * aBrief.dur});
+});
+document.querySelectorAll('#a-modes .chip').forEach(c =>
+  c.addEventListener('click', () => apost('/audio/mode', {mode: c.dataset.mode})));
+
+function fmtA(){
+  const db = v => (v > 0 ? '+' : '') + v + ' dB';
+  $('a-volv').textContent = $('a-vol').value + '%';
+  $('a-bassv').textContent = db(+$('a-bass').value);
+  $('a-treblev').textContent = db(+$('a-treble').value);
+  $('a-lvlv').textContent = $('a-lvl').value + '%';
+  $('a-blvlv').textContent = $('a-blvl').value + '%';
+}
+['a-vol', 'a-bass', 'a-treble', 'a-lvl', 'a-blvl'].forEach(id =>
+  $(id).addEventListener('input', () => { aTouched = Date.now(); fmtA(); }));
+// 'change', not 'input': each one restarts the decoder, so only on release.
+['a-vol', 'a-bass', 'a-treble'].forEach(id => $(id).addEventListener('change', () => {
+  aTouched = Date.now();
+  apost('/audio/levels', {volume: +$('a-vol').value / 100,
+                          bass: +$('a-bass').value, treble: +$('a-treble').value});
+}));
+$('a-blvl').addEventListener('change', () => {
+  aTouched = Date.now();
+  apost('/audio/beep', {kind: 'beep', level: +$('a-blvl').value / 100});
+});
+
+$('a-freqs').innerHTML = FREQS.map(f =>
+  `<button class="chip" data-f="${f}">${f >= 1000 ? f / 1000 + ' kHz' : f + ' Hz'}</button>`).join('');
+function markFreq(){
+  $('a-freqs').querySelectorAll('.chip').forEach(c =>
+    c.classList.toggle('sel', +c.dataset.f === +$('a-freq').value));
+}
+$('a-freqs').querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => {
+  $('a-freq').value = c.dataset.f; markFreq(); }));
+$('a-freq').addEventListener('input', markFreq);
+const toneLevel = () => +$('a-lvl').value / 100 * maxTone;
+function playTone(){
+  apost('/audio/tone', {freq: +$('a-freq').value, seconds: +$('a-secs').value, level: toneLevel()});
+}
+function playSweep(){ apost('/audio/sweep', {f0: 40, f1: 15000, seconds: 8, level: toneLevel()}); }
+
+// Keys typed into the Audio tab's own fields stay there: an arrow key on the
+// volume slider must not also drive the robot. Space still e-stops.
+document.querySelectorAll('#tab-audio input, #tab-audio select').forEach(el =>
+  el.addEventListener('keydown', e => { if(e.code !== 'Space') e.stopPropagation(); }));
+
+// H for horn. One blast per press - holding the key does not machine-gun it.
+addEventListener('keydown', e => {
+  if(e.code !== 'KeyH' || e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+  if(e.target.matches && e.target.matches('input[type=text], input[type=number], textarea, select')) return;
+  e.preventDefault(); beep('horn');
+});
+
+markFreq(); fmtA(); audioPoll();
+
+// ---------------------------------------------------------------- display
+let lcdOn = true;
+function renderLcd(st){
+  if(!st) return;
+  lcdOn = st.on;
+  $('lcd-st').textContent = st.present ? (st.on ? 'on' : 'blank') : 'not connected';
+  $('lcd-frames').textContent = st.frames;
+  $('lcd-ms').textContent = st.present ? st.ms.toFixed(0) + ' ms at ' + st.fps + ' Hz' : '—';
+  $('lcd-hz').textContent = st.spi_hz ? (st.spi_hz / 1e6).toFixed(2) + ' MHz' : '—';
+  $('t-lcd').className = st.on ? 'g-on' : '';
+  $('t-lcd').textContent = st.on ? 'Screen ON' : 'Screen OFF';
+  $('lcd-err').textContent = st.error || '';
+}
+// A PNG every 2 s while the tab is open, never otherwise - the mirror is
+// for checking, not something to spend the Pi's CPU on in the background.
+function refreshLcd(){ $('lcd-img').src = '/display.png?t=' + Date.now(); }
+setInterval(() => { if(tab === 'sensors') refreshLcd(); }, 2000);
+
+// ---------------------------------------------------------------- assistant
+let asOn = true;
+const AS_STATUS = {listening: 'ready — listening to the phone', thinking: 'thinking…',
+                   speaking: 'speaking', off: 'off', offline: 'PC not reachable', no_model: 'model not installed',
+                   loading: 'loading model on the PC…', error: 'problem', starting: 'starting…'};
+let asModelsSig = null;
+function renderAssistantCard(a){
+  if(!a) return;
+  asOn = a.enabled;
+  const st = a.status && a.status.startsWith('using ') ? a.status.replace('using ', 'using ') : (AS_STATUS[a.status] || a.status);
+  $('as-status').textContent = a.enabled ? st : 'off';
+  $('as-toggle').className = a.enabled ? 'g-on' : '';
+  $('as-toggle').textContent = a.enabled ? 'Assistant ON' : 'Assistant OFF';
+  $('as-heard').textContent = a.heard || '—';
+  $('as-reply').textContent = a.reply || '—';
+  $('as-latency').textContent = a.latency_ms != null ? (a.latency_ms / 1000).toFixed(1) + ' s' : '—';
+  $('as-caps').textContent = (a.can_see ? 'sees' : 'no vision') + ' · ' + (a.can_use_tools ? 'tools' : 'no tools');
+  if(document.activeElement !== $('as-url')) $('as-url').value = a.ollama_url || '';
+  const models = (a.models || []).filter(m => !/embed/.test(m));
+  if(a.model && !models.includes(a.model)) models.unshift(a.model);
+  const sig = models.join('|');
+  if(sig !== asModelsSig){
+    asModelsSig = sig;
+    $('as-model').replaceChildren(...models.map(m => new Option(m, m)));
+  }
+  if(document.activeElement !== $('as-model')) $('as-model').value = a.model || '';
+  $('as-active').textContent = a.active_model || '—';
+  renderPull(a.pull);
+  $('as-err').textContent = a.error || '';
+}
+
+// Model download progress, straight from Ollama's pull stream on the PC.
+let pullSeen = null;
+function renderPull(p){
+  const row = $('as-pullrow'), bar = $('as-pullbar');
+  if(!p){ row.style.display = 'none'; bar.classList.remove('show'); return; }
+  row.style.display = '';
+  $('as-pullname').textContent = p.model;
+  if(p.error){ $('as-pullpct').textContent = 'failed: ' + p.error; bar.classList.remove('show'); return; }
+  if(p.done){ $('as-pullpct').textContent = 'done — pick it in Model and press Apply'; bar.classList.remove('show'); return; }
+  bar.classList.add('show');
+  const pct = p.total ? p.completed / p.total * 100 : 0;
+  $('as-pullfill').style.width = pct.toFixed(1) + '%';
+  // Speed and time left from how far it moved since the previous poll.
+  const now = Date.now();
+  let eta = '';
+  if(pullSeen && pullSeen.model === p.model && p.total && now > pullSeen.t){
+    const rate = (p.completed - pullSeen.completed) / ((now - pullSeen.t) / 1000);
+    if(rate > 0){
+      const left = (p.total - p.completed) / rate;
+      eta = ` · ${(rate / 1e6).toFixed(1)} MB/s · ${left > 90 ? Math.round(left / 60) + ' min' : Math.round(left) + ' s'} left`;
+    }
+  }
+  if(!pullSeen || now - pullSeen.t > 3000 || pullSeen.model !== p.model)
+    pullSeen = {model: p.model, completed: p.completed, t: now};
+  $('as-pullpct').textContent = p.total
+    ? `${pct.toFixed(0)}% · ${(p.completed / 1e9).toFixed(2)} / ${(p.total / 1e9).toFixed(2)} GB${eta}`
+    : p.status;
+}
+
+// ---------------------------------------------------------------- speech
+//
+// Typed text is data from a person, so everything here that shows it builds
+// DOM nodes with textContent. innerHTML with a quote or a < in a sentence
+// would break the page - or run it.
+
+let tErr = '', tSetup = '', tVoiceSig = null, tHistSig = null, tTouched = 0;
+const T_STATUS = {idle: 'ready', loading: 'loading voice…', synth: 'thinking…', speaking: 'speaking'};
+// Speak must feel like a button, not a form: the request comes back at once
+// and the status says what the truck is doing, so no busy lock on the box.
+
+function tpost(u, b){
+  return fetch(u, {method:'POST', headers:{'Content-Type':'application/json'},
+                   body: JSON.stringify(b || {})})
+    .then(r => r.json().catch(() => ({})))
+    .then(d => {
+      tErr = (d && d.error) || '';
+      renderTtsBrief(d);
+      if(tab === 'audio') ttsPoll();
+      showTErr();
+      return d;
+    })
+    .catch(() => { tErr = 'Request failed — is web_nav.py still running?'; showTErr(); return {}; });
+}
+
+function speakFrom(id){
+  const el = $(id), text = el.value.trim();
+  if(!text) return;
+  tpost('/tts/say', {text}).then(d => {
+    // The Drive box is for quick one-liners, so it empties; the Speak box
+    // keeps the text, because the next thing is usually an edit of it.
+    if(d && d.ok && id === 'd-say') el.value = '';
+  });
+}
+
+function showTErr(){
+  const msg = tSetup || tErr;
+  $('t-err').textContent = msg;
+  if(msg && !tSetup) $('d-err').textContent = msg;
+}
+
+function renderTtsBrief(b){
+  if(!b || !('status' in b)) return;
+  let st = T_STATUS[b.status] || b.status;
+  if(b.status === 'speaking' && b.first_sound_ms != null)
+    st += ` · sound in ${(b.first_sound_ms / 1000).toFixed(1)} s`;
+  $('t-status').textContent = st;
+  $('d-say').placeholder = b.status === 'idle' ? 'Say something…' : st;
+  if(b.error && b.error !== tErr){ tErr = b.error; showTErr(); }
+}
+
+function ttsPoll(){
+  fetch('/tts/state').then(r => r.json()).then(d => {
+    renderTtsBrief(d);
+    const installed = d.voices.filter(v => v.installed);
+    tSetup = !d.have_piper
+      ? 'Piper is not installed. On the Pi, in the venv:  pip install "piper-tts>=1.3"  — then restart web_nav.py.'
+      : !installed.length ? 'No voice yet — open "Voices" below and press Download on one (about 60 MB).' : '';
+    if(!installed.length) $('t-voicebox').open = true;
+    renderVoiceSelect(installed, d.voice);
+    renderVoices(d.voices, d.voice);
+    renderHistory(d.history || []);
+    if(Date.now() - tTouched > 2000){
+      $('t-speed').value = Math.round(d.speed * 100);
+      $('t-vol').value = Math.round(d.volume * 100);
+      fmtT2();
+    }
+    showTErr();
+  }).catch(() => {});
+}
+setInterval(() => { if(tab === 'audio') ttsPoll(); }, 2000);
+
+function renderVoiceSelect(installed, cur){
+  const sel = $('t-voice'), sig = installed.map(v => v.id).join('|');
+  if(sig !== tVoiceSig){
+    tVoiceSig = sig;
+    sel.replaceChildren();
+    if(!installed.length){
+      sel.append(new Option('— download a voice below —', ''));
+    }
+    for(const v of installed) sel.append(new Option(`${v.id}  ·  ${v.label}`, v.id));
+  }
+  if(document.activeElement !== sel) sel.value = cur || '';
+}
+$('t-voice').addEventListener('change', e => { if(e.target.value) tpost('/tts/settings', {voice: e.target.value}); });
+
+function renderVoices(voices, cur){
+  const box = $('t-voices');
+  box.replaceChildren(...voices.map(v => {
+    const row = document.createElement('div'); row.className = 'vrow';
+    const name = document.createElement('div'); name.className = 'vn';
+    const b = document.createElement('b'); b.textContent = v.id;
+    const sub = document.createElement('span');
+    sub.textContent = v.label + (v.mb ? ` · ${v.mb} MB` : '');
+    name.append(b, sub); row.append(name);
+    const dl = v.download;
+    if(dl && dl.pct < 100){
+      const t = document.createElement('span'); t.className = 'mono num';
+      t.textContent = dl.stage === 'model'
+        ? `${dl.pct}% · ${(dl.got / 1e6).toFixed(1)} MB`
+        : (dl.stage || '…');
+      row.append(t);
+    }else if(v.installed){
+      const ok = document.createElement('span'); ok.className = 'ok';
+      ok.textContent = v.id === cur ? '✓ in use' : '✓';
+      const del = document.createElement('button'); del.textContent = 'Delete';
+      del.onclick = () => {
+        if(del.classList.contains('arm')){ tpost('/tts/delete', {voice: v.id}); return; }
+        del.classList.add('arm'); del.textContent = 'sure?';
+        setTimeout(() => { del.classList.remove('arm'); del.textContent = 'Delete'; }, 3000);
+      };
+      row.append(ok, del);
+    }else{
+      if(dl && dl.error){
+        const e = document.createElement('span'); e.className = 'bad';
+        e.textContent = dl.error; e.title = dl.error; row.append(e);
+      }
+      const get = document.createElement('button'); get.className = 'b-audio';
+      get.textContent = dl && dl.error ? 'Retry' : 'Download';
+      get.onclick = () => tpost('/tts/download', {voice: v.id});
+      row.append(get);
+    }
+    return row;
+  }));
+}
+
+function renderHistory(hist){
+  const sig = hist.join('\u0000');
+  if(sig === tHistSig) return;
+  tHistSig = sig;
+  $('t-history').replaceChildren(...hist.map(h => {
+    const c = document.createElement('button');
+    c.className = 'chip hist'; c.textContent = h; c.title = 'Say again: ' + h;
+    c.onclick = () => { $('t-text').value = h; fmtT2(); tpost('/tts/say', {text: h}); };
+    return c;
+  }));
+}
+
+function fmtT2(){
+  $('t-speedv').textContent = (+$('t-speed').value / 100).toFixed(2) + '×';
+  $('t-volv').textContent = $('t-vol').value + '%';
+  $('t-count').textContent = $('t-text').value.length + ' / 1000';
+}
+['t-speed', 't-vol'].forEach(id => {
+  $(id).addEventListener('input', () => { tTouched = Date.now(); fmtT2(); });
+  $(id).addEventListener('change', () => { tTouched = Date.now();
+    tpost('/tts/settings', {speed: +$('t-speed').value / 100, volume: +$('t-vol').value / 100}); });
+});
+$('t-text').addEventListener('input', fmtT2);
+$('t-text').addEventListener('keydown', e => {
+  if(e.key === 'Enter' && (e.ctrlKey || e.metaKey)){ e.preventDefault(); speakFrom('t-text'); }
+});
+$('d-say').addEventListener('keydown', e => {
+  if(e.key === 'Enter'){ e.preventDefault(); speakFrom('d-say'); }
+});
+
+// Typing must never drive the robot. The page-wide handler turns WASD and
+// the arrows into motion and SPACE into an E-STOP, so without this every
+// space in a sentence stopped the truck and every "a" steered it. Applies to
+// every text field on the page, including the Places name box.
+document.querySelectorAll('input[type=text], textarea').forEach(el =>
+  el.addEventListener('keydown', e => e.stopPropagation()));
+
+fmtT2(); ttsPoll();
+
 </script>
 </body>
 </html>"""
@@ -3631,6 +4507,12 @@ def state():
         markers=markers.state,
         cliff=cliff.state,
         detect=detector.state,
+        audio=speaker.brief if speaker else None,
+        display=screen.state if screen else None,
+        tts=talker.brief if talker else None,
+        assistant=assistant.brief if assistant else None,
+        voice=({"phone": ears.state["phone_connected"], "pending": ears.state["pending"],
+                "talk_url": voice.talk_url()} if ears else None),
     )
 
 
@@ -4006,6 +4888,126 @@ def stop():
     return "", 204
 
 
+@app.route("/display", methods=["POST"])
+def display_ctl():
+    d = request.get_json(force=True, silent=True) or {}
+    if screen is None:
+        return jsonify(error="display not started"), 400
+    try:
+        if "on" in d:
+            screen.set_power(d["on"])
+        if d.get("test"):
+            screen.test()
+    except Exception as e:                                    # noqa: BLE001
+        return jsonify(error=str(e)), 400
+    return jsonify(screen.state)
+
+
+@app.route("/display.png")
+def display_png():
+    """What the truck's screen is showing. Rendered even with no panel
+    attached, so the layout can be judged before the display is wired."""
+    if screen is None:
+        return "", 404
+    return Response(screen.png(), mimetype="image/png",
+                    headers={"Cache-Control": "no-store"})
+
+
+# 0 deg = straight ahead, + = left, in 45 deg wedges.
+AI_DIRECTIONS = ("ahead", "ahead-left", "left", "behind-left",
+                 "behind", "behind-right", "right", "ahead-right")
+
+
+@app.route("/ai/status")
+def ai_status():
+    """What an AI driver needs to decide a move, and nothing it does not.
+
+    /state is shaped for drawing — hundreds of raw LiDAR points in the
+    scanner's own frame. This is shaped for deciding: the nearest obstacle
+    in each of eight directions, measured in the BODY frame from the truck's
+    centre (so subtract half the length or width for the gap at the
+    bumper), plus exactly what the guard would refuse right now."""
+    guard.survey(lidar)
+    near = dict.fromkeys(AI_DIRECTIONS)
+    for x, y in body_points(lidar.scan()):
+        i = int(((math.degrees(math.atan2(y, x)) + 22.5) % 360) // 45)
+        d = math.hypot(x, y)
+        if near[AI_DIRECTIONS[i]] is None or d < near[AI_DIRECTIONS[i]]:
+            near[AI_DIRECTIONS[i]] = d
+    m, im, ex = robot.state, imu.state, explorer.status
+    return jsonify(
+        motors={"enabled": m["enabled"], "watchdog_tripped": m["tripped"],
+                "speed_limit": m["limit"]},
+        pose_mm_deg=slam.slam.pose.as_dict(),
+        compass_deg=im.get("yaw") if im.get("ready") else None,
+        body_mm={"length": TRUCK_LENGTH_MM, "width": TRUCK_WIDTH_MM},
+        lidar={"connected": lidar.connected, "hz": round(lidar.hz(), 1),
+               "nearest_mm_from_centre": {k: (round(v) if v is not None else None)
+                                          for k, v in near.items()}},
+        guard={"enabled": guard.enabled, "blocked": guard.blocked,
+               "reason": guard.reason, "stop_mm": guard.stop_mm,
+               "clearance_mm": guard.clear},
+        floor_check={"enabled": cliff.enabled, "reason": cliff.reason},
+        camera_live=bool(camera.state.get("live")),
+        navigation={"running": ex.get("running"), "state": ex.get("state"),
+                    "message": ex.get("message"), "goal": ex.get("goal")},
+        places=sorted(load_places()),
+        audio=speaker.brief if speaker else None,
+        speech=talker.brief if talker else None,
+        microphone=({k: v for k, v in ears.state.items() if k != "log"} if ears else None),
+    )
+
+
+def lcd_snapshot():
+    """What the status screen shows, as plain values.
+
+    Each sensor in its own try: the screen is how you find out something is
+    wrong, so one broken reader must not blank the rest of it."""
+    ip = lan_ip()
+    s = {"ip": None if ip.startswith("127.") else ip, "port": http_port}
+
+    def part(fn):
+        try:
+            fn()
+        except Exception:                                     # noqa: BLE001
+            pass
+
+    def motors():
+        m = robot.state
+        s.update(enabled=m.get("enabled"), tripped=m.get("tripped"))
+
+    def sensors():
+        hz = lidar.hz()
+        s.update(lidar_ok=bool(lidar.connected and hz > 0), lidar_hz=hz)
+
+    def orientation():
+        im = imu.state
+        s.update(imu_ok=bool(im.get("ready")),
+                 heading=im.get("yaw") if im.get("ready") else None)
+
+    def cam():
+        s["cam_ok"] = bool(camera.state.get("live"))
+
+    def nav():
+        s.update(blocked=guard.blocked, reason=guard.reason)
+        p = slam.slam.pose
+        s["pose"] = (p.x, p.y, math.degrees(p.th) % 360.0)
+        ex = explorer.status
+        if ex.get("running"):
+            s["explore"] = f"AUTO · {ex.get('state')}"
+
+    def sound():
+        a = speaker.brief
+        s.update(song=a["track"], paused=a["paused"], pos=a["pos"],
+                 dur=a["dur"], volume=a["volume"],
+                 beep=(f'"{a["now"]}"' if a["kind"] == "speech" else
+                       a["now"] if a["kind"] in ("beep", "tone") else None))
+
+    for fn in (motors, sensors, orientation, cam, nav, sound):
+        part(fn)
+    return s
+
+
 def lan_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -4019,6 +5021,7 @@ def lan_ip():
 
 def main():
     global robot, lidar, imu, slam, explorer, camera, markers, cliff, detector
+    global speaker, screen, http_port, talker, ears, assistant
     ap = argparse.ArgumentParser(description="drive + lidar + imu")
     ap.add_argument("-p", "--lidar-port", help="serial port (default: auto-detect)")
     ap.add_argument("-b", "--baud", type=int, default=LIDAR_BAUD)
@@ -4028,6 +5031,10 @@ def main():
                     help="record unknown tags at the current pose")
     ap.add_argument("--no-cliff", action="store_true",
                     help="do not let the camera veto forward motion")
+    ap.add_argument("--no-https", action="store_true",
+                    help="do not serve the phone-microphone page over https :5443")
+    ap.add_argument("--no-display", action="store_true",
+                    help="do not drive the ST7789 status screen")
     ap.add_argument("--no-detect", action="store_true",
                     help="do not run object detection")
     ap.add_argument("--detect-url", default=None,
@@ -4046,6 +5053,20 @@ def main():
         print("  Is web_pilot.py, web_drive.py or web_dashboard.py running?")
         print("  Only one script can own these pins at a time.\n")
         raise
+
+    # The speaker is optional like every sensor: no card, no ffmpeg, the
+    # page says so on the Audio tab and everything else carries on.
+    speaker = audio.Audio()
+    app.register_blueprint(audio.blueprint(speaker))
+    talker = tts.Tts(speaker)
+    app.register_blueprint(tts.blueprint(talker))
+    ears = voice.Ears(talker)
+    app.register_blueprint(voice.blueprint(ears))
+    # The assistant drives the truck through this server's own HTTP API, so
+    # its moves take exactly the arrow keys' path — guard, watchdog and all.
+    assistant = brain.Brain(ears, talker, speaker, f"http://127.0.0.1:{args.http_port}")
+    ears.assistant = lambda: assistant.brief
+    app.register_blueprint(brain.blueprint(assistant))
 
     lidar = Lidar(args.lidar_port or autodetect_lidar(), args.baud)
     imu = ImuReader()
@@ -4107,6 +5128,11 @@ def main():
                  "web_nav": sys.modules[__name__]})
     _loaded = tuning.load()
 
+    # The status screen goes last: it reads every other object, and a
+    # missing or unwired display must cost nothing but its own card.
+    http_port = args.http_port
+    screen = display.StatusScreen(lcd_snapshot, enabled=not args.no_display)
+
     print("\n  Speaker Truck — nav")
     print(f"  http://{lan_ip()}:{args.http_port}   (click the page, then arrow keys)")
     print(f"  lidar: {lidar.port or 'NONE'} @ {args.baud}")
@@ -4125,8 +5151,23 @@ def main():
     print(f"  cliff: {'on' if cliff.enabled else 'off'}"
           f" · camera {CAM_PITCH_DEG:.0f}° down at {CAM_HEIGHT_MM:.0f} mm")
     print(f"  guard: {'on' if guard.enabled else 'off'} at {guard.stop_mm:.0f} mm")
+    print(f"  audio: {speaker.card() or 'NO ALSA CARD — WIRING.md §7'}"
+          f" · {speaker.device or 'ALSA default'}"
+          f"{'' if speaker.have_aplay else ' · aplay MISSING'}"
+          f"{'' if speaker.have_ffmpeg else ' · ffmpeg MISSING (no MP3)'}"
+          f" · {len(speaker.files())} songs")
+    _voices = talker.installed()
+    print(f"  speech: {'Piper' if talker.have_piper else 'Piper MISSING — pip install piper-tts'}"
+          f" · {talker.voice if _voices else 'no voice downloaded (Audio tab)'}")
+    print(f"  lcd:   {'ST7789 on SPI0 · ' + str(round(screen.lcd.actual_hz / 1e6, 2)) + ' MHz' if screen.lcd else 'NONE — ' + screen.error}")
     print(f"  slam:  {slam.slam.grid.n}x{slam.slam.grid.n} cells @ "
           f"{slam.slam.grid.res} mm, matching on")
+    https_port = None if args.no_https else voice.serve_https(app)
+    _ab = assistant.brief
+    print(f"  brain: Ollama {_ab['model']} at {_ab['ollama_url']}"
+          + (" · OFF (Audio tab)" if not _ab['enabled'] else
+             " · connecting to the PC… (status on the Audio tab)"))
+    print(f"  talk:  {'https://' + lan_ip() + ':' + str(https_port) + '/talk  (phone mic)' if https_port else 'off'}")
     print(f"  MAX_DUTY {MAX_DUTY:.2f} · watchdog {WATCHDOG_S}s")
     print("\n  *** WHEELS OFF THE GROUND ***\n")
     try:
@@ -4137,7 +5178,13 @@ def main():
             explorer.stop("shutting down")
         robot.close()
         camera.close()
-        print("\nMotors stopped, STBY low, pins released.")
+        if talker:
+            talker.close()
+        if speaker:
+            speaker.stop()
+        if screen:
+            screen.close()         # blank + sleep the panel, release GPIO7
+        print("\nMotors stopped, STBY low, pins released. Audio stopped.")
 
 
 if __name__ == "__main__":

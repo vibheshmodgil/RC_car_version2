@@ -44,8 +44,11 @@ here is done in software by the player, not by the amp.
   Tone / sweep   — a WAV generated in-process and played with `aplay`. Needs
                    only alsa-utils, so it works before ffmpeg is installed and
                    is the first thing to try when the speaker is silent.
-  Music          — uploaded files played with `ffplay`, which decodes MP3 and
-                   applies the bass/treble shelves and volume in one pass.
+  Music          — uploaded files decoded by `ffmpeg` straight to ALSA, with
+                   the bass/treble shelves and volume in one pass.
+
+The player itself lives in audio.py, shared with web_nav.py, whose Audio tab
+is the fuller version of this panel (beeps, pause, playlist).
 
     sudo apt install -y alsa-utils ffmpeg
 
@@ -54,17 +57,11 @@ Wiring, the SD/GAIN pins and the config.txt overlay: WIRING.md section 7.
 pip dependency: flask
 """
 
-import math
 import os
-import shutil
 import socket
-import struct
-import subprocess
 import sys
-import tempfile
 import threading
 import time
-import wave
 
 # Absolute path, so the script works no matter which directory it is
 # launched from. __file__.rsplit("/") breaks when run as `python x.py`
@@ -81,7 +78,8 @@ from pins import (  # noqa: E402
 
 from gpiozero import DigitalOutputDevice, PWMOutputDevice, RotaryEncoder  # noqa: E402
 from flask import Flask, jsonify, request, render_template_string  # noqa: E402
-from werkzeug.utils import secure_filename  # noqa: E402
+from audio import Audio, AUDIO_DIR, MAX_UPLOAD_MB  # noqa: E402
+from audio import blueprint as audio_bp  # noqa: E402
 
 # Seconds without a /state poll before the motors are stopped. 0 disables.
 WATCHDOG_S = 2.0
@@ -89,17 +87,6 @@ WATCHDOG_S = 2.0
 # Nominal free-running speed of the JGB37-520, used as the trace's initial
 # y-scale. The scale grows past this if the motors ever exceed it.
 RATED_RPM = 330
-
-# --- Audio -----------------------------------------------------------------
-AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
-ALLOWED_AUDIO = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac"}
-MAX_UPLOAD_MB = 32
-
-# Ceiling on generated tone amplitude, 0.0-1.0. A full-scale sine into a
-# class-D amp is loud enough to damage a small speaker and your hearing, and
-# the tone is a diagnostic, not a demo.
-MAX_TONE_LEVEL = 0.5
-
 
 # ---------------------------------------------------------------------------
 # Robot hardware
@@ -299,263 +286,6 @@ class Robot:
 
 
 # ---------------------------------------------------------------------------
-# Audio — MAX98357A over I2S
-# ---------------------------------------------------------------------------
-
-def _write_wav(path, samples, rate=44100):
-    """16-bit mono WAV from an iterable of floats in -1.0 .. 1.0."""
-    with wave.open(path, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(rate)
-        w.writeframes(b"".join(
-            struct.pack("<h", int(max(-1.0, min(1.0, s)) * 32767))
-            for s in samples
-        ))
-
-
-def _envelope(i, n, fade):
-    """10 ms raised edges. Without them a tone starts and ends with a click,
-    which on a class-D amp is a broadband transient into the speaker."""
-    if i < fade:
-        return i / fade
-    if i > n - fade:
-        return (n - i) / fade
-    return 1.0
-
-
-def tone_samples(freq, seconds, level, rate=44100):
-    n = int(rate * seconds)
-    fade = max(1, int(rate * 0.01))
-    for i in range(n):
-        yield level * _envelope(i, n, fade) * math.sin(2 * math.pi * freq * i / rate)
-
-
-def sweep_samples(f0, f1, seconds, level, rate=44100):
-    """Logarithmic sweep — equal time per octave, which is how a speaker's
-    response is actually read. A linear sweep spends most of its time above
-    5 kHz and tells you nothing about the bottom end."""
-    n = int(rate * seconds)
-    fade = max(1, int(rate * 0.01))
-    ratio = f1 / f0
-    phase = 0.0
-    for i in range(n):
-        f = f0 * (ratio ** (i / n))
-        phase += 2 * math.pi * f / rate
-        yield level * _envelope(i, n, fade) * math.sin(phase)
-
-
-class Audio:
-    """One player process at a time, driven by ALSA command-line tools.
-
-    The MAX98357A has no volume register — it plays whatever samples arrive —
-    so `amixer` shows no control and every level here is applied in software.
-    """
-
-    def __init__(self):
-        os.makedirs(AUDIO_DIR, exist_ok=True)
-        self._proc = None
-        self._now = None
-        self._lock = threading.Lock()
-        self.have_aplay = shutil.which("aplay") is not None
-        self.have_ffplay = shutil.which("ffplay") is not None
-        self._tone_path = os.path.join(tempfile.gettempdir(), "truck_tone.wav")
-        # None = ALSA's default device. On a Pi with HDMI plus an I2S card the
-        # default is frequently the wrong one, which plays to silence with no
-        # error, so the device is selectable.
-        self.device = None
-        self.last_error = ""
-
-    # --- devices ------------------------------------------------------------
-
-    def devices(self):
-        """Playback devices from `aplay -l`, as selectable hw:C,D strings."""
-        if not self.have_aplay:
-            return []
-        try:
-            out = subprocess.run(["aplay", "-l"], capture_output=True,
-                                 text=True, timeout=5).stdout or ""
-        except (OSError, subprocess.SubprocessError):
-            return []
-        found = []
-        for line in out.splitlines():
-            # card 0: MAX98357A [MAX98357A], device 0: bcm2835-i2s-... []
-            if not line.startswith("card ") or "device " not in line:
-                continue
-            try:
-                card = line.split("card ", 1)[1].split(":", 1)[0].strip()
-                dev = line.split("device ", 1)[1].split(":", 1)[0].strip()
-                name = line.split("[", 1)[1].split("]", 1)[0]
-            except IndexError:
-                continue
-            # plughw, not hw. `hw:` is the raw device and accepts only the
-            # exact format the hardware wants — the bcm2835 I2S interface
-            # wants stereo, so a mono tone is rejected with "Channels count
-            # non available" and nothing plays. `plughw:` inserts ALSA's
-            # conversion plugin, which fixes up channels, rate and sample
-            # format on the way through.
-            found.append({"dev": f"plughw:{card},{dev}", "name": name})
-        return found
-
-    def card(self):
-        """Name of the first playback card, for display only."""
-        d = self.devices()
-        return d[0]["name"] if d else None
-
-    def set_device(self, dev):
-        """dev is one of the hw:C,D strings from devices(), or None/'' for
-        ALSA's default."""
-        if not dev:
-            self.device = None
-            return
-        if dev not in [d["dev"] for d in self.devices()]:
-            raise ValueError(f"unknown device: {dev}")
-        self.device = dev
-
-    def _alsa_args(self):
-        return ["-D", self.device] if self.device else []
-
-    # --- transport ----------------------------------------------------------
-
-    @property
-    def playing(self):
-        p = self._proc
-        return p is not None and p.poll() is None
-
-    def stop(self):
-        with self._lock:
-            p, self._proc, self._now = self._proc, None, None
-        if p and p.poll() is None:
-            p.terminate()
-            try:
-                p.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                p.kill()
-
-    def _spawn(self, cmd, label, env=None):
-        """Start a player and confirm it is still alive a moment later.
-
-        Popen succeeds even when the player dies instantly — wrong ALSA
-        device, no sound card, unsupported format — so without this check the
-        request returns 200 while nothing plays and nothing is reported.
-        stderr is captured rather than discarded so the real message
-        ('No such file or directory', 'Device or resource busy') reaches the
-        page instead of /dev/null.
-        """
-        self.stop()          # only ever one player, so a new play replaces it
-        e = dict(os.environ)
-        if env:
-            e.update(env)
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.PIPE, env=e)
-        time.sleep(0.35)
-        if proc.poll() is not None and proc.returncode != 0:
-            raw = (proc.stderr.read() or b"").decode(errors="replace").strip()
-            msg = raw.splitlines()[-1] if raw else f"player exited {proc.returncode}"
-            self.last_error = msg
-            raise RuntimeError(msg)
-        self.last_error = ""
-        with self._lock:
-            self._proc = proc
-            self._now = label
-
-    # --- sources ------------------------------------------------------------
-
-    def tone(self, freq, seconds, level):
-        if not self.have_aplay:
-            raise RuntimeError("aplay not found — sudo apt install alsa-utils")
-        freq = max(20.0, min(20000.0, float(freq)))
-        seconds = max(0.2, min(10.0, float(seconds)))
-        level = max(0.0, min(MAX_TONE_LEVEL, float(level)))
-        _write_wav(self._tone_path, tone_samples(freq, seconds, level))
-        self._spawn(["aplay", "-q"] + self._alsa_args() + [self._tone_path],
-                    f"{freq:.0f} Hz tone")
-
-    def sweep(self, f0, f1, seconds, level):
-        if not self.have_aplay:
-            raise RuntimeError("aplay not found — sudo apt install alsa-utils")
-        seconds = max(1.0, min(20.0, float(seconds)))
-        level = max(0.0, min(MAX_TONE_LEVEL, float(level)))
-        _write_wav(self._tone_path, sweep_samples(f0, f1, seconds, level))
-        self._spawn(["aplay", "-q"] + self._alsa_args() + [self._tone_path],
-                    f"sweep {f0:.0f}-{f1:.0f} Hz")
-
-    def play(self, name, volume, bass, treble):
-        if not self.have_ffplay:
-            raise RuntimeError("ffplay not found — sudo apt install ffmpeg")
-        path = self.resolve(name)
-        volume = max(0.0, min(1.5, float(volume)))
-        bass = max(-12.0, min(12.0, float(bass)))
-        treble = max(-12.0, min(12.0, float(treble)))
-        # One ffmpeg filter chain does decode + shelves + gain in a single pass.
-        af = f"bass=g={bass:.1f},treble=g={treble:.1f},volume={volume:.3f}"
-        # ffplay plays through SDL, which takes its ALSA device from AUDIODEV
-        # rather than a command-line flag — so the device chosen for the tone
-        # test applies to music too.
-        env = {"SDL_AUDIODRIVER": "alsa"}
-        if self.device:
-            env["AUDIODEV"] = self.device
-        self._spawn(
-            ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error",
-             "-af", af, path],
-            os.path.basename(path), env=env,
-        )
-
-    # --- library ------------------------------------------------------------
-
-    def resolve(self, name):
-        """Map a client-supplied name onto a real file inside AUDIO_DIR.
-
-        secure_filename plus a basename strips any path traversal, and the
-        isfile check keeps the result inside the upload directory."""
-        safe = secure_filename(os.path.basename(name or ""))
-        if not safe:
-            raise FileNotFoundError(name)
-        path = os.path.join(AUDIO_DIR, safe)
-        if not os.path.isfile(path):
-            raise FileNotFoundError(name)
-        return path
-
-    def files(self):
-        out = []
-        for fn in sorted(os.listdir(AUDIO_DIR)):
-            p = os.path.join(AUDIO_DIR, fn)
-            if os.path.isfile(p) and os.path.splitext(fn)[1].lower() in ALLOWED_AUDIO:
-                out.append({"name": fn, "kb": round(os.path.getsize(p) / 1024)})
-        return out
-
-    def save(self, storage):
-        name = secure_filename(storage.filename or "")
-        ext = os.path.splitext(name)[1].lower()
-        if not name or ext not in ALLOWED_AUDIO:
-            raise ValueError(f"unsupported file type: {ext or '(none)'}")
-        storage.save(os.path.join(AUDIO_DIR, name))
-        return name
-
-    def delete(self, name):
-        path = self.resolve(name)
-        if self._now == os.path.basename(path):
-            self.stop()
-        os.remove(path)
-
-    @property
-    def state(self):
-        devs = self.devices()
-        return {
-            "playing": self.playing,
-            "now": self._now,
-            "files": self.files(),
-            "devices": devs,
-            "device": self.device,
-            "card": devs[0]["name"] if devs else None,
-            "have_aplay": self.have_aplay,
-            "have_ffplay": self.have_ffplay,
-            "max_tone_level": MAX_TONE_LEVEL,
-            "last_error": self.last_error,
-        }
-
-
-# ---------------------------------------------------------------------------
 # Flask app
 # ---------------------------------------------------------------------------
 
@@ -563,6 +293,7 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 robot = Robot()
 audio = Audio()
+app.register_blueprint(audio_bp(audio))
 
 PAGE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -989,9 +720,9 @@ canvas#eq{height:118px;cursor:default}
       </div>
 
       <p class="mono-note">
-        Approximate shelving response of the filters actually applied. Levels
-        are baked in when playback starts, so press play again after moving a
-        slider. The MAX98357A has no volume register — all of this is software.
+        Approximate shelving response of the filters actually applied. Moving a
+        slider during a song restarts it at the same spot with the new levels.
+        The MAX98357A has no volume register — all of this is software.
       </p>
       <p class="warn" id="awarn"></p>
     </section>
@@ -1411,7 +1142,7 @@ function audioPoll(){
 
     const miss = [];
     if(!d.have_aplay)  miss.push('alsa-utils');
-    if(!d.have_ffplay) miss.push('ffmpeg');
+    if(!d.have_ffmpeg) miss.push('ffmpeg');
     let msg = '';
     if(miss.length){
       msg = 'Missing: ' + miss.join(' + ') + ' — sudo apt install -y ' + miss.join(' ');
@@ -1430,6 +1161,10 @@ $('dev').addEventListener('change', e => apost('/audio/device', {device: e.targe
 $('freq').addEventListener('input', markFreq);
 $('lvl').addEventListener('input', fmtLvl);
 $('vol').addEventListener('input', fmtVol);
+// 'change', not 'input': each change restarts the decoder, so only on release.
+['vol','bass','treble'].forEach(id => $(id).addEventListener('change', () =>
+  apost('/audio/levels', {volume:+$('vol').value/100, bass:+$('bass').value,
+                          treble:+$('treble').value})));
 $('bass').addEventListener('input', fmtEQ);
 $('treble').addEventListener('input', fmtEQ);
 addEventListener('resize', drawEQ);
@@ -1496,94 +1231,6 @@ def set_param():
     return "", 204
 
 
-# --- audio -----------------------------------------------------------------
-# These return JSON rather than 204 so the page can show why something failed
-# (missing ffmpeg, unsupported file type) instead of silently doing nothing.
-
-AUDIO_ERRORS = (RuntimeError, ValueError, OSError, FileNotFoundError)
-
-
-def _body():
-    return request.get_json(force=True, silent=True) or {}
-
-
-@app.route("/audio/state")
-def audio_state():
-    return jsonify(audio.state)
-
-
-@app.route("/audio/tone", methods=["POST"])
-def audio_tone():
-    d = _body()
-    try:
-        audio.tone(d.get("freq", 440), d.get("seconds", 2), d.get("level", 0.25))
-    except AUDIO_ERRORS as e:
-        return jsonify(error=str(e)), 400
-    return jsonify(ok=True)
-
-
-@app.route("/audio/sweep", methods=["POST"])
-def audio_sweep():
-    d = _body()
-    try:
-        audio.sweep(d.get("f0", 40), d.get("f1", 15000),
-                    d.get("seconds", 8), d.get("level", 0.25))
-    except AUDIO_ERRORS as e:
-        return jsonify(error=str(e)), 400
-    return jsonify(ok=True)
-
-
-@app.route("/audio/play", methods=["POST"])
-def audio_play():
-    d = _body()
-    try:
-        audio.play(d.get("file"), d.get("volume", 0.8),
-                   d.get("bass", 0), d.get("treble", 0))
-    except AUDIO_ERRORS as e:
-        return jsonify(error=str(e)), 400
-    return jsonify(ok=True)
-
-
-@app.route("/audio/stop", methods=["POST"])
-def audio_stop():
-    audio.stop()
-    return jsonify(ok=True)
-
-
-@app.route("/audio/device", methods=["POST"])
-def audio_device():
-    try:
-        audio.set_device(_body().get("device"))
-    except AUDIO_ERRORS as e:
-        return jsonify(error=str(e)), 400
-    return jsonify(ok=True, device=audio.device)
-
-
-@app.route("/audio/upload", methods=["POST"])
-def audio_upload():
-    f = request.files.get("file")
-    if f is None:
-        return jsonify(error="no file in request"), 400
-    try:
-        return jsonify(ok=True, name=audio.save(f))
-    except AUDIO_ERRORS as e:
-        return jsonify(error=str(e)), 400
-
-
-@app.route("/audio/delete", methods=["POST"])
-def audio_delete():
-    try:
-        audio.delete(_body().get("file"))
-    except AUDIO_ERRORS as e:
-        return jsonify(error=str(e)), 400
-    return jsonify(ok=True)
-
-
-@app.errorhandler(413)
-def too_large(_e):
-    return jsonify(error=f"file is larger than {MAX_UPLOAD_MB} MB"), 413
-
-
 # ---------------------------------------------------------------------------
 
 def lan_ip():
@@ -1609,7 +1256,7 @@ if __name__ == "__main__":
     card = audio.card()
     print(f"  audio: {card or 'NO ALSA CARD'}"
           f" · aplay {'ok' if audio.have_aplay else 'MISSING'}"
-          f" · ffplay {'ok' if audio.have_ffplay else 'MISSING'}")
+          f" · ffmpeg {'ok' if audio.have_ffmpeg else 'MISSING'}")
     if not card:
         print("         check dtoverlay in /boot/firmware/config.txt "
               "— WIRING.md section 7")

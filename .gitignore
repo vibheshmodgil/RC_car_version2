@@ -8,6 +8,12 @@ __pycache__/
 # Pi-side artifacts
 *.log
 uploads/
+audio.json
+voices/
+tts.json
+talk_cert.pem
+talk_key.pem
+brain.json
 drive_invert.json
 imu_calib.json
 house_map.json
