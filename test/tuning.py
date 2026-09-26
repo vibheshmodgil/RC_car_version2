@@ -656,6 +656,68 @@ def save():
     return diff
 
 
+# --- the known-good profile ----------------------------------------------------
+#
+# "Revert" goes to the CODE defaults, which also throws away what was measured
+# on this truck (its size, the LiDAR's rotation). "Restore known-good" goes to
+# code defaults PLUS a small set of values known to map well:
+#
+#   tuning_good.json          saved from the cockpit on the Pi (Save as known-good)
+#   tuning_good.default.json  in the repo - the values the whole house was
+#                             mapped with on 2026-09-26; used when the Pi has
+#                             not saved its own
+#
+# Both hold only the values that differ from the code defaults, like tuning.json.
+
+GOOD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tuning_good.json")
+GOOD_DEFAULT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tuning_good.default.json")
+
+
+def _read_values(path):
+    try:
+        with open(path) as f:
+            return json.load(f).get("values", {})
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def good_profile():
+    """(values, source file name) of the known-good profile."""
+    for path in (GOOD_FILE, GOOD_DEFAULT_FILE):
+        vals = _read_values(path)
+        if vals is not None:
+            return vals, os.path.basename(path)
+    return {}, None
+
+
+def restore_good():
+    """Code defaults, then the known-good values, then saved to tuning.json."""
+    vals, src = good_profile()
+    revert()
+    applied = apply(vals)
+    save()
+    return {"source": src, "applied": applied}
+
+
+def save_good():
+    """Make what is set now the known-good profile (differences from default only)."""
+    diff = {}
+    for t in REGISTRY:
+        try:
+            v = get(t.key)
+        except (KeyError, AttributeError):
+            continue
+        if t.default is not None and v != t.default:
+            diff[t.key] = v
+    tmp = GOOD_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"version": 1, "values": diff}, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, GOOD_FILE)
+    return diff
+
+
 def load():
     """Apply tuning.json, if there is one. Call after bind()."""
     try:

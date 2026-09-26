@@ -73,7 +73,7 @@ HORN_LEVEL = 0.97
 
 # Bump when a beep's sound changes. Rendered WAVs are cached in /tmp by
 # name, and without this the old sound keeps playing until a reboot.
-BEEP_CACHE_VERSION = 2
+BEEP_CACHE_VERSION = 3
 
 # Music gain ceiling. Above 1.0 the volume filter clips loud passages.
 MAX_VOLUME = 1.5
@@ -94,6 +94,22 @@ BEEPS = {
     # the Audio tab cuts it short.
     "reverse": [((1100,), 0.5), ((), 0.5)] * 8,
     "alert":   [((880,), 0.16), ((660,), 0.16)] * 3,          # two-tone
+
+    # Cues - the truck telling you what it is doing (test/cues.py). Short,
+    # and each with a shape you can learn without looking: rising = good /
+    # on, falling = lost / off, a chord = done.
+    "reverse_pip": [((1100,), 0.40)],                         # one pulse of the backing-up alarm
+    "armed":    [((523,), 0.08), ((), 0.03), ((784,), 0.13)],
+    "disarmed": [((784,), 0.08), ((), 0.03), ((523,), 0.15)],
+    "locked":   [((659,), 0.07), ((880,), 0.07), ((1319,), 0.15)],          # "got you"
+    "found":    [((784,), 0.07), ((1047,), 0.13)],                          # "there you are"
+    "lost":     [((698,), 0.15), ((587,), 0.15), ((466,), 0.30)],           # "uh-oh"
+    "gave_up":  [((587,), 0.2), ((494,), 0.2), ((392,), 0.2), ((294,), 0.45)],
+    "arrived":  [((523, 659, 784), 0.12), ((), 0.05), ((523, 659, 784, 1047), 0.32)],
+    "mapped":   [((523,), 0.1), ((659,), 0.1), ((784,), 0.1), ((1047,), 0.1),
+                 ((), 0.05), ((523, 784, 1047), 0.45)],
+    "failed":   [((330,), 0.2), ((262,), 0.4)],
+    "bonk":     [((300, 450), 0.09)],                          # the guard said no
 }
 
 MODES = ("single", "all", "repeat")     # after a song: stop / next / again

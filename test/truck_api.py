@@ -195,14 +195,57 @@ class TruckApi:
 
     def places_text(self):
         names = self.ai_status().get("places") or []
-        return ("Saved places: " + ", ".join(names)) if names else \
+        routes = sorted((self.get("/routes").get("routes") or {}))
+        out = ("Saved places: " + ", ".join(names) + ".") if names else \
             "No places saved. A person can save one from the cockpit's Map tab."
+        if routes:
+            out += " Routes: " + ", ".join(routes) + "."
+        return out
 
     def go_to_place(self, name):
+        """Drive to a saved place or map marker ("hall", "marker 2"). The
+        cockpit matches loosely - "the hall", "kitchen" for "kitchen entrance"."""
         if not self.ai_status()["motors"]["enabled"]:
             return "Not started: motors are DISABLED. Ask the person to press ENABLE in the cockpit."
-        r = self.post("/goto", {"name": name})
-        return f"Navigating to {name}: {r.get('state')} — {r.get('message') or ''}"
+        try:
+            r = self.post("/goto", {"name": name})
+        except TruckError as e:
+            if "unknown place" not in str(e):
+                raise
+            names = self.ai_status().get("places") or []
+            return (f"I don't know a place called {name}. "
+                    + (("I know: " + ", ".join(names) + ".") if names else "No places are saved yet."))
+        # The first plan happens a moment later, in the explorer's thread.
+        # Live, "On my way to kitchen entrance" was said for a trip that had
+        # already failed with "no route" - so wait for the plan first.
+        goal = r.get("goal") or name
+        for _ in range(8):
+            time.sleep(0.25)
+            nav = self.ai_status().get("navigation") or {}
+            if nav.get("state") == "failed":
+                return f"I can't find a way to {goal} from here. {nav.get('message') or ''}".strip()
+            if nav.get("state") == "done":
+                return f"I'm already at {goal}."
+            if nav.get("running") and self.get("/state").get("explore", {}).get("path_len"):
+                break
+        return f"On my way to {goal}."
+
+    def drive_route(self, name, loop=False):
+        """Drive a route drawn on the map, waypoint by waypoint."""
+        if not self.ai_status()["motors"]["enabled"]:
+            return "Not started: motors are DISABLED. Ask the person to press ENABLE in the cockpit."
+        try:
+            r = self.post("/route/go", {"name": name, "loop": bool(loop)})
+        except TruckError as e:
+            if "unknown route" not in str(e):
+                raise
+            routes = sorted((self.get("/routes").get("routes") or {}))
+            return (f"I don't know a route called {name}. "
+                    + (("Routes: " + ", ".join(routes) + ".") if routes else
+                       "No routes yet - draw one on the cockpit's Map tab."))
+        n = r.get("points") or 0
+        return (f"Driving the {r.get('name')} route, {n} point{'s' if n != 1 else ''}"
+                + (", round and round until you say stop." if loop else "."))
 
     def cancel_navigation(self):
         self.post("/goto", {"stop": True})
@@ -298,12 +341,37 @@ class TruckApi:
         if action != "start":
             return f"unknown mapping action {action!r}; use start or stop"
         s = self.ai_status()
+        nav = s.get("navigation") or {}
+        # Already mapping: say so, don't restart. Live, "okay sure, do the
+        # mapping" said just after "make a new map" restarted the explorer
+        # in the middle of its calibration spin.
+        if nav.get("running") and str(nav.get("state", "")).startswith(("cal_", "explore")):
+            return "I'm already mapping the house."
         if not s["motors"]["enabled"]:
             return "Not started: motors are DISABLED. Ask the person to press ENABLE in the cockpit."
         if not (s.get("lidar") or {}).get("connected", True):
             return "Not started: the LiDAR is not connected, so I cannot map."
         r = self.post("/explore", {"start": True, "calibrate": False})
-        return f"Mapping started: {r.get('state')} {r.get('message') or ''}".strip()
+        if not r.get("running"):
+            return f"Mapping did not start: {r.get('message') or r.get('state')}"
+        return "Mapping started. I'll ask you the room names as I go."
+
+    def restore_settings(self):
+        """Tuning back to the known-good set: code defaults plus the values
+        measured on this truck (tuning_good.json)."""
+        r = self.post("/tuning", {"good": "restore"})
+        n = len(r.get("applied") or {})
+        return f"Settings restored to the known-good set ({n} values)."
+
+    def new_map(self):
+        """Known-good settings, clear the map (rooms and objects too), then map
+        the house from here. Mapping only starts if a person has already
+        pressed ENABLE - otherwise it stops after clearing and says so."""
+        r = self.post("/fresh_map")
+        if r.get("started"):
+            return ("Settings restored and old map cleared. Mapping the house now; "
+                    "I'll ask you the room names as I go.")
+        return "Settings restored and map cleared, but my motors are disabled. Please press ENABLE, then say start mapping."
 
     def follow(self, action):
         """Follow the nearest person in view ("start"), or stop following.

@@ -231,6 +231,28 @@ async def mapping(action: str) -> str:
 
 
 @mcp.tool()
+async def drive_route(name: str, loop: bool = False) -> str:
+    """Drive a route drawn on the cockpit's map, waypoint by waypoint, with the
+    normal planner and guard. loop=True repeats until stopped. Refused unless
+    a person has already pressed ENABLE. list with `places`."""
+    return await _call(api.drive_route, name, loop)
+
+
+@mcp.tool()
+async def new_map() -> str:
+    """Restore known-good settings, clear the map (rooms and objects too), and
+    map the house from where the truck stands. Destructive: only when the
+    person asks for a new map. Mapping starts only if ENABLE was pressed."""
+    return await _call(api.new_map)
+
+
+@mcp.tool()
+async def restore_settings() -> str:
+    """Tuning back to the known-good set (code defaults + measured values)."""
+    return await _call(api.restore_settings)
+
+
+@mcp.tool()
 async def label_questions() -> str:
     """Detections waiting for a person to confirm before they go on the map:
     key, what the detector thinks it is, the nearest named room, and how many

@@ -14,12 +14,14 @@ from. No ROS, no build step - plain Python and one self-contained HTML page.
 |---|---|
 | **SLAM** | Occupancy grid and scan matching, with match-confidence rejection and loop closure (in the background, so it never stalls the pose). 30 m × 30 m map, saved every 20 s and resumed after a restart. |
 | **Autonomous mapping** | Frontier exploration with a clearance-aware A* planner. Looks around to start, makes room to turn in tight corners, and stops when the reachable house is mapped. |
-| **Click to go** | Click the map: *Go here*, or name the room. Named rooms get a **Go** button, and the voice assistant can drive to them. |
+| **Click to go** | Click the map: *Go here*, name the room, or **drop a marker** (M1, M2…). Named rooms and markers get a **Go** button, and the voice assistant drives to them ("go to the hall", "go to marker 2"). |
+| **Routes** | **Draw route** on the map: click waypoints, name it, save. The truck drives it point by point with the normal planner and guard, once or on a loop, from the button or by voice ("drive the patrol route"). |
 | **Collision guard** | One rule: no LiDAR point may end up inside the truck's outline along the path a move really drives - straight, spin or arc. Drawn live: green is free floor, red is where the truck's centre cannot go. |
 | **Follow me** | Locks on to one person - clothing colours plus where they are walking - and follows at ~1.6 m, past other people and round furniture, tracking their legs in the LiDAR when the camera cannot see them. Where they walked is drawn on the map; when it loses them it searches from there. The guard keeps it off everyone. |
 | **Voice** | Speak into a phone; a free local model (Ollama on your PC) answers out loud and can drive, look, name rooms and go to them. |
 | **ArUco localisation** | Printed tags give an absolute position fix - the only input outside SLAM's closed loop. |
 | **Object labels** | Open-vocabulary detection pins "sofa", "wardrobe", "chest of drawers" to the map, one object per spot, automatically - no questions asked. |
+| **Truck sounds** | It tells you what it is doing: a backing-up alarm while reversing, a chirp when follow mode locks on, "uh-oh" when it loses you and a happy note when it finds you, a ta-da on arriving or finishing the map, a bonk when the guard refuses your move. Never over its own speech. On/off on the Drive tab. |
 | **System monitor** | A task manager in the cockpit. Pi CPU per core and per thread, temperature, under-voltage, and the PC's YOLO / Piper / Ollama load. |
 | **Live tuning** | Every parameter adjustable while driving, saved to the SD card automatically. |
 | **Self-calibration** | Push the robot half a metre and it measures its own scanner rotation and odometry scale, with a residual. |
@@ -107,6 +109,15 @@ Open **http://shiv.local:5004** (or `http://<pi-ip>:5004`), click the page once,
 then press **ENABLE**. It turns solid green (**● ENABLED**) when the motors are armed.
 
 - **Map tab:** *START AUTO-MAP*, click the map to go somewhere, *Reset map*.
+  **Fresh map** does it all in one go: restores the known-good settings, clears
+  the map and maps the house again. Or say *"make a new map"* to the assistant.
+- **Restarted, or carried the truck somewhere?** It finds itself on the saved
+  map by itself a few seconds after starting. The Map tab note says what it
+  decided. **Find me on map** runs it again.
+- **Settings went wrong?** Tune tab → **Restore known-good** (or say *"restore
+  the default settings"*). This gives code defaults plus the measured truck
+  size, LiDAR rotation and wheel values. *Revert to code defaults* throws the
+  measured ones away too.
 - **Vision tab → Person → Follow:** follow me.
 - **Phone:** open `https://<pi-ip>:5443/talk` and talk to it. The self-signed
   certificate warning is expected, so accept it.
@@ -289,6 +300,7 @@ Full detail and what each result should look like: **[Start_pi.md](Start_pi.md)*
 | Camera, markers | `test/camera.py`, `test/markers.py` (`test/cliff.py` is no longer used for driving) |
 | The truck's status screen | `test/display.py` (`render_status`) — wiring in [WIRING.md §14](WIRING.md) |
 | Text to speech (voices, queue) | `test/tts.py` — Piper, `pip install "piper-tts>=1.3"` |
+| Truck sounds (when each plays) | `test/cues.py`; the sounds themselves are in `BEEPS` in `test/audio.py` |
 | Speaker playback, beeps, the horn | `test/audio.py` — shared by `web_nav.py`, `web_dashboard.py`, `speaker_test.py` |
 | Object detection | `test/detect.py` — needs `yolov8n.onnx` in `test/` |
 | Person tracking | `test/person.py` — finds people, distance, clothing-colour signature |

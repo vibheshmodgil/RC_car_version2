@@ -701,6 +701,16 @@ class Explorer:
             # one unroutable goal made every /state and /ai/status a 500 -
             # the cockpit and the voice assistant both - until the next trip.
             self.path = (astar(infl, m, (sx, sy), goal, pen) if goal else None) or []
+            if not self.path:
+                # Where the truck has DRIVEN is passable, whatever the map
+                # now says. Live, one noisy scan drew a wall across the
+                # bedroom doorway the truck had just driven through, and every
+                # trip out of the bedroom failed with "no route". Retry with
+                # the driven path open; if a door really has been shut, the
+                # guard stops it there and the trip reports that instead.
+                self._open_trail(infl, m, cell, half)
+                goal = nearest_open(infl, m, (int(gx // cell) + half, int(gy // cell) + half))
+                self.path = (astar(infl, m, (sx, sy), goal, pen) if goal else None) or []
             self._last_plan = t
             if not self.path:
                 self.state = "failed"
@@ -709,6 +719,28 @@ class Explorer:
                 return
 
         self._follow(pose, cell, half, t)
+
+    def _open_trail(self, infl, m, cell, half):
+        """Mark every planner cell the truck's own trail passes through as
+        passable (1), in place. The LINE between consecutive trail points,
+        not just the points: live, a third of the steps were longer than a
+        planner cell (up to 460 mm), which left holes and no route. Jumps
+        over 1 m are a relocalisation or a loop closure, not driving."""
+        try:
+            trail = list(self.slamr.slam.trail)
+        except AttributeError:
+            return
+        prev = None
+        for x, y in trail:
+            if prev is not None and math.hypot(x - prev[0], y - prev[1]) <= 1000.0:
+                steps = max(1, int(math.hypot(x - prev[0], y - prev[1]) // (cell / 2.0)))
+                for i in range(steps + 1):
+                    px = prev[0] + (x - prev[0]) * i / steps
+                    py = prev[1] + (y - prev[1]) * i / steps
+                    cx, cy = int(px // cell) + half, int(py // cell) + half
+                    if 0 <= cx < m and 0 <= cy < m:
+                        infl[cy * m + cx] = 1
+            prev = (x, y)
 
     def _turn_refused(self):
         g = self.guard

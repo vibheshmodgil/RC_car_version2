@@ -18,11 +18,14 @@ drive_invert.json
 imu_calib.json
 house_map.json
 places.json
+routes.json
 lidar_cal.json
 captures/
 asks/
 marker_map.json
 tuning.json
+tuning_good.json
+cues.json
 objects.json
 # Model weights. Downloaded on demand, hundreds of megabytes, and GitHub
 # hard-rejects anything over 100 MB — yolov8x-worldv2.pt alone is 146 MB.

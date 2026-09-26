@@ -72,7 +72,7 @@ PREFERRED_MODELS = ("qwen3-vl:4b-instruct", "qwen3-vl:2b-instruct", "llama3.2:3b
 # Said at once when the model calls a tool before saying anything — so the
 # truck reacts in the time it takes to decide, not after a second slow pass.
 ACKS = {"drive": "Okay, moving.", "look": "Let me look.", "status": "Let me check.",
-        "go_to_place": "Okay, on my way.", "places": "Let me check.", "play_song": "Sure."}
+"places": "Let me check.", "play_song": "Sure."}
 
 
 def _quick_reply(name, result):
@@ -127,6 +127,16 @@ _FAST = [
     (r"(what|which) (places|rooms)( do you know| are (there|saved)| have you saved)?|list places",
      "places", {}),
     (r"save (map|your map)", "save_map", {}),
+    (r"(go|come|drive|get) (back )?(home|to (home|base|start))|return( home| to (base|start))?"
+     r"|(go|come) back( to (your )?(initial|starting|original) (position|point|place))?( first room)?"
+     r"|back to (your )?(initial|starting|original) (position|point|place)", "go_to_place", {"name": "home"}),
+    (r"(make|create|build|start|do) (new|fresh) map( of (house|whole house|home))?"
+     r"|(clear|reset|delete) (map|your map)( and (map|explore) (house|whole house|home|everything)( again)?)?"
+     r"|map (whole )?(house|home) again( from scratch)?", "new_map", {}),
+    (r"(restore|reset) (your )?(default |good |known good |best )?(settings|tuning)"
+     r"|(go )?back to (default|good|known good) settings", "restore_settings", {}),
+    (r"(start|begin) (mapping|exploring)|map (whole )?(house|home)|explore (house|home)", "mapping",
+     {"action": "start"}),
     (r"(take|click|snap) (photo|picture|pic|snapshot)", "take_photo", {}),
 ]
 _FAST = [(re.compile(p), name, args) for p, name, args in _FAST]
@@ -199,6 +209,19 @@ def _parse_label_answer(text):
     return None
 
 
+def _unspell(name):
+    """People spell a name out to make sure it is heard: "hall h a l l".
+    Live, that went on the map as the room "hall h a l l". Three or more
+    single letters are a spelling: dropped when the word is also there, or
+    joined into the word when only the letters were said ("k i t c h e n")."""
+    words = name.split()
+    single = [w for w in words if len(w) == 1 and w.isalpha()]
+    if len(single) < 3:
+        return name
+    rest = [w for w in words if not (len(w) == 1 and w.isalpha())]
+    return " ".join(rest) if rest else "".join(single)
+
+
 def _parse_room_answer(text):
     """"the kitchen" / "it's the living room" / "don't know" -> name, "" for
     a skip, None if it does not sound like an answer."""
@@ -206,7 +229,7 @@ def _parse_room_answer(text):
     if not s or _SKIP.search(s) or _NO.fullmatch(s) or _YES.fullmatch(s):
         return "" if s else None
     s = re.sub(r"^(?:it'?s|it is|this is|that'?s|you'?re in|you are in|we'?re in|we are in)\s+", "", s)
-    s = re.sub(r"^(?:the|my|our|a)\s+", "", s).strip()
+    s = _unspell(re.sub(r"^(?:the|my|our|a)\s+", "", s).strip())
     return s if 0 < len(s.split()) <= 4 else None
 
 
@@ -216,7 +239,7 @@ def _room_name(text):
     m = _ROOM_HERE.match(_clean_answer(text))
     if not m:
         return None
-    name = (m.group("name") or m.group("name2") or m.group("name3") or "").strip()
+    name = _unspell((m.group("name") or m.group("name2") or m.group("name3") or "").strip())
     if name and any(w in name.split() or name.endswith(w) for w in _ROOM_WORDS):
         return name
     return None
@@ -229,6 +252,11 @@ def _fast_command(text):
         return "save_place", {"name": room}
     s = re.sub(r"[^\w\s]", " ", text.lower())
     s = " ".join(_FILLER.sub(" ", s).split())
+    m = re.fullmatch(r"(?:drive|do|run|follow|take|start)(?: the| my)? (?P<name>[\w ]{1,30}?) (?P<kind>route|patrol)"
+                     r"(?P<loop> (?:again and again|on loop|in loop|in a loop|round and round|forever))?",
+                     " ".join(re.sub(r"[^\w\s]", " ", text.lower()).split()))
+    if m:
+        return "drive_route", {"name": m.group("name"), "loop": bool(m.group("loop"))}
     if not s or len(s.split()) > 5:
         return None
     for rx, name, args in _FAST:
@@ -271,8 +299,11 @@ TOOLS = [
     {"name": "save_place", "description": "Remember the spot you are on now under a name.",
      "parameters": {"type": "object", "properties": {"name": {"type": "string"}},
                     "required": ["name"]}},
-    {"name": "go_to_place", "description": "Drive by yourself to a saved place.",
+    {"name": "go_to_place", "description": "Drive by yourself to a saved place or map marker (e.g. hall, marker 2). name=home goes back to where the map started.",
      "parameters": {"type": "object", "properties": {"name": {"type": "string"}},
+                    "required": ["name"]}},
+    {"name": "drive_route", "description": "Drive a route drawn on the map, point by point. loop=true to repeat until told to stop.",
+     "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "loop": {"type": "boolean"}},
                     "required": ["name"]}},
     {"name": "mapping", "description": "Start or stop exploring the room by yourself to build the map.",
      "parameters": {"type": "object", "properties": {
@@ -282,6 +313,10 @@ TOOLS = [
      "parameters": {"type": "object", "properties": {
          "action": {"type": "string", "enum": ["start", "stop"]}},
          "required": ["action"]}},
+    {"name": "new_map", "description": "Clear the old map and make a new one of the whole house. Only when the person clearly asks for a new or fresh map.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "restore_settings", "description": "Put the tuning settings back to the known-good values. Use when asked to reset or restore settings.",
+     "parameters": {"type": "object", "properties": {}}},
     {"name": "save_map", "description": "Save the map built so far.",
      "parameters": {"type": "object", "properties": {}}},
     {"name": "take_photo", "description": "Save a camera picture for the person to see later.",
@@ -289,7 +324,8 @@ TOOLS = [
 ]
 
 # Tools whose result text is already the spoken answer — see _quick_reply.
-SPOKEN_RESULTS = ("music", "volume", "save_place", "mapping", "save_map", "take_photo", "follow")
+SPOKEN_RESULTS = ("music", "volume", "save_place", "mapping", "save_map", "take_photo", "follow",
+                  "new_map", "restore_settings", "go_to_place", "drive_route")
 
 
 def _system_prompt(voice_id, can_see):
@@ -760,7 +796,7 @@ class Brain:
         if not rs or time.monotonic() - rs["t"] > ROOM_FIX_S:
             return None
         s = _clean_answer(text)
-        m = _NO.match(s) or re.match(r"^wrong", s)
+        m = _NO.match(s) or re.match(r"^wrong\b", s)
         if not m:
             return None
         self._room_said = None
@@ -774,6 +810,7 @@ class Brain:
         return ""                       # handled; _ask has already spoken"
 
     def _respond(self, text):
+        self._said = text or ""              # what the person said, for tool safety checks
         try:
             fixed = self._fix_room(text)
         except Exception:                                      # noqa: BLE001
@@ -1008,6 +1045,19 @@ class Brain:
                 return self.api.follow(args.get("action", "")), None, None
             if name == "save_map":
                 return self.api.save_map(), None, None
+            if name == "drive_route":
+                return self.api.drive_route(args.get("name", ""), bool(args.get("loop"))), None, None
+            if name == "new_map":
+                # Clearing the map deletes the named rooms. Only when the
+                # person said so: live, "start mapping the whole house and
+                # map everything" made the model pick new_map, and the rooms
+                # named ten minutes earlier were gone. Otherwise: map more.
+                if not re.search(r"\b(new|fresh|clear|reset|delete|erase|scratch|again|wipe|forget)\b",
+                                 getattr(self, "_said", "").lower()):
+                    return self.api.explore("start"), None, None
+                return self.api.new_map(), None, None
+            if name == "restore_settings":
+                return self.api.restore_settings(), None, None
             if name == "take_photo":
                 return self.api.take_photo(), None, None
             return f"unknown tool {name}", None, None

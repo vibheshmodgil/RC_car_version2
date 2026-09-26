@@ -922,6 +922,97 @@ class Slam:
         self.fixes = getattr(self, "fixes", 0) + 1
         return self.pose
 
+    # --- finding itself on a saved map ------------------------------------------
+
+    def relocalize(self, points, step_mm=150.0, ang_deg=5.0, occ=0.5):
+        """Where is the truck on the loaded map? Tries every confidently-free
+        spot (every step_mm) at every heading (every ang_deg) with ONE scan,
+        then refines the best. Does not move the pose - returns a report and
+        the caller decides (see adopt()).
+
+        Why: a saved map resumes at the pose it was switched off at. Carried
+        somewhere else before switching on - or restarted after a drive that
+        was never autosaved - the truck believes it is somewhere it is not,
+        the local matcher (a few hundred mm of search) cannot find the truth,
+        and everything mapped from then on goes in the wrong place.
+
+        Score = share of scan points that land on occupied cells. The report
+        says whether the answer is unique: a second, different pose scoring
+        nearly as well (a symmetric room) means the scan cannot tell them apart.
+        """
+        pts = scan_to_robot(points, off_x=self.matcher.off[0], off_y=self.matcher.off[1],
+                            yaw_off=self.matcher.off[2])
+        if len(pts) < 30 or self.grid.hits == 0:
+            return {"ok": False, "why": "not enough scan or no map"}
+        P = np.array(pts[::max(1, len(pts) // 90)], dtype=np.float32)       # ~90 points
+        g = self.grid.array()
+        occ_map = g > occ
+        res, half, n = self.grid.res, self.grid.half, self.grid.n
+
+        def frac(xs, ys, ths):
+            """Score for each candidate (arrays of equal length)."""
+            c, s = np.cos(ths)[:, None], np.sin(ths)[:, None]
+            wx = xs[:, None] + P[None, :, 0] * c - P[None, :, 1] * s
+            wy = ys[:, None] + P[None, :, 0] * s + P[None, :, 1] * c
+            cx = np.floor(wx / res).astype(np.int32) + half
+            cy = np.floor(wy / res).astype(np.int32) + half
+            inside = (cx >= 0) & (cx < n) & (cy >= 0) & (cy < n)
+            hit = np.zeros(cx.shape, dtype=bool)
+            hit[inside] = occ_map[cy[inside], cx[inside]]
+            return hit.mean(axis=1)
+
+        # Candidate positions: free cells, on a step_mm lattice.
+        k = max(1, int(step_mm // res))
+        free = g[::k, ::k] < -1.0
+        rows, cols = np.nonzero(free)
+        cand_x = ((cols * k - half) * res + res / 2.0).astype(np.float32)
+        cand_y = ((rows * k - half) * res + res / 2.0).astype(np.float32)
+        if cand_x.size == 0:
+            return {"ok": False, "why": "no free space in the map"}
+        angs = np.radians(np.arange(0.0, 360.0, ang_deg)).astype(np.float32)
+        best = []                                     # (score, x, y, th) per heading
+        for a in angs:
+            sc = frac(cand_x, cand_y, np.full(cand_x.shape, a, dtype=np.float32))
+            order = np.argsort(sc)[-3:]
+            best += [(float(sc[i]), float(cand_x[i]), float(cand_y[i]), float(a)) for i in order]
+        best.sort(reverse=True)
+
+        def refine(x, y, th):
+            dx = np.arange(-step_mm, step_mm + 1, 25.0, dtype=np.float32)
+            da = np.radians(np.arange(-ang_deg, ang_deg + 0.1, 1.0)).astype(np.float32)
+            X, Y, A = np.meshgrid(x + dx, y + dx, th + da, indexing="ij")
+            sc = frac(X.ravel(), Y.ravel(), A.ravel())
+            i = int(np.argmax(sc))
+            return float(sc[i]), float(X.ravel()[i]), float(Y.ravel()[i]), float(A.ravel()[i])
+
+        top = [refine(x, y, th) for _, x, y, th in best[:6]]
+        top.sort(reverse=True)
+        b = top[0]
+        # The best candidate that is really a different place.
+        rival = next((t for t in top[1:] + [(s, x, y, th) for s, x, y, th in best[6:40]]
+                      if math.hypot(t[1] - b[1], t[2] - b[2]) > 1000.0
+                      or abs(_wrap(t[3] - b[3])) > math.radians(30)), None)
+        here = float(frac(np.array([self.pose.x], np.float32), np.array([self.pose.y], np.float32),
+                          np.array([self.pose.th], np.float32))[0])
+        return {"ok": True, "score": round(b[0], 3), "x": round(b[1]), "y": round(b[2]),
+                "deg": round(math.degrees(b[3]) % 360, 1),
+                "rival": round(rival[0], 3) if rival else 0.0,
+                "here": round(here, 3),
+                "moved_mm": round(math.hypot(b[1] - self.pose.x, b[2] - self.pose.y)),
+                "candidates": int(cand_x.size) * len(angs)}
+
+    def adopt(self, x, y, th):
+        """Put the truck at (x, y, th) on the map: pose, odometry, and a fresh
+        baseline for encoders and IMU so nothing jumps on the next update."""
+        self.pose = Pose(x, y, th)
+        self.odom.pose = self.pose.copy()
+        self.odom._last_l = self.odom._last_r = None
+        self.odom._yaw0 = None
+        self._last_map_pose = None
+        self.trail.append((x, y))
+        self._loop_gen += 1
+        self._loop_done = None
+
     # --- persistence --------------------------------------------------------
     #
     # Without this the map dies with the process, and "go to the kitchen" is

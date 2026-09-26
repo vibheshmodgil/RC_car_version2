@@ -163,6 +163,9 @@ Speaker_truck/
 │   ├── marker_test.py    # print tags, check detection range
 │   ├── cliff.py          # camera floor check — no longer used by the guard
 │   ├── tuning.py         # registry of every live-tunable value
+│   ├── check_files.py    # read-only health check on the Pi: damaged code files, SD card space and errors
+│   ├── cues.py           # truck sounds: reverse alarm, follow locked/lost/found, arrived, guard bonk
+│   ├── cues.json         # truck sounds on/off — Pi-side
 │   ├── sysstats.py       # task-manager numbers from /proc — Pi System tab + PC containers
 │   ├── calibrate.py      # measure scanner yaw + odometry scale by pushing
 │   ├── detect.py         # YOLOv8n furniture labels pinned to the map
@@ -174,6 +177,9 @@ Speaker_truck/
 │   ├── captures/         # stills saved from the camera — never synced back
 │   ├── marker_map.json   # learned tag positions — Pi-side, never synced
 │   ├── tuning.json       # values saved from the Tune tab — Pi-side
+│   ├── tuning_good.default.json # known-good tuning (house mapped cleanly with it) — in the repo
+│   ├── routes.json       # routes drawn on the map — Pi-side, cleared with the map
+│   ├── tuning_good.json  # "Save as known-good" from the Tune tab — Pi-side, wins over the default
 │   ├── uploads/          # songs uploaded from the Audio tab — Pi-side
 │   ├── audio.json        # speaker device, volume, play mode — Pi-side
 │   ├── voices/           # Piper voice models, ~60 MB each — Pi-side, never synced

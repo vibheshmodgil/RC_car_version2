@@ -141,6 +141,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 INVERT_FILE = os.path.join(_HERE, "drive_invert.json")
 MAP_FILE = os.path.join(_HERE, "house_map.json")
 PLACES_FILE = os.path.join(_HERE, "places.json")
+ROUTES_FILE = os.path.join(_HERE, "routes.json")
 LIDAR_CAL_FILE = os.path.join(_HERE, "lidar_cal.json")
 
 
@@ -894,14 +895,67 @@ class SlamRunner:
             self.map_note = f"saved map not loaded: {e}"
             return
         self._saved_scans = self.slam.scans
-        self.map_note = (f"resumed saved map ({blob.get('scans', 0)} scans). Start the truck "
-                         "where it was switched off, or press Reset map.")
+        self.map_note = (f"resumed saved map ({blob.get('scans', 0)} scans) - finding where "
+                         "the truck is on it...")
+        threading.Thread(target=self._reloc_at_start, daemon=True, name="relocalize").start()
+
+    def _reloc_at_start(self):
+        """Once the LiDAR has a full scan, find the truck on the resumed map.
+        Live, a restart left it believing it was 1.7 m and 20 degrees from
+        where it stood - 11 % of the scan on walls there, 74 % at the true spot."""
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 20.0:
+            if len(self.lidar.scan() or []) >= 150:
+                break
+            time.sleep(0.5)
+        time.sleep(1.0)
+        self.relocalize()
+
+    # A found pose is taken only when it is clearly right: this share of the
+    # scan on walls, clearly better than where it thought it was, and clearly
+    # better than any other place in the house.
+    RELOC_MIN = 0.45
+    RELOC_GAIN = 0.15
+    RELOC_UNIQUE = 0.85
+
+    def relocalize(self, force=False):
+        """Find the truck on the map from one scan (Slam.relocalize) and move
+        it there if the answer is clear. force=True takes the best guess."""
+        if getattr(self, "_reloc_busy", False):
+            return {"ok": False, "why": "already searching"}
+        self._reloc_busy = True                    # SLAM holds off meanwhile
+        try:
+            r = self.slam.relocalize(self.lidar.scan() or [])
+            if not r.get("ok"):
+                self.map_note = "could not look for the truck on the map: " + r.get("why", "")
+                r["adopted"] = False
+            elif r["here"] >= r["score"] - 0.05 or (
+                    r["moved_mm"] < 300 and abs(((r["deg"] - math.degrees(self.slam.pose.th)) + 180) % 360 - 180) < 10):
+                # Same place (live: found 0 mm away, 1 degree off, scoring
+                # 0.75 against 0.70 - the refine step, not a different place).
+                r["adopted"] = False
+                r["verdict"] = "already in the right place"
+            elif force or (r["score"] >= self.RELOC_MIN and r["score"] >= r["here"] + self.RELOC_GAIN
+                           and r["rival"] < self.RELOC_UNIQUE * r["score"]):
+                self.slam.adopt(r["x"], r["y"], math.radians(r["deg"]))
+                r["adopted"] = True
+                r["verdict"] = "found - moved %.1f m to where the scan fits" % (r["moved_mm"] / 1000.0)
+            else:
+                r["adopted"] = False
+                r["verdict"] = ("not sure where I am (best %.0f %% of the scan on walls, next-best place %.0f %%)"
+                                " - drive a little and press Find me again" % (100 * r["score"], 100 * r["rival"]))
+            if r.get("verdict"):
+                self.map_note = "position: " + r["verdict"]
+            self.reloc = r
+            return r
+        finally:
+            self._reloc_busy = False
 
     def _run(self):
         period = 1.0 / self._hz
         while True:
             time.sleep(period)
-            if not self.enabled:
+            if not self.enabled or getattr(self, "_reloc_busy", False):
                 continue
             try:
                 pts = self.lidar.scan()
@@ -1231,9 +1285,29 @@ class Guard:
     def apply(self, throttle, steer, lidar, auto=False):
         """The command the motors may have. Also kept as self.out, so the
         explorer can tell "refused outright" from "turn dropped, still
-        moving" - the reason text alone cannot."""
+        moving" - the reason text alone cannot.
+
+        The answer depends only on the command and the scan, so the same
+        command against the same scan is not worked out again. The control
+        loop asks 50 times a second and the LiDAR changes 11 times: live, the
+        repeats were a quarter of a core of pure Python, and every one held
+        the interpreter while the person tracker waited - frames took up to
+        2 s to fetch and following ran at 1.6 detections a second. Kept at
+        most CACHE_S, so a retune or a scan going stale still takes effect
+        within a tenth of a second."""
+        now = time.monotonic()
+        key = (round(throttle, 3), round(steer, 3), bool(auto), self.enabled,
+               getattr(lidar, "_scan_time", None))
+        c = getattr(self, "_cache", None)
+        if c is not None and c[0] == key and now - c[1] < self.CACHE_S:
+            self.blocked, self.reason, self.creeping = c[3], c[4], c[5]
+            self.out = c[2]
+            return self.out
         self.out = self._apply(throttle, steer, lidar, auto)
+        self._cache = (key, now, self.out, self.blocked, self.reason, self.creeping)
         return self.out
+
+    CACHE_S = 0.1
 
     def _apply(self, throttle, steer, lidar, auto=False):
         self.blocked, self.reason = False, ""
@@ -1337,10 +1411,12 @@ def control_loop():
         th, st, ts, source = intent.get()
         if time.monotonic() - ts > WATCHDOG_S:
             th = st = 0.0                       # deadman: intent went stale
+        th_in, st_in = th, st
         try:
             th, st = guard.apply(th, st, lidar, auto=(source in ("explore", "follow")))
         except Exception:                                     # noqa: BLE001
             th = st = 0.0
+        drive_now[:] = [th_in, st_in, th, st, source]         # for the truck sounds (cues.py)
         # Only touch the GPIO when something actually changed. Rewriting the
         # same PWM value 50 times a second is pure contention.
         cur = (round(th, 3), round(st, 3))
@@ -1364,6 +1440,8 @@ http_port = HTTP_PORT
 markers = cliff = detector = None
 intent = Intent()
 guard = Guard()
+cues = None
+drive_now = [0.0, 0.0, 0.0, 0.0, "idle"]    # asked throttle/steer, after the guard, source
 from calibrate import PushMeasure  # noqa: E402
 pusher = PushMeasure()
 import sysstats  # noqa: E402
@@ -1482,6 +1560,148 @@ class SysMonitor:
 
 
 sysmon = SysMonitor()
+
+
+def find_place(name, places):
+    """The saved name meant by `name`, or None. "the hall", "Hall", "hall."
+    and "the kitchen" (saved as "kitchen entrance") all find their place.
+    Live, "go to the hall" through the assistant failed because the model
+    passed a name that was not character-for-character the saved one."""
+    import difflib                                            # noqa: PLC0415
+    import re                                                 # noqa: PLC0415
+
+    def norm(s):
+        s = re.sub(r"[^\w\s]", " ", str(s).lower())
+        s = re.sub(r"\b(the|my|our|a|an|to|number|no)\b", " ", s)
+        nums = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6",
+                "seven": "7", "eight": "8", "nine": "9", "ten": "10", "first": "1",
+                "second": "2", "third": "3"}
+        return " ".join(nums.get(w, w) for w in s.split())
+
+    if not name or not places:
+        return None
+    if name in places:
+        return name
+    want = norm(name)
+    keys = {k: norm(k) for k in places}
+    for k, v in keys.items():                                 # same words ("bed room" = "bedroom")
+        if v == want or v.replace(" ", "") == want.replace(" ", ""):
+            return k
+    for k, v in keys.items():                                 # "kitchen" -> "kitchen entrance"
+        if want and (v.startswith(want + " ") or want in v.split()):
+            return k
+    close = difflib.get_close_matches(want, list(keys.values()), n=1, cutoff=0.75)
+    if close:
+        return next(k for k, v in keys.items() if v == close[0])
+    return None
+
+
+def _means_home(name):
+    import re                                                 # noqa: PLC0415
+    s = " ".join(re.sub(r"[^\w\s]", " ", str(name).lower()).split())
+    return bool(re.search(r"\b(home|base|start|starting (point|position|place)|initial (point|position|place)"
+                          r"|original (point|position|place)|where (you|we|it) started|beginning)\b", s))
+
+
+def load_routes():
+    """Drawn routes: {"patrol": [[x, y], ...], ...} - world mm, this map's frame."""
+    try:
+        with open(ROUTES_FILE) as f:
+            d = json.load(f)
+        return {str(k): [[float(p[0]), float(p[1])] for p in v] for k, v in d.items()}
+    except (OSError, ValueError, TypeError, KeyError, IndexError):
+        return {}
+
+
+def save_routes(d):
+    try:
+        tmp = ROUTES_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=1)
+        os.replace(tmp, ROUTES_FILE)
+        return True
+    except OSError:
+        return False
+
+
+class RouteRunner:
+    """Drive a drawn route: one explorer.goto per waypoint, in order, each
+    with the normal planner, guard and obstacle handling - a waypoint is
+    "go through here", not "drive this exact line".
+
+    Ends when the last point is reached (or starts over, with loop), when a
+    waypoint cannot be reached, or when anything else takes the explorer -
+    Stop, Cancel trip, a click on "Go here", mapping, follow mode. It never
+    needs telling: it sees the explorer is no longer on its waypoint.
+    """
+
+    def __init__(self):
+        self.running = False
+        self.name = ""
+        self.points = []
+        self.i = 0
+        self.loop = False
+        self.laps = 0
+        self.message = ""
+        self._gen = 0
+        self._label = ""
+
+    def start(self, name, points, loop=False):
+        if not points:
+            raise ValueError("a route needs at least one point")
+        self._gen += 1
+        self.name, self.points, self.loop = name or "route", [tuple(p) for p in points], bool(loop)
+        self.i, self.laps, self.running = 0, 0, True
+        if follower is not None and follower.running:
+            follower.stop("driving a route")
+        robot.enable()
+        self._go()
+        threading.Thread(target=self._run, args=(self._gen,), daemon=True, name="route").start()
+
+    def _go(self):
+        x, y = self.points[self.i]
+        self._label = "%s, point %d of %d" % (self.name, self.i + 1, len(self.points))
+        self.message = "driving " + self._label
+        explorer.goto(x, y, self._label)
+
+    def _end(self, why):
+        self.running = False
+        self.message = why
+
+    def stop(self, why="route stopped"):
+        if self.running:
+            self._gen += 1
+            self._end(why)
+
+    def _run(self, gen):
+        while self.running and gen == self._gen:
+            time.sleep(0.3)
+            if gen != self._gen:
+                return
+            if explorer.goal_label != self._label:
+                return self._end("route stopped - the truck was sent somewhere else")
+            if explorer.running:
+                continue
+            if explorer.state == "done":
+                self.i += 1
+                if self.i >= len(self.points):
+                    if not self.loop:
+                        return self._end("route %s done" % self.name)
+                    self.i, self.laps = 0, self.laps + 1
+                self._go()
+            elif explorer.state == "failed":
+                return self._end("route stopped at point %d: %s" % (self.i + 1, explorer.message))
+            else:
+                return self._end("route cancelled")
+
+    @property
+    def status(self):
+        return {"running": self.running, "name": self.name, "point": self.i + 1,
+                "points": len(self.points), "loop": self.loop, "laps": self.laps,
+                "message": self.message}
+
+
+route = RouteRunner()
 
 
 PAGE = r"""<!DOCTYPE html>
@@ -2116,6 +2336,11 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
           <button onclick="beep('reverse')">Reverse</button>
           <button onclick="beep('alert')">Alert</button>
         </div>
+        <div class="tog" style="margin-top:8px"
+             title="Sounds when things happen: reversing, ENABLE, follow locked / lost / found, arrived, map done, guard refused">
+          <button id="t-cues" onclick="post('/cues', {enabled: !cuesOn})">Truck sounds</button>
+          <button id="t-cuerev" onclick="post('/cues', {reverse: !cueRevOn})">Reverse alarm</button>
+        </div>
         <div class="nowplay"><span class="eqbars" id="d-eq"><i></i><i></i><i></i></span><b id="d-now">Idle</b></div>
         <div class="transport">
           <button onclick="apost('/audio/skip',{back:true})" title="Previous song">&#9664;&#9664;</button>
@@ -2208,10 +2433,21 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
         <button class="chip" onclick="mapFit()">Fit</button>
         <button class="chip" id="m-follow" onclick="mapFollowToggle()">Follow truck</button>
         <button class="chip" id="m-person" onclick="togglePersonTrail()" title="Show or hide the followed person's trail">Person trail</button>
+        <button class="chip" id="m-route" onclick="routeMode(!routeDraw)"
+                title="Click points on the map, then save or drive the route">Draw route</button>
         <button class="chip" onclick="mapZoomBy(1.4)">+</button>
         <button class="chip" onclick="mapZoomBy(1/1.4)">&minus;</button>
         <span class="note" id="m-goal" style="margin:0"></span>
         <button class="chip" id="m-cancel" style="display:none" onclick="post('/goto',{stop:true})">Cancel trip</button>
+      </div>
+      <div class="viewbar" id="r-bar" style="display:none">
+        <span class="note" id="r-info" style="margin:0">click the map to add points</span>
+        <button class="chip" onclick="routeUndo()">Undo</button>
+        <input type="text" id="r-name" maxlength="40" placeholder="route name, e.g. patrol" style="width:150px">
+        <button class="chip" onclick="routeSave()">Save</button>
+        <button class="chip" onclick="routeDrive(false)">Drive it</button>
+        <button class="chip" onclick="routeDrive(true)">Loop</button>
+        <button class="chip" onclick="routeMode(false)">Done</button>
       </div>
       <div class="view">
         <canvas id="map"></canvas>
@@ -2247,6 +2483,9 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
         </div>
         <div class="tog">
           <button onclick="post('/slam',{reset:true})">Reset map</button>
+          <button onclick="findMe()" title="Match the LiDAR against the whole saved map and put the truck where it fits">Find me on map</button>
+          <button class="b-enable" onclick="freshMap()"
+                  title="Known-good settings, clear the map, and map the house from here">Fresh map</button>
           <button onclick="post('/map/save',{})">Save map</button>
           <button onclick="post('/map/load',{})">Load map</button>
         </div>
@@ -2321,6 +2560,8 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
       <div class="card">
         <h2>Places</h2>
         <div class="places" id="places"></div>
+        <h2 style="margin-top:10px">Routes</h2>
+        <div class="places" id="routes"></div>
         <div class="row2">
           <input type="text" id="pname" placeholder="name this spot, e.g. kitchen">
           <button onclick="savePlace()">Save here</button>
@@ -2877,6 +3118,9 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
 <div class="tabpanel" id="tab-tune">
   <div class="tuneact">
     <button class="b-enable" onclick="tuneSave()">Save to tuning.json</button>
+    <button class="b-enable" onclick="tuneGood('restore')"
+            title="Code defaults plus the measured values that mapped the house well (tuning_good.json)">Restore known-good</button>
+    <button onclick="tuneGood('save')" title="Make the current values the known-good set">Save as known-good</button>
     <button class="b-stop" onclick="tuneRevert()">Revert to code defaults</button>
     <button onclick="tuneDocs()">What do these do?</button>
     <span class="msg" id="tunemsg"></span>
@@ -3583,6 +3827,7 @@ function cmd(u){ fetch(u,{method:'POST'}).then(poll); }
 function post(u,b){ return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},
                                     body:JSON.stringify(b)}).then(poll); }
 function toggle(k){ post('/invert', {[k]: !$('t-'+k).classList.contains('on')}); }
+let cuesOn = true, cueRevOn = true;
 function toggleGuard(){ post('/guard', {enabled: !guardOn}); }
 
 // The <img> is created and destroyed rather than shown and hidden. An MJPEG
@@ -3821,6 +4066,60 @@ function refreshPlaces(){
 }
 setInterval(refreshPlaces, 4000); refreshPlaces();
 
+// ---- markers and routes --------------------------------------------------
+// A marker is a place named "marker N", so "go to marker 2" works by voice
+// exactly like a room. A route is a list of waypoints the truck drives in
+// order, each with the normal planner - "go through here", not a rail.
+let routeDraw = false, routePts = [], routesData = {}, routeNames = [], routeRun = null;
+function nextMarkerName(){
+  let n = 1;
+  while(('marker ' + n) in placesData) n++;
+  return 'marker ' + n;
+}
+function routeMode(on){
+  routeDraw = on;
+  if(on){ routePts = []; hideMapMenu(); }
+  $('r-bar').style.display = on ? '' : 'none';
+  $('m-route').classList.toggle('sel', on);
+  routeInfo(); drawMap();
+}
+function routeInfo(){
+  $('r-info').textContent = routePts.length
+    ? `${routePts.length} point${routePts.length > 1 ? 's' : ''} · ${(routeLen(routePts)/1000).toFixed(1)} m`
+    : 'click the map to add points';
+}
+function routeLen(pts){ let d = 0; for(let i = 1; i < pts.length; i++) d += Math.hypot(pts[i][0]-pts[i-1][0], pts[i][1]-pts[i-1][1]); return d; }
+function routeUndo(){ routePts.pop(); routeInfo(); drawMap(); }
+function routeSave(){
+  const n = $('r-name').value.trim();
+  if(!n){ flash('Give the route a name first.'); return; }
+  if(routePts.length < 1){ flash('Click the map to add points first.'); return; }
+  postJson('/routes', {name: n, points: routePts}).then(d => {
+    routesData = d.routes || {}; renderRoutes(); flash(`Route "${n}" saved - say "drive the ${n} route"`);
+  }).catch(() => flash('Could not reach the robot.'));
+}
+function routeDrive(loop){
+  if(!routePts.length){ flash('Click the map to add points first.'); return; }
+  const n = $('r-name').value.trim() || 'drawn route';
+  postJson('/route/go', {name: n, points: routePts, loop}).then(d => flash(d.error || d.message)).catch(() => {});
+}
+function goRoute(i, loop){ if(routeNames[i] != null) postJson('/route/go', {name: routeNames[i], loop}).then(d => flash(d.error || d.message)).catch(() => {}); }
+function delRoute(i){ if(routeNames[i] != null) postJson('/routes', {name: routeNames[i], delete: true}).then(d => { routesData = d.routes || {}; renderRoutes(); drawMap(); }).catch(() => {}); }
+function renderRoutes(){
+  routeNames = Object.keys(routesData);
+  $('routes').innerHTML = routeNames.length
+    ? routeNames.map((k, i) =>
+        `<span class="place">${escHtml(k)} <span class="note" style="margin:0">${routesData[k].length} pts</span>` +
+        `<button class="b-auto" onclick="goRoute(${i}, false)">Go</button>` +
+        `<button onclick="goRoute(${i}, true)" title="Drive it round and round until stopped">Loop</button>` +
+        `<button class="x" title="delete this route" onclick="delRoute(${i})">×</button></span>`).join('')
+    : '<span class="note">none yet - <b>Draw route</b> above the map</span>';
+}
+function refreshRoutes(){
+  fetch('/routes').then(r => r.json()).then(d => { routesData = d.routes || {}; routeRun = d.route; renderRoutes(); drawMap(); }).catch(() => {});
+}
+setInterval(refreshRoutes, 5000); refreshRoutes();
+
 // Send the truck somewhere: {name} for a room, {x, y, name} for a point.
 function goto(body){
   hideMapMenu();
@@ -4022,10 +4321,36 @@ function drawMap(){
     }
   }
 
-  // Room names, large and underneath like a floor plan.
+  // Routes: saved ones faint, the one driving bright, the one being drawn dashed.
+  const drawRoute = (pts, alpha, dash, label) => {
+    if(!pts || !pts.length) return;
+    g.strokeStyle = css('--warning'); g.fillStyle = css('--warning');
+    g.globalAlpha = alpha; g.lineWidth = 2.5; g.setLineDash(dash);
+    g.beginPath(); pts.forEach(([x, y], i) => i ? g.lineTo(X(x), Y(y)) : g.moveTo(X(x), Y(y))); g.stroke();
+    g.setLineDash([]); g.font = '600 10px system-ui,sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+    pts.forEach(([x, y], i) => {
+      g.beginPath(); g.arc(X(x), Y(y), 7, 0, 6.2832); g.fill();
+      g.fillStyle = '#111'; g.fillText(String(i + 1), X(x), Y(y) + .5); g.fillStyle = css('--warning');
+    });
+    if(label){ g.textBaseline = 'alphabetic'; g.fillText(label, X(pts[0][0]), Y(pts[0][1]) - 12); }
+    g.globalAlpha = 1; g.textBaseline = 'alphabetic';
+  };
+  const active = routeRun && routeRun.running ? routeRun.name : null;
+  Object.entries(routesData).forEach(([name, pts]) => drawRoute(pts, name === active ? .95 : .35, [], name));
+  if(routeDraw) drawRoute(routePts, .95, [7, 5], '');
+
+  // Room names, large and underneath like a floor plan. Markers as pins.
   g.font = '600 13px system-ui,sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
   g.fillStyle = css('--text-1') || '#ddd'; g.globalAlpha = .8;
-  Object.entries(placesData).forEach(([name, [x, y]]) => g.fillText(name, X(x), Y(y)));
+  Object.entries(placesData).forEach(([name, [x, y]]) => {
+    if(/^marker \d+$/.test(name)){
+      g.globalAlpha = 1; g.fillStyle = css('--critical');
+      g.beginPath(); g.arc(X(x), Y(y) - 9, 6, 0, 6.2832); g.fill();
+      g.beginPath(); g.moveTo(X(x) - 5, Y(y) - 6); g.lineTo(X(x), Y(y)); g.lineTo(X(x) + 5, Y(y) - 6); g.fill();
+      g.font = '600 11px system-ui,sans-serif'; g.fillText(name.replace('marker ', 'M'), X(x), Y(y) - 21);
+      g.font = '600 13px system-ui,sans-serif'; g.fillStyle = css('--text-1') || '#ddd'; g.globalAlpha = .8;
+    } else g.fillText(name, X(x), Y(y));
+  });
   g.globalAlpha = 1; g.textBaseline = 'alphabetic';
 
   // Known markers. Squares, because they are squares.
@@ -4130,6 +4455,7 @@ function hideMapMenu(){ const mm_ = $('m-menu'); if(mm_) mm_.style.display = 'no
 // A click: a photo pin opens the photo; an object or an empty spot opens a
 // small menu. Nothing moves until a menu item is chosen.
 function mapClick(sx, sy){
+  if(routeDraw){ const [wx, wy] = mapToWorld(sx, sy); routePts.push([wx, wy]); routeInfo(); drawMap(); return; }
   let best = null, bd = 12;
   mapHit.forEach(hh => {
     const d = Math.hypot(hh.x - sx, hh.y - sy);
@@ -4153,6 +4479,7 @@ function mapClick(sx, sy){
     menu.innerHTML =
       `<div class="mm-t">${(wx/1000).toFixed(1)}, ${(wy/1000).toFixed(1)} m</div>`
       + `<button data-a="go" class="b-auto">Go here · ${dist}</button>`
+      + `<button data-a="marker">Drop marker here</button>`
       + `<div class="mm-row"><input type="text" maxlength="40" placeholder="name this room">`
       + `<button data-a="name">Save</button></div>`
       + `<button data-a="close">Cancel</button>`;
@@ -4176,6 +4503,10 @@ function mapClick(sx, sy){
     const a = b.dataset.a;
     if(a === 'go') goto({x: wx, y: wy, name: best ? (objNames[best.i] || best.o.label) : ''});
     else if(a === 'name') nameIt();
+    else if(a === 'marker'){
+      postJson('/places', {name: nextMarkerName(), x: wx, y: wy}).then(refreshPlaces).catch(() => {});
+      hideMapMenu();
+    }
     else if(a === 'rename'){ showTab('map'); renameObj(best.i); }
     else if(a === 'remove') removeObj(best.i);
     else hideMapMenu();
@@ -4255,6 +4586,13 @@ function poll(){
     $('lr').textContent = m.left_rpm.toFixed(1);
     $('rr').textContent = m.right_rpm.toFixed(1);
     for(const k of ['left','right','swap']) $('t-'+k).classList.toggle('on', !!m.invert[k]);
+    if(d.cues){
+      cuesOn = d.cues.enabled; cueRevOn = d.cues.reverse;
+      $('t-cues').className = cuesOn ? 'g-on' : '';
+      $('t-cues').textContent = 'Truck sounds ' + (cuesOn ? 'ON' : 'OFF');
+      $('t-cuerev').className = cuesOn && cueRevOn ? 'g-on' : '';
+      $('t-cuerev').textContent = 'Reverse alarm ' + (cueRevOn ? 'ON' : 'OFF');
+    }
     guardOn = gd.enabled; stopMm = gd.stop_mm;
     $('t-guard').className = guardOn ? 'g-on' : '';
     $('t-guard').textContent = guardOn ? 'Guard ON' : 'Guard OFF';
@@ -4358,7 +4696,9 @@ function poll(){
     exPath = ex.running ? (ex.path_mm || []) : [];
     $('m-cancel').style.display = trip ? '' : 'none';
     $('m-goal').textContent = trip ? '→ ' + ex.goal + ' · ' + (ex.message || '')
-      : (['done', 'failed'].includes(ex.state) ? ex.message : '');
+      : (d.route && d.route.message && !d.route.running ? d.route.message
+         : (['done', 'failed'].includes(ex.state) ? ex.message : ''));
+    routeRun = d.route || routeRun;
     const cr = ex.cal_results || {}, cn = ex.cal_notes || [];
     if(Object.keys(cr).length || cn.length){
       $('calbox').style.display = 'block';
@@ -4835,6 +5175,34 @@ function flash(msg){
   el.classList.add('show');
   clearTimeout(flash._t);
   flash._t = setTimeout(() => el.classList.remove('show'), 3000);
+}
+
+function tuneGood(action){
+  fetch('/tuning', {method:'POST', headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({good: action})})
+    .then(r => r.json()).then(d => {
+      const msg = action === 'save'
+        ? `known-good set saved (${Object.keys(d.good || {}).length} values differ from defaults)`
+        : 'known-good settings restored, and saved';
+      $('tunemsg').textContent = msg;
+      renderTune(d.snapshot);
+      flash(msg);
+    })
+    .catch(() => flash('Could not reach the robot.'));
+}
+
+function findMe(){
+  flash('Looking for the truck on the map...');
+  postJson('/slam', {relocalize: true}).then(d => {
+    const r = d.relocalize || {};
+    flash(r.verdict || r.why || 'done'); drawMap();
+  }).catch(() => flash('Could not reach the robot.'));
+}
+
+function freshMap(){
+  if(!confirm('Clear the map, rooms and objects, restore known-good settings, and map the house again?')) return;
+  fetch('/fresh_map', {method:'POST'}).then(r => r.json())
+    .then(d => flash(d.message || 'done')).catch(() => flash('Could not reach the robot.'));
 }
 
 function tuneRevert(){
@@ -5363,6 +5731,17 @@ def index():
 _last_survey = [0.0]
 
 
+@app.route("/cues", methods=["GET", "POST"])
+def cues_route():
+    """Truck sounds on/off: {enabled: bool, reverse: bool} (cues.py)."""
+    if cues is None:
+        return jsonify(ok=False, error="not started"), 503
+    if request.method == "POST":
+        d = request.get_json(silent=True) or {}
+        return jsonify(ok=True, **cues.set(d.get("enabled"), d.get("reverse")))
+    return jsonify(ok=True, **cues.state)
+
+
 @app.route("/sys")
 def sys_stats():
     """The System tab's numbers (SysMonitor). The first call after the tab
@@ -5370,8 +5749,30 @@ def sys_stats():
     return jsonify(sysmon.snapshot())
 
 
+_state_cache = [0.0, None]
+_state_lock = threading.Lock()
+
+
 @app.route("/state")
 def state():
+    """Built at most every STATE_CACHE_S, however many are asking. The page
+    polls at ~7 Hz; a second tab, a phone and a PC-side logger each used to
+    cost a full rebuild (point cloud, clusters, every subsystem's state) -
+    with Python able to run one thread at a time, that CPU came straight out
+    of the person tracker and SLAM."""
+    with _state_lock:
+        now = time.monotonic()
+        if _state_cache[1] is None or now - _state_cache[0] > STATE_CACHE_S:
+            _state_cache[1] = _state_build().get_data()
+            _state_cache[0] = now
+        body = _state_cache[1]
+    return Response(body, mimetype="application/json")
+
+
+STATE_CACHE_S = 0.12
+
+
+def _state_build():
     # The page polls this at ~7 Hz. Surveying sweeps ~200 points three times,
     # which is wasted work at that rate and steals CPU from the SLAM thread.
     now = time.monotonic()
@@ -5410,6 +5811,8 @@ def state():
         detect=detector.state,
         person=tracker.state,
         follow=follower.status if follower is not None else None,
+        cues=cues.state if cues is not None else None,
+        route=route.status,
         audio=speaker.brief if speaker else None,
         display=screen.state if screen else None,
         tts=talker.brief if talker else None,
@@ -5609,12 +6012,17 @@ def tuning_set():
     """
     d = request.get_json(force=True, silent=True) or {}
     done = {}
-    if d.get("revert"):
+    if d.get("good") == "restore":
+        done = tuning.restore_good()["applied"]
+    elif d.get("good") == "save":
+        good = tuning.save_good()
+        return jsonify(ok=True, good=good, snapshot=tuning.snapshot())
+    elif d.get("revert"):
         done = tuning.revert()
     else:
         done = tuning.apply(d.get("values") or {})
     saved = None
-    if d.get("save") or d.get("revert"):
+    if d.get("save") or d.get("revert") or d.get("good"):
         saved = tuning.save()
     elif done:
         _autosave_tuning()
@@ -5766,26 +6174,55 @@ def cliff_ctl():
     return jsonify(ok=True, enabled=False, removed=True)
 
 
+def _reset_map():
+    explorer.stop("map reset")          # its path is in the old frame
+    if follower is not None:
+        follower.forget("map reset")    # the person's trail is in the old frame too
+    slam.slam.reset()
+    # Everything else pinned in the old map's coordinates goes with it:
+    # objects and rooms would float over walls that no longer exist.
+    detector.map.forget()
+    detector.map.save()
+    save_places({})
+    route.stop("map reset")
+    save_routes({})                     # drawn in the old map's frame
+    # And the autosave, or the next boot would resume the old map.
+    try:
+        os.remove(MAP_FILE)
+    except OSError:
+        pass
+    slam._saved_scans = 0
+    slam.map_note = "map reset · objects and rooms cleared"
+
+
+@app.route("/fresh_map", methods=["POST"])
+def fresh_map():
+    """One button (or "make a new map" to the assistant): known-good tuning,
+    empty map, auto-map from here. The voice assistant then asks the room
+    names as it goes. Starting needs a person to have pressed ENABLE already
+    - a voice command must never be what arms the motors."""
+    good = tuning.restore_good()
+    _reset_map()
+    if not robot._enabled:
+        return jsonify(ok=True, started=False, settings=good["source"],
+                       message="Settings restored and map cleared. Press ENABLE, then start auto-map.")
+    if follower is not None and follower.running:
+        follower.stop("mapping started")
+    explorer.start(calibrate=True)
+    return jsonify(ok=True, started=True, settings=good["source"],
+                   message="Settings restored, map cleared, mapping the house.")
+
+
 @app.route("/slam", methods=["POST"])
 def slam_ctl():
     d = request.get_json(force=True, silent=True) or {}
     if d.get("reset"):
-        explorer.stop("map reset")          # its path is in the old frame
-        if follower is not None:
-            follower.forget("map reset")    # the person's trail is in the old frame too
-        slam.slam.reset()
-        # Everything else pinned in the old map's coordinates goes with it:
-        # objects and rooms would float over walls that no longer exist.
-        detector.map.forget()
-        detector.map.save()
-        save_places({})
-        # And the autosave, or the next boot would resume the old map.
-        try:
-            os.remove(MAP_FILE)
-        except OSError:
-            pass
-        slam._saved_scans = 0
-        slam.map_note = "map reset · objects and rooms cleared"
+        _reset_map()
+    if d.get("relocalize"):
+        r = slam.relocalize(force=bool(d.get("force")))
+        st = dict(slam.state)
+        st["relocalize"] = r
+        return jsonify(st)
     if "enabled" in d:
         slam.enabled = bool(d["enabled"])
     if "matching" in d:
@@ -5817,6 +6254,46 @@ def places_ctl():
     return jsonify(places=places, pose=slam.slam.pose.as_dict())
 
 
+@app.route("/routes", methods=["GET", "POST"])
+def routes_ctl():
+    """List, save or delete drawn routes: {name, points: [[x, y], ...]} saves,
+    {name, delete: true} deletes."""
+    routes = load_routes()
+    if request.method == "POST":
+        d = request.get_json(force=True, silent=True) or {}
+        name = (d.get("name") or "").strip()[:40]
+        if d.get("delete") and name:
+            routes.pop(find_place(name, routes) or name, None)
+        elif name and d.get("points"):
+            routes[name] = [[round(float(q[0]), 1), round(float(q[1]), 1)] for q in d["points"]][:100]
+        save_routes(routes)
+    return jsonify(routes=routes, route=route.status)
+
+
+@app.route("/route/go", methods=["POST"])
+def route_go():
+    """Drive a route: {name} for a saved one, or {points} for one just drawn;
+    {loop: true} goes round until stopped; {stop: true} stops."""
+    d = request.get_json(force=True, silent=True) or {}
+    if d.get("stop"):
+        route.stop()
+        explorer.stop("route stopped")
+        return jsonify(route.status)
+    routes = load_routes()
+    name = (d.get("name") or "").strip()
+    pts = d.get("points")
+    if not pts:
+        found = find_place(name, routes)
+        if not found:
+            return jsonify(error="unknown route: %r" % name, routes=sorted(routes)), 400
+        name, pts = found, routes[found]
+    try:
+        route.start(name or "drawn route", [(float(q[0]), float(q[1])) for q in pts], d.get("loop"))
+    except (ValueError, TypeError, IndexError) as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(route.status)
+
+
 @app.route("/goto", methods=["POST"])
 def goto_ctl():
     d = request.get_json(force=True, silent=True) or {}
@@ -5825,12 +6302,20 @@ def goto_ctl():
         return jsonify(explorer.status)
     name = (d.get("name") or "").strip()
     places = load_places()
-    if name and name in places:
+    found = find_place(name, places) if name and not ("x" in d and "y" in d) else None
+    if not found and name and _means_home(name):
+        # "Home" / "where you started" / "your initial position": the spot the
+        # map was started from, unless a place is saved under that name.
+        places = dict(places, home=[0.0, 0.0])
+        found = "home"
+    if found:
+        name = found
         x, y = places[name]
     elif "x" in d and "y" in d:
         x, y, name = float(d["x"]), float(d["y"]), name or "a point"
     else:
-        return jsonify(error="unknown place: %r" % name), 400
+        return jsonify(error="unknown place: %r" % name, places=sorted(places),
+                       routes=sorted(load_routes())), 400
     if follower is not None and follower.running:
         follower.stop("sent somewhere else")
     robot.enable()
@@ -6088,7 +6573,7 @@ def lan_ip():
 
 def main():
     global robot, lidar, imu, slam, explorer, camera, markers, cliff, detector
-    global speaker, screen, http_port, talker, ears, assistant, tracker, follower
+    global speaker, screen, http_port, talker, ears, assistant, tracker, follower, cues
     ap = argparse.ArgumentParser(description="drive + lidar + imu")
     ap.add_argument("-p", "--lidar-port", help="serial port (default: auto-detect)")
     ap.add_argument("-b", "--baud", type=int, default=LIDAR_BAUD)
@@ -6189,6 +6674,11 @@ def main():
     from follow import Follower                               # noqa: PLC0415
     follower = Follower(tracker, slam, lambda: body_points(lidar.scan()), guard,
                         lambda t, s: intent.set(t, s, "follow"), explorer, detector)
+    # Truck sounds: reverse alarm, follow locked / lost / found, arrived...
+    from cues import Cues                                     # noqa: PLC0415
+    cues = Cues(speaker, lambda: robot._enabled, lambda: tuple(drive_now),
+                lambda: (follower.state, follower.message),
+                lambda: (explorer.state, explorer.message, follower.running))
 
     # Hand the tuning registry the live objects it points at. After this,
     # every number in docs/TUNING.md is reachable from the Tune tab.

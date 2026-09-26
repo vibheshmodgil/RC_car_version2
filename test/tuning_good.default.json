@@ -1,0 +1,12 @@
+{
+ "version": 1,
+ "note": "Known-good tuning: the whole house mapped cleanly with these on 2026-09-26. Everything not listed is the code default. The Pi's own tuning_good.json (Save as known-good) takes precedence.",
+ "values": {
+  "truck_len": 250,
+  "truck_wid": 295,
+  "wheel_diam_mm": 70.5,
+  "track_mm": 510,
+  "lidar_yaw": 69,
+  "guard_stop_mm": 300
+ }
+}
