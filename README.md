@@ -12,20 +12,26 @@ from. No ROS, no build step - plain Python and one self-contained HTML page.
 
 | | |
 |---|---|
-| **SLAM** | Occupancy grid and scan matching, with match-confidence rejection and loop closure. Measured 82 mm final error over a 48 m circuit, against 844 mm before. |
-| **Autonomous mapping** | Frontier exploration with A* planning - a doorway *is* a frontier, so doors get found without being a special case. |
-| **Collision guard** | Footprint-aware and per-direction. Blocks only what is blocked, and can always creep out rather than wedging itself. |
-| **Cliff detection** | The camera sees the stair edge that a horizontal LiDAR cannot. |
+| **SLAM** | Occupancy grid and scan matching, with match-confidence rejection and loop closure (in the background, so it never stalls the pose). 30 m × 30 m map, saved every 20 s and resumed after a restart. |
+| **Autonomous mapping** | Frontier exploration with a clearance-aware A* planner. Looks around to start, makes room to turn in tight corners, and stops when the reachable house is mapped. |
+| **Click to go** | Click the map: *Go here*, or name the room. Named rooms get a **Go** button, and the voice assistant can drive to them. |
+| **Collision guard** | One rule: no LiDAR point may end up inside the truck's outline along the path a move really drives - straight, spin or arc. Drawn live: green is free floor, red is where the truck's centre cannot go. |
+| **Voice** | Speak into a phone; a free local model (Ollama on your PC) answers out loud and can drive, look, name rooms and go to them. |
 | **ArUco localisation** | Printed tags give an absolute position fix - the only input outside SLAM's closed loop. |
-| **Object labels** | Open-vocabulary detection pins "sofa", "wardrobe", "staircase" to the map. On the Pi, or off-board on a PC. |
-| **Live tuning** | 56 parameters adjustable while driving, each sitting next to the evidence you judge it by. |
+| **Object labels** | Open-vocabulary detection pins "sofa", "wardrobe", "chest of drawers" to the map, one object per spot, automatically - no questions asked. |
+| **Live tuning** | Every parameter adjustable while driving, saved to the SD card automatically. |
 | **Self-calibration** | Push the robot half a metre and it measures its own scanner rotation and odometry scale, with a residual. |
+
+The camera floor check (cliff detection) was **removed from driving**: with the
+camera tilt unmeasured it read walls as drop-offs and stalled the truck at
+random. **Nothing detects stair edges** - keep the truck away from stairs.
 
 ### The cockpit
 
-Five tabs over a status bar that never scrolls away - **Drive** (LiDAR plot,
-mounting, guard), **Map** (occupancy grid, SLAM tuning), **Sensors**,
-**Vision** (camera, floor check, markers, objects), **Tune**.
+Six tabs over a status bar that never scrolls away - **Drive** (LiDAR plot with
+the guard's red/green view, mounting), **Map** (zoomable map, click to go, rooms,
+objects, SLAM tuning), **Sensors**, **Vision** (camera, markers, objects,
+person), **Audio** (music, speech, voice assistant), **Tune**.
 
 **New here? This page is the whole path.** Fifteen minutes from a cold laptop
 to a moving robot. Everything else links out from the bottom.
@@ -114,18 +120,30 @@ You're ready when the prompt reads `(.venv) shiv@shiv:~/Desktop/Speaker_truck $`
 python test/web_nav.py
 ```
 
-Open `http://<pi-ip>:5004`, **click the page once** for keyboard focus, then
-arrow keys or WASD. Space is e-stop.
+With the PC helpers (faster speech, a bigger detection model, the voice
+assistant - see *Which file do I edit?* below):
 
-Five tabs: **Drive** (LiDAR plot, scanner mounting, guard), **Map** (occupancy
-grid, SLAM and odometry tuning), **Sensors** (IMU, LiDAR, encoders, camera),
-**Vision** (camera, floor check, markers), **Tune** (the full index of every
-tunable).
+```bash
+TRUCK_OLLAMA_URL=http://<pc-ip>:11434 python test/web_nav.py \
+  --tts-url http://<pc-ip>:5005 --detect-url http://<pc-ip>:8000/detect
+```
 
-**Tuning happens next to the thing it changes** — the vehicle footprint and
-mounting sliders sit beside the plot, matching sliders beside SLAM cpu, floor
-thresholds over the live picture. The Tune tab is the index and the Save/Revert button, not the place
-you work.
+Open `http://<pi-ip>:5004` (or `http://shiv.local:5004`), **click the page
+once** for keyboard focus, then arrow keys or WASD. Space is e-stop. Typing in
+a text box never drives.
+
+A typical session:
+
+1. **Reset map** (Map tab), then **ENABLE**.
+2. **START AUTO-MAP** - it maps the house on its own and stops when done. Answer
+   *"What room am I in?"* on the phone as it goes; say *"no, the hall"* within
+   20 s to correct a mishearing.
+3. **Click the map** to send it somewhere, or press **Go** on a room - or say
+   *"go to the kitchen"*.
+
+**Tuning happens next to the thing it changes** - the vehicle footprint and
+mounting sliders sit beside the plot, matching sliders beside SLAM cpu. Every
+change is saved automatically; the Tune tab is the index and the Revert button.
 
 Two constants can be **measured** rather than guessed: *Measure by pushing* on
 the Drive tab derives the scanner's true rotation and counts-per-rev from one
@@ -163,13 +181,17 @@ Full detail and what each result should look like: **[Start_pi.md](Start_pi.md)*
 | How SLAM behaves | **the Tune tab**, live — then Save. See [docs/TUNING.md](docs/TUNING.md) |
 | The cockpit page | `test/web_nav.py` (the `PAGE` string) |
 | Mapping / scan matching internals | `test/slam.py` |
-| Autonomous exploration | `test/explore.py` |
-| Camera, markers, cliff detection | `test/camera.py`, `test/markers.py`, `test/cliff.py` |
+| Autonomous exploration, click-to-go, path planning | `test/explore.py` |
+| The collision guard | `test/web_nav.py` - `swept_obstacle()` and `Guard` |
+| Camera, markers | `test/camera.py`, `test/markers.py` (`test/cliff.py` is no longer used for driving) |
 | The truck's status screen | `test/display.py` (`render_status`) — wiring in [WIRING.md §14](WIRING.md) |
 | Text to speech (voices, queue) | `test/tts.py` — Piper, `pip install "piper-tts>=1.3"` |
 | Speaker playback, beeps, the horn | `test/audio.py` — shared by `web_nav.py`, `web_dashboard.py`, `speaker_test.py` |
 | Object detection | `test/detect.py` — needs `yolov8n.onnx` in `test/` |
+| Person tracking (follow mode groundwork) | `test/person.py` — Vision tab → Person → Track person; the PC's `/person` model via the detection server |
 | Better detection, off-board | `tools/detect_server.py` — run it on your PC, paste the URL into the Objects panel |
+| Faster speech, off-board | `tools/tts_server.py` — the PC makes the audio (~0.1 s a sentence instead of 5–17 s), paste `http://<pc-ip>:5005` into the Speak card |
+| Run both PC helpers in Docker | `tools/docker-compose.yml` — `cd tools && docker compose up -d --build`; Ollama stays native on Windows |
 | Talking to the truck (it answers out loud) | `test/brain.py` — a free local model in Ollama on your PC; phone mic in `test/voice.py` — [Start_pi.md §5.12](Start_pi.md) |
 | What the AI can do to the truck (look, drive, horn…) | `test/truck_api.py` — shared by `brain.py` and `tools/truck_mcp.py` |
 
@@ -197,7 +219,8 @@ Details in [WIRING.md §8](WIRING.md).
 | Document | For |
 |---|---|
 | [Start_pi.md](Start_pi.md) | Full bring-up runbook and the test ladder |
-| [docs/TUNING.md](docs/TUNING.md) | Every variable that decides whether SLAM works |
+| [docs/CHANGES.md](docs/CHANGES.md) | What changed in the last round of testing, why, and how each fix was verified |
+| [docs/TUNING.md](docs/TUNING.md) | Every variable that decides whether SLAM, the guard and the explorer work |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the pieces fit, the coordinate frame, the thread model |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | When it doesn't work |
 | [WIRING.md](WIRING.md) | Authoritative hardware: power rails, every connection |

@@ -43,6 +43,16 @@ Streaming, and the latest click wins:
 Speech plays through audio.py as an interjection, like a beep: a song that
 is playing is held and resumes where it was when the speaking ends.
 
+Speaking from the PC
+--------------------
+With a speech server URL set (the Speak card, `--tts-url`, or TRUCK_TTS_URL)
+the worker sends the text to tools/tts_server.py on the PC and streams the PCM
+it returns into the same aplay pipe — tens of milliseconds a sentence instead
+of seconds, and no Pi CPU. Everything above (pieces, latest-wins, held songs)
+is unchanged: only where the PCM comes from differs. If the PC does not
+answer, the Pi synthesises for itself and tries the PC again after
+REMOTE_RETRY_S; local Piper is only ever loaded if that happens.
+
 Voices live in test/voices/ on the Pi — never synced, gitignored.
 """
 
@@ -51,11 +61,14 @@ import json
 import os
 import queue
 import re
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
 import wave
@@ -73,6 +86,10 @@ HISTORY = 12
 SYNTH_TIMEOUT_S = 120
 # Pieces longer than this are cut at a comma — see _pieces.
 PIECE_CHARS = 90
+# The PC speech server: how long to wait for it to accept a connection, and
+# how long the Pi speaks for itself after it did not, before asking again.
+REMOTE_CONNECT_S = 1.5
+REMOTE_RETRY_S = 30
 
 # Curated from the Piper voice list: the ones that sound good on a small
 # speaker. Any other Piper voice dropped into test/voices/ is picked up too.
@@ -193,6 +210,40 @@ def _chunks(voice, text, speed, volume):
             yield bytes(int(rate * 0.12) * 2), rate            # the comma we cut at
 
 
+def _remote_chunks(url, req):
+    """Open a stream from the PC's tts_server and return a generator of
+    (pcm, rate). Raises here, before any audio, if the PC is not there —
+    the caller then speaks locally instead.
+
+    The reachability check is a bare connect with a short timeout; the
+    request itself gets the long one, because the PC may be downloading or
+    loading the voice before it answers."""
+    parts = urllib.parse.urlsplit(url)
+    socket.create_connection((parts.hostname, parts.port or 80), REMOTE_CONNECT_S).close()
+    body = json.dumps({"voice": req.get("voice"), "text": req.get("text", ""),
+                       "speed": req.get("speed", 1.0), "volume": req.get("volume", 1.0),
+                       "warm": bool(req.get("warm"))}).encode()
+    try:
+        r = urllib.request.urlopen(urllib.request.Request(
+            url.rstrip("/") + "/say", body, {"Content-Type": "application/json"}),
+            timeout=SYNTH_TIMEOUT_S)
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("error") or f"HTTP {e.code}"
+        except ValueError:
+            msg = f"HTTP {e.code}"
+        raise OSError(msg) from None
+    rate = int(r.headers.get("X-Sample-Rate") or 22050)
+
+    def stream():
+        try:
+            while pcm := r.read1(1 << 15):   # whatever has arrived, not a full block
+                yield pcm, rate
+        finally:
+            r.close()                        # a cut-off sentence stops the PC too
+    return stream()
+
+
 def worker():
     """JSON lines in, JSON lines out, audio handed over as raw PCM files.
 
@@ -204,9 +255,19 @@ def worker():
         os.nice(10)
     except (AttributeError, OSError):
         pass
-    t_import = time.monotonic()
-    from piper import PiperVoice                               # noqa: PLC0415
-    import_ms = round((time.monotonic() - t_import) * 1000)
+    # Piper is imported on first local use: with the PC doing the speaking,
+    # the Pi never pays the import, the ~60 MB model, or its warm-up.
+    piper = {}
+
+    def piper_voice_cls():
+        if "cls" not in piper:
+            t_import = time.monotonic()
+            from piper import PiperVoice                       # noqa: PLC0415
+            piper["cls"] = PiperVoice
+            piper["import_ms"] = round((time.monotonic() - t_import) * 1000)
+        return piper["cls"]
+
+    remote_down = {"until": 0.0, "why": ""}
 
     jobs = queue.Queue()
     newest = [0]
@@ -236,26 +297,41 @@ def worker():
         rid = req.get("id")
         if req.get("stop") or rid != newest[0]:
             continue                     # superseded before it even started
+        source = None
         try:
-            model = req["model"]
-            fresh = model not in loaded
-            if fresh:
-                loaded.clear()           # one voice in memory: ~60-120 MB each
-                t_load = time.monotonic()
-                loaded[model] = PiperVoice.load(model)
-                load_ms = round((time.monotonic() - t_load) * 1000)
             warm = bool(req.get("warm"))
             text = "Ready." if warm else req["text"]
             t0, n = time.monotonic(), 0
+            url, fresh = req.get("url"), False
+            if url and time.monotonic() >= remote_down["until"]:
+                try:
+                    source = _remote_chunks(url, req)
+                    remote_down["why"] = ""
+                except (OSError, ValueError) as e:
+                    remote_down["until"] = time.monotonic() + REMOTE_RETRY_S
+                    remote_down["why"] = f"PC speech server not answering ({e}) — the Pi is speaking"
+            if url:
+                send({"id": rid, "engine": "pi" if source is None else "pc",
+                      "warn": remote_down["why"]})
+            if source is None:
+                model = req["model"]
+                fresh = model not in loaded
+                if fresh:
+                    cls = piper_voice_cls()
+                    loaded.clear()       # one voice in memory: ~60-120 MB each
+                    t_load = time.monotonic()
+                    loaded[model] = cls.load(model)
+                    load_ms = round((time.monotonic() - t_load) * 1000)
+                source = _chunks(loaded[model], text,
+                                 req.get("speed", 1.0), req.get("volume", 1.0))
             first_ms = None
-            for pcm, rate in _chunks(loaded[model], text,
-                                     req.get("speed", 1.0), req.get("volume", 1.0)):
+            for pcm, rate in source:
                 if first_ms is None:
                     first_ms = round((time.monotonic() - t0) * 1000)
                     if fresh:
                         # Where start-up time goes, once per model load —
                         # the first inference is the surprising one.
-                        send({"id": rid, "info": {"import_ms": import_ms, "load_ms": load_ms,
+                        send({"id": rid, "info": {"import_ms": piper["import_ms"], "load_ms": load_ms,
                                                   "first_inference_ms": first_ms}})
                 if newest[0] != rid:
                     break
@@ -270,6 +346,9 @@ def worker():
             send({"id": rid, "done": True, "chunks": n})
         except Exception as e:                                 # noqa: BLE001
             send({"id": rid, "error": f"{e.__class__.__name__}: {e}"})
+        finally:
+            if source is not None:
+                source.close()
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +372,9 @@ class Tts:
         self.first_sound_ms = None  # click -> first audio, last time it spoke
         self.startup = None         # worker timings from the last model load
         self.downloads = {}         # vid -> {"pct", "error", "stage", ...}
+        self.url = os.environ.get("TRUCK_TTS_URL", "").rstrip("/")   # PC speech server
+        self.engine = "pi"          # who made the last speech: "pc" or "pi"
+        self.remote_error = ""      # why the PC was not used, when it was set
         self._proc = None
         self._replies = queue.Queue()
         self._err = None
@@ -336,19 +418,31 @@ class Tts:
         self.speed = float(d.get("speed", self.speed))
         self.volume = float(d.get("volume", self.volume))
         self.history = [h for h in d.get("history", []) if isinstance(h, str)][:HISTORY]
+        self.url = d.get("url", self.url)
 
     def _save(self):
         try:
             with open(SETTINGS_FILE, "w") as f:
                 json.dump({"voice": self.voice, "speed": self.speed,
-                           "volume": self.volume, "history": self.history},
+                           "volume": self.volume, "history": self.history,
+                           "url": self.url},
                           f, indent=2)
         except OSError:
             pass
 
-    def set(self, voice=None, speed=None, volume=None):
+    def set(self, voice=None, speed=None, volume=None, url=None):
+        if url is not None:
+            url = url.strip().rstrip("/")
+            if url and not url.startswith(("http://", "https://")):
+                raise ValueError("speech server URL must start with http:// — e.g. http://192.168.1.7:5005")
+            self.url, self.remote_error = url, ""
+            if not url:
+                self.engine = "pi"
+            self._warm()
         if voice is not None:
-            if voice not in self.installed():
+            # The PC fetches any Piper voice on first use; only the Pi needs
+            # it downloaded beforehand.
+            if voice not in self.installed() and not self.url:
                 raise ValueError(f"voice not downloaded: {voice}")
             self.voice = voice
             self._warm()
@@ -467,10 +561,10 @@ class Tts:
             raise ValueError("nothing to say")
         if len(text) > MAX_CHARS:
             raise ValueError(f"too long — {MAX_CHARS} characters at most")
-        if not self.have_piper:
+        if not self.have_piper and not self.url:
             raise RuntimeError('Piper not installed — in the venv: pip install "piper-tts>=1.3"')
         voice = voice or self.voice
-        if voice not in self.installed():
+        if voice not in self.installed() and not self.url:
             raise RuntimeError("no voice downloaded yet — pick one under Voices and press Download")
         job = {"text": text, "voice": voice,
                "speed": self.speed if speed is None else max(0.5, min(2.0, float(speed))),
@@ -525,7 +619,8 @@ class Tts:
             time.sleep(0.05)
 
     def _warm(self):
-        if self.have_piper and self.voice in self.installed() and not self._busy:
+        local = self.have_piper and self.voice in self.installed()
+        if (local or self.url) and not self._busy:
             self._submit({"warm": True, "voice": self.voice})
 
     def _submit(self, job):
@@ -611,6 +706,8 @@ class Tts:
                 self._discard(rep)            # left over from superseded text
                 continue
             idle = 0.0
+            if "engine" in rep:
+                self.engine, self.remote_error = rep["engine"], rep.get("warn", "")
             yield rep
             if rep.get("done") or rep.get("error"):
                 return
@@ -650,7 +747,8 @@ class Tts:
 
     def _do_warm(self, job):
         self.status = "loading"
-        rid = self._send({"model": _model_path(job["voice"]), "warm": True})
+        rid = self._send({"model": _model_path(job["voice"]), "voice": job["voice"],
+                          "url": self.url, "warm": True})
         for rep in self._replies_for(rid, job):
             if rep.get("error"):
                 self.error = rep["error"]
@@ -666,7 +764,8 @@ class Tts:
         rate = _sample_rate(model)
         proc, keep = None, False
         try:
-            rid = self._send({"model": model, "text": job["text"], "speed": job["speed"],
+            rid = self._send({"model": model, "voice": job["voice"], "url": self.url,
+                              "text": job["text"], "speed": job["speed"],
                               "volume": job["volume"], "dir": self._chunk_dir})
             if carry and carry[1] == rate and carry[0].poll() is None:
                 # Same stream as the sentence before: no gap, no device
@@ -726,7 +825,8 @@ class Tts:
     @property
     def brief(self):
         return {"status": self.status, "text": self.text, "error": self.error,
-                "first_sound_ms": self.first_sound_ms, "startup": self.startup}
+                "first_sound_ms": self.first_sound_ms, "startup": self.startup,
+                "engine": self.engine}
 
     @property
     def state(self):
@@ -739,6 +839,8 @@ class Tts:
             "voices": self.voices(),
             "history": self.history,
             "max_chars": MAX_CHARS,
+            "url": self.url,
+            "remote_error": self.remote_error,
         })
         return s
 
@@ -781,7 +883,8 @@ def blueprint(tts):
 
     @bp.route("/tts/settings", methods=["POST"])
     def tts_settings():
-        return run(lambda d: tts.set(d.get("voice"), d.get("speed"), d.get("volume")))
+        return run(lambda d: tts.set(d.get("voice"), d.get("speed"), d.get("volume"),
+                                     d.get("url")))
 
     @bp.route("/tts/download", methods=["POST"])
     def tts_download():

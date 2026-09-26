@@ -36,6 +36,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 
@@ -86,6 +87,8 @@ def _quick_reply(name, result):
         return ""                      # the horn is the answer
     if name in ("stop", "stop_music"):
         return "Stopped."
+    if name in SPOKEN_RESULTS:
+        return "Sorry, that did not work." if r.startswith("error") else result
     if name == "drive":
         if "guard blocked" in r:
             return "Something is in the way, so I stopped."
@@ -95,6 +98,144 @@ def _quick_reply(name, result):
             return "I couldn't move."
         return "Done."
     return None
+
+# Plain commands answered without the model. Measured with qwen3-vl:2b: 12 of
+# 16 requests called the right tool, and the misses were exactly these — "I'll
+# turn the volume down for you" said, nothing done. These need no judgement,
+# so they are matched here, run at once, and cost no model time at all.
+# Anything with a name in it (a song, a place), driving, and looking still
+# goes to the model. The WHOLE utterance must be the command, after dropping
+# politeness, so "I love the horn in that song" is still just chat.
+# Longest first: "a bit" has to go before "a" can strand the "bit".
+_FILLER = re.compile(r"\b(a little bit|a little|a bit|for me|can you|could you|will you|would you|"
+                     r"make it|please|hey|truck|speaker|ok|okay|now|just|the|a|some)\b")
+_FAST = [
+    (r"stop( (moving|driving|there|it|everything|right there))?", "stop", {}),
+    (r"(sound|blow|honk|play)? ?(your )?(horn|honk)", "horn", {"kind": "horn"}),
+    (r"beep", "horn", {"kind": "beep"}),
+    (r"stop (music|song|playing|singing)", "stop_music", {}),
+    (r"pause( (music|song))?", "music", {"action": "pause"}),
+    (r"(resume|continue|unpause)( (music|song|playing))?", "music", {"action": "resume"}),
+    (r"(next|skip)( (song|track|one))?|play next( (song|one))?|skip (this|song|track)( song)?", "music",
+     {"action": "next"}),
+    (r"(previous|last)( (song|track))?|play (previous|last)( (song|one))?|go back( (a|one))? song", "music",
+     {"action": "previous"}),
+    (r"(louder|volume up|turn (it|volume) up|increase volume|raise volume|turn up volume)", "volume",
+     {"change": "up"}),
+    (r"(quieter|softer|volume down|turn (it|volume) down|decrease volume|lower volume|turn down volume)",
+     "volume", {"change": "down"}),
+    (r"(what|which) (places|rooms)( do you know| are (there|saved)| have you saved)?|list places",
+     "places", {}),
+    (r"save (map|your map)", "save_map", {}),
+    (r"(take|click|snap) (photo|picture|pic|snapshot)", "take_photo", {}),
+]
+_FAST = [(re.compile(p), name, args) for p, name, args in _FAST]
+
+
+# --- questions the truck asks while mapping ---------------------------------
+#
+# "Is this a sofa?" when the detector has seen one three times, and "What room
+# am I in?" when exploring somewhere unnamed. Asked only in a quiet moment,
+# never over a conversation, and the next thing said is read as the answer.
+ASK_GAP_S = 25          # at least this long between two questions
+QUIET_S = 8             # and this long after the last exchange
+ANSWER_WINDOW_S = 45    # an answer after this long is just conversation
+ROOM_ASK_GAP_S = 90     # the room question is rarer: mapping moves slowly
+ROOM_SKIP_MM = 2500     # "don't know" here means don't ask again near here
+ROOM_FIX_S = 20         # "no, the hall" this soon after naming a room corrects it
+
+_ROOM_WORDS = ("room", "kitchen", "bathroom", "washroom", "toilet", "hall", "hallway", "corridor",
+               "lounge", "office", "study", "garage", "balcony", "porch", "attic", "basement",
+               "laundry", "nursery", "pantry", "store", "entrance", "lobby", "terrace", "veranda")
+_YES = re.compile(r"^(yes|yeah|yep|yup|ya|correct|right|that's right|thats right|it is|true|sure|"
+                  r"of course|haan|han|ha|ji)\b")
+_NO = re.compile(r"^(no|nope|nah|wrong|not really|incorrect|nahi|nahin|na)\b")
+_SKIP = re.compile(r"\b(skip|later|not now|don't know|dont know|not sure|no idea|pata nahi|"
+                   r"never ?mind|ask me later)\b")
+_IT_IS = re.compile(r"(?:it'?s|it is|that'?s|that is|this is|thats)\s+(?:actually\s+|really\s+)?"
+                    r"(?:an?\s+|the\s+|my\s+|our\s+)?(?P<name>[\w' -]{2,40}?)\s*$")
+_ROOM_HERE = re.compile(r"^(?:this|here) is (?:the |my |our |a )?(?P<name>[\w' -]{2,30}?)\s*$|"
+                        r"^(?:we are|we're|you are|you're|i am|i'm) in (?:the |my |our |a )?"
+                        r"(?P<name2>[\w' -]{2,30}?)\s*$|"
+                        r"^(?:call|name) (?:this room|this place|this|here) (?:as )?(?:the )?(?P<name3>[\w' -]{2,30}?)\s*$")
+
+
+_SHORT_OK = {"hi", "hey", "yes", "no", "go", "ok", "stop", "hello", "haan", "nahi"}
+
+
+def _noise(text):
+    """One short word that is not a word anyone says to a robot alone."""
+    s = _clean_answer(text)
+    return len(s.split()) <= 1 and len(s) < 4 and s not in _SHORT_OK
+
+
+def _clean_answer(text):
+    s = re.sub(r"[^\w\s']", " ", text.lower().replace("’", "'"))
+    return " ".join(s.split())
+
+
+def _parse_label_answer(text):
+    """"yes" / "no" / "no, it's a bed" / "skip" -> (answer, new_name or None),
+    or None if this is not an answer at all."""
+    s = _clean_answer(text)
+    if not s:
+        return None
+    if _SKIP.search(s):
+        return "skip", None
+    m = _IT_IS.search(s)
+    if m and not _YES.fullmatch(s):
+        name = re.sub(r"^(a|an|the)\s+", "", m.group("name")).strip()
+        # "that's not a television, don't save it" is a no, not a new name.
+        if re.match(r"(not|no|nothing)\b", name) or re.search(r"\b(don't|dont|do not)\b", name):
+            return "no", None
+        if len(name.split()) > 4:
+            name = ""                               # a sentence, not a name
+        if name and name not in ("right", "correct", "it", "wrong", "true"):
+            return "yes", name                     # "no, it's a bed" -> label it bed
+    if _NO.match(s):
+        return "no", None
+    if _YES.match(s):
+        return "yes", None
+    return None
+
+
+def _parse_room_answer(text):
+    """"the kitchen" / "it's the living room" / "don't know" -> name, "" for
+    a skip, None if it does not sound like an answer."""
+    s = _clean_answer(text)
+    if not s or _SKIP.search(s) or _NO.fullmatch(s) or _YES.fullmatch(s):
+        return "" if s else None
+    s = re.sub(r"^(?:it'?s|it is|this is|that'?s|you'?re in|you are in|we'?re in|we are in)\s+", "", s)
+    s = re.sub(r"^(?:the|my|our|a)\s+", "", s).strip()
+    return s if 0 < len(s.split()) <= 4 else None
+
+
+def _room_name(text):
+    """"this is the kitchen" / "we're in the bedroom" -> "kitchen" — only when
+    the name sounds like a room, so "this is great" stays conversation."""
+    m = _ROOM_HERE.match(_clean_answer(text))
+    if not m:
+        return None
+    name = (m.group("name") or m.group("name2") or m.group("name3") or "").strip()
+    if name and any(w in name.split() or name.endswith(w) for w in _ROOM_WORDS):
+        return name
+    return None
+
+
+def _fast_command(text):
+    """(tool, args) when the utterance is one of the plain commands above."""
+    room = _room_name(text)
+    if room:
+        return "save_place", {"name": room}
+    s = re.sub(r"[^\w\s]", " ", text.lower())
+    s = " ".join(_FILLER.sub(" ", s).split())
+    if not s or len(s.split()) > 5:
+        return None
+    for rx, name, args in _FAST:
+        if rx.fullmatch(s):
+            return name, dict(args)
+    return None
+
 
 TOOLS = [
     {"name": "status", "description": "Obstacles around you, whether motors are armed, pose.",
@@ -117,12 +258,34 @@ TOOLS = [
      "parameters": {"type": "object", "properties": {"name": {"type": "string"}}}},
     {"name": "stop_music", "description": "Stop the music.",
      "parameters": {"type": "object", "properties": {}}},
+    {"name": "music", "description": "Pause, resume, or skip to the next or previous song.",
+     "parameters": {"type": "object", "properties": {
+         "action": {"type": "string", "enum": ["pause", "resume", "next", "previous"]}},
+         "required": ["action"]}},
+    {"name": "volume", "description": "Make the speaker louder or quieter.",
+     "parameters": {"type": "object", "properties": {
+         "change": {"type": "string", "description": "up, down, or a percentage like 50"}},
+         "required": ["change"]}},
     {"name": "places", "description": "List saved places.",
      "parameters": {"type": "object", "properties": {}}},
+    {"name": "save_place", "description": "Remember the spot you are on now under a name.",
+     "parameters": {"type": "object", "properties": {"name": {"type": "string"}},
+                    "required": ["name"]}},
     {"name": "go_to_place", "description": "Drive by yourself to a saved place.",
      "parameters": {"type": "object", "properties": {"name": {"type": "string"}},
                     "required": ["name"]}},
+    {"name": "mapping", "description": "Start or stop exploring the room by yourself to build the map.",
+     "parameters": {"type": "object", "properties": {
+         "action": {"type": "string", "enum": ["start", "stop"]}},
+         "required": ["action"]}},
+    {"name": "save_map", "description": "Save the map built so far.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "take_photo", "description": "Save a camera picture for the person to see later.",
+     "parameters": {"type": "object", "properties": {}}},
 ]
+
+# Tools whose result text is already the spoken answer — see _quick_reply.
+SPOKEN_RESULTS = ("music", "volume", "save_place", "mapping", "save_map", "take_photo")
 
 
 def _system_prompt(voice_id, can_see):
@@ -244,6 +407,13 @@ def _clean_for_speech(text):
     text = re.sub(r"[*_`#>]+", "", text)
     text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.M)
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    # Emoji and other symbols: small models add them despite the prompt, and
+    # Piper turns a smiley into 2.5 s of noise. So/Sk = symbols and skin
+    # tones, Cs/Co = surrogates and private use; U+FE0F / U+200D are the
+    # emoji joiners left behind.
+    text = "".join(c for c in text
+                   if unicodedata.category(c) not in ("So", "Sk", "Cs", "Co")
+                   and c not in (chr(0xFE0F), chr(0x200D)))
     return " ".join(text.split())
 
 
@@ -322,6 +492,14 @@ class Brain:
         self._last_turn = 0.0
         self._last_health = 0.0
         self._loaded_model = None
+        # The question the truck asked out loud and is waiting on:
+        # {"kind": "label"|"room", "key", "label", "t", "pose"}, or None.
+        self.question = None
+        self._last_ask = 0.0
+        self._last_room_ask = 0.0
+        self._last_ask_check = 0.0
+        self._room_skips = []          # poses where "don't know" was the answer
+        self._room_said = None         # the room just named, for "no, the hall"
         threading.Thread(target=self._run, daemon=True).start()
 
     # --- settings -----------------------------------------------------------
@@ -487,6 +665,10 @@ class Brain:
                     continue
             text = self.ears.listen(timeout=1.0)
             if text is None:
+                try:
+                    self._maybe_ask()
+                except Exception:                              # noqa: BLE001
+                    pass                  # a question is never worth an error state
                 continue
             if not self.enabled:
                 # Switched off while waiting: these words belong to whoever
@@ -499,7 +681,123 @@ class Brain:
                 self.status, self.error = "error", f"{e.__class__.__name__}: {e}"
                 time.sleep(1.0)
 
+    # --- the truck's own questions -----------------------------------------
+
+    def _maybe_ask(self):
+        """In a quiet moment, while exploring somewhere unnamed, ask which
+        room this is — the one thing the truck cannot work out alone, and
+        what "go to the kitchen" needs later. Objects are NOT asked about:
+        they are saved automatically once seen from three viewpoints, since
+        a question per chair proved tedious. Only with the phone connected:
+        a question nobody can answer is just the truck talking to itself."""
+        now = time.monotonic()
+        if (self.question and now - self.question["t"] < ANSWER_WINDOW_S) or self.talker.busy \
+                or now - self._last_ask < ASK_GAP_S or now - self._last_turn < QUIET_S \
+                or now - self._last_ask_check < 3.0 or self.status != "listening" \
+                or not self.ears.state.get("phone_connected"):
+            return
+        self._last_ask_check = now
+        self.question = None
+        s = self.api.ai_status()
+        # Driven by hand or mapping on its own, the same rule: once per
+        # unnamed area. The spot is remembered when ASKED, not only when
+        # skipped, so an unanswered question is not repeated every 90 s.
+        pose = s.get("pose_mm_deg") or {}
+        if not s.get("room_here") and now - self._last_room_ask > ROOM_ASK_GAP_S:
+            x, y = pose.get("x", 0.0), pose.get("y", 0.0)
+            if all((x - sx) ** 2 + (y - sy) ** 2 > ROOM_SKIP_MM ** 2 for sx, sy in self._room_skips):
+                self._last_room_ask = now
+                self._room_skips.append((x, y))
+                self._ask("What room am I in?", {"kind": "room", "pose": (x, y)})
+
+    def _ask(self, sentence, question):
+        self.talker.say(sentence, append=True, remember=False)
+        question["t"] = self._last_ask = time.monotonic()
+        self.question = question
+        self.reply = sentence
+
+    def _answer_question(self, text):
+        """The words right after a question. Returns the sentence to say if
+        they answered it, or None if they are just conversation — the
+        question then waits in the queue and the model gets the words."""
+        q, self.question = self.question, None
+        if q["kind"] == "label":
+            parsed = _parse_label_answer(text)
+            if parsed is None:
+                return None
+            answer, name = parsed
+            self.api.answer_label(q["key"], answer, name)
+            if answer == "yes":
+                return f"Got it, a {name}. It's on the map now." if name else \
+                    f"Great, the {q['label']} is on the map now."
+            return "Okay, I won't label it." if answer == "no" else "Okay, I'll ask later."
+        name = _parse_room_answer(text)
+        if name is None:
+            return None
+        if not name:
+            self._room_skips.append(q["pose"])
+            return "Okay."
+        self._name_room(name, q["pose"])
+        return f"Got it, this is the {name}."
+
+    def _name_room(self, name, pose):
+        """Save a room where the question was ASKED — the truck may have
+        driven on while the person answered — and remember it briefly so a
+        mishearing can be corrected ("this is whole" for "hall")."""
+        x, y = pose
+        self.api.post("/places", {"name": name, "x": x, "y": y})
+        self._room_said = {"name": name, "pose": pose, "t": time.monotonic()}
+
+    def _fix_room(self, text):
+        """"No" / "no, the hall" just after a room was named: the speech
+        recogniser got it wrong. Returns what to say ("" if it asked again
+        itself), or None if this is not a correction."""
+        rs = self._room_said
+        if not rs or time.monotonic() - rs["t"] > ROOM_FIX_S:
+            return None
+        s = _clean_answer(text)
+        m = _NO.match(s) or re.match(r"^wrong", s)
+        if not m:
+            return None
+        self._room_said = None
+        self.api.post("/places", {"name": rs["name"], "delete": True})
+        rest = re.sub(r"^(?:it'?s|it is|this is|that'?s|i said)\s+", "", s[m.end():].strip(" ,"))
+        name = _parse_room_answer(rest) if rest else None
+        if name:
+            self._name_room(name, rs["pose"])
+            return f"Sorry. This is the {name}."
+        self._ask("Sorry, which room is this?", {"kind": "room", "pose": rs["pose"]})
+        return ""                       # handled; _ask has already spoken"
+
     def _respond(self, text):
+        try:
+            fixed = self._fix_room(text)
+        except Exception:                                      # noqa: BLE001
+            fixed = None
+        if fixed is not None:                    # "" = it re-asked, already spoken
+            if fixed:
+                self.heard, self.reply, self.error = text, fixed, ""
+                self.talker.say(fixed, append=True, remember=False)
+            self._last_turn = time.monotonic()
+            return
+        if self.question and time.monotonic() - self.question["t"] < ANSWER_WINDOW_S:
+            try:
+                said = self._answer_question(text)
+            except Exception:                                  # noqa: BLE001
+                said = None
+            if said:
+                self.heard, self.reply, self.error = text, said, ""
+                self.talker.say(said, append=True, remember=False)
+                self.turns += 1
+                self._last_turn = time.monotonic()
+                self.status = "listening"
+                return
+        self.question = None
+        # A fragment is the recogniser catching noise ("se", "koi"), not a
+        # question; answering it has the truck talk to nobody.
+        if _noise(text):
+            self.heard = text
+            return
         t0 = time.monotonic()
         self.heard, self.reply, self.error, self.latency_ms = text, "", "", None
         self.status = "thinking"
@@ -523,16 +821,22 @@ class Brain:
 
         system, tools = self._messages_head()
         spoken = []
+        fast = _fast_command(text) if tools else None
         try:
-            for _ in range(MAX_TOOL_ROUNDS):
+            for round_no in range(MAX_TOOL_ROUNDS):
                 speaker = _SentenceSpeaker(self.talker, first_sentence)
                 content, calls = "", []
-                for kind, value in self.ollama.chat_stream(self.active, [system] + self.history, tools):
-                    if kind == "text":
-                        content += value
-                        speaker.feed(value)
-                    elif kind == "tool_calls":
-                        calls += value
+                if round_no == 0 and fast:
+                    # A plain command: the call the model should have made,
+                    # without asking it — see _fast_command.
+                    calls = [{"function": {"name": fast[0], "arguments": fast[1]}}]
+                else:
+                    for kind, value in self.ollama.chat_stream(self.active, [system] + self.history, tools):
+                        if kind == "text":
+                            content += value
+                            speaker.feed(value)
+                        elif kind == "tool_calls":
+                            calls += value
                 speaker.flush()
                 spoken += speaker.spoken
 
@@ -688,6 +992,18 @@ class Brain:
                 return self.api.places_text(), None, None
             if name == "go_to_place":
                 return self.api.go_to_place(args.get("name", "")), None, None
+            if name == "music":
+                return self.api.music(args.get("action", "")), None, None
+            if name == "volume":
+                return self.api.volume(args.get("change", "")), None, None
+            if name == "save_place":
+                return self.api.save_place(args.get("name", "")), None, None
+            if name == "mapping":
+                return self.api.explore(args.get("action", "")), None, None
+            if name == "save_map":
+                return self.api.save_map(), None, None
+            if name == "take_photo":
+                return self.api.take_photo(), None, None
             return f"unknown tool {name}", None, None
         except truck_api.TruckError as e:
             return f"Error: {e}", None, None
@@ -701,7 +1017,10 @@ class Brain:
                 "active_model": self.active, "pull": self.pull_state, "always_thinks": self.always_thinks,
                 "models": self.models, "can_see": self.can_see, "can_use_tools": self.can_use_tools,
                 "heard": self.heard, "reply": self.reply,
-                "latency_ms": self.latency_ms, "turns": self.turns}
+                "latency_ms": self.latency_ms, "turns": self.turns,
+                # What it asked out loud and is waiting on, if anything.
+                "asking": ({"kind": self.question["kind"], "label": self.question.get("label")}
+                           if self.question else None)}
 
 
 def _installed(model, models):

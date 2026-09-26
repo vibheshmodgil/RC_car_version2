@@ -1,0 +1,50 @@
+# The PC's half of the truck. On Windows, with Docker Desktop running:
+#
+#   cd tools
+#   docker compose up -d --build     # first time: builds the image (~10 min)
+#   docker compose logs -f           # one line per sentence / frame
+#   docker compose down              # stop
+#
+# Then in the cockpit (http://<pi-ip>:5004), with <pc-ip> from `ipconfig`:
+#   Audio tab  -> Speak -> Speech server on the PC -> http://<pc-ip>:5005
+#   Vision tab -> Objects -> server URL            -> http://<pc-ip>:8000/detect
+#
+# Ollama stays outside Docker, running natively with the GPU (port 11434).
+# Voices, detection weights and the CLIP cache live in named volumes, so they
+# download once, not on every rebuild.
+
+x-image: &image
+  build:
+    context: ..
+    dockerfile: tools/Dockerfile
+  image: speaker-truck-pc
+  restart: unless-stopped
+
+services:
+  tts:
+    <<: *image
+    command: python /app/tts_server.py
+    environment:
+      TTS_VOICE_DIR: /voices
+    volumes:
+      - voices:/voices
+    ports:
+      - "5005:5005"
+
+  detect:
+    <<: *image
+    # yolov8s: ~220 ms a frame on a desktop CPU, inside the Pi's ~1 s cycle.
+    # The GPU is left to Ollama; on a bigger card add a GPU reservation here
+    # and use --device cuda --model yolov8m-worldv2.pt.
+    command: python /app/detect_server.py --model yolov8s-worldv2.pt --device cpu
+    working_dir: /models
+    volumes:
+      - models:/models
+      - cache:/root/.cache
+    ports:
+      - "8000:8000"
+
+volumes:
+  voices:
+  models:
+  cache:

@@ -199,7 +199,10 @@ def serve_https(app, port=HTTPS_PORT):
         return None
     try:
         from werkzeug.serving import make_server               # noqa: PLC0415
-        srv = make_server("0.0.0.0", port, app, threaded=True, ssl_context=pair)
+        try:                            # IPv6 + IPv4, as web_nav's http server
+            srv = make_server("::", port, app, threaded=True, ssl_context=pair)
+        except OSError:
+            srv = make_server("0.0.0.0", port, app, threaded=True, ssl_context=pair)
     except (OSError, SystemExit) as e:
         print(f"  https: port {port} unavailable ({e})")
         return None

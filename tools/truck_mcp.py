@@ -194,5 +194,62 @@ async def stop_sound() -> str:
     return await _call(api.stop_sound)
 
 
+@mcp.tool()
+async def music(action: str) -> str:
+    """Control the song that is playing: "pause", "resume", "next" or "previous"."""
+    return await _call(api.music, action)
+
+
+@mcp.tool()
+async def volume(change: str) -> str:
+    """Speaker volume: "up", "down" (a quarter step each) or a percentage like "50"."""
+    return await _call(api.volume, change)
+
+
+@mcp.tool()
+async def save_place(name: str) -> str:
+    """Save the truck's current position on the map under a name, so
+    go_to_place can drive back to it later."""
+    return await _call(api.save_place, name)
+
+
+@mcp.tool()
+async def mapping(action: str) -> str:
+    """Autonomous exploration that builds the map: "start" or "stop". Start is
+    refused unless a person has already pressed ENABLE and the LiDAR is
+    connected. Check progress with status; save the result with save_map."""
+    return await _call(api.explore, action)
+
+
+@mcp.tool()
+async def label_questions() -> str:
+    """Detections waiting for a person to confirm before they go on the map:
+    key, what the detector thinks it is, the nearest named room, and how many
+    times it was seen. Nothing is labelled on the map until answered."""
+    return await _call(api.label_questions_text)
+
+
+@mcp.tool()
+async def answer_label(key: str, answer: str, name: str = "") -> str:
+    """Answer a label question for the person: answer "yes", "no" or "skip".
+    "yes" with a name labels it by that name instead ("no, it's a bed" is
+    yes + name="bed"). "no" means it is never asked about at that spot again.
+    Only answer what the person actually said — never guess for them."""
+    return await _call(api.answer_label, key, answer, name or None)
+
+
+@mcp.tool()
+async def save_map() -> str:
+    """Save the SLAM map built so far on the Pi."""
+    return await _call(api.save_map)
+
+
+@mcp.tool()
+async def take_photo() -> str:
+    """Save the current camera view to test/captures/ on the Pi, tagged with
+    the pose. To see the view yourself, use look instead."""
+    return await _call(api.take_photo)
+
+
 if __name__ == "__main__":
     mcp.run()

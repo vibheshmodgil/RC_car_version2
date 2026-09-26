@@ -361,20 +361,23 @@ creep out on its own. If not, raise *Creep margin* on the Tune tab.
 
 ---
 
-## Floor check and markers
+## LiDAR and markers
 
-### The floor check fires constantly on normal floor
+### The guard says "no fresh LiDAR scan" but the scanner is spinning
 
-Press **Relearn floor** on open floor — not facing a wall, since it takes
-whatever it sees as the definition of floor. If it still fires on a patterned
-rug, raise *Floor chroma tolerance* on the Tune tab.
+Look at the LiDAR badge. **LIDAR STALLED** with a byte count in its tooltip
+means data arrives but no revolution completes; the reader now closes each
+revolution on the scanner's own start flag, and reopens the port by itself
+after 2.5 s without a scan (10 s just after opening, for spin-up). The rate on
+the Drive tab should be ~11.5 Hz - about 23 means revolutions are being cut
+in half.
 
-### The floor check never fires, even at a step
+### Only half the room shows on the plot
 
-The camera is not tilted down enough. At 0° tilt, five of the six sample rows
-are at or above the horizon and see no floor at all. Tilt down 15–25° and set
-`CAM_PITCH_DEG`. Check the framing with `camera_test.py --stream` — the bottom
-edge should show floor at about the front bumper.
+In a corner the walls are inside the scanner's minimum range and return
+nothing. Drive out a little; the full circle comes back.
+
+(The camera floor check was removed from driving - see TUNING.md, guard.)
 
 ### Markers are detected but the distance is wrong
 

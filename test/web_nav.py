@@ -502,6 +502,8 @@ class Lidar:
         self._lock = threading.Lock()
         self._current, self._scan = [], []
         self._last_angle = None
+        self._last_pkt_a0 = None
+        self._ct_seen = -1e9
         self._rev_times = deque(maxlen=20)
         self._scan_time = 0.0
         self.packets = self.bad = 0
@@ -512,22 +514,49 @@ class Lidar:
         elif not serial:
             self.error = "pyserial not installed"
 
+    # No complete revolution for this long = the scanner has stopped talking.
+    STALL_S = 2.5
+    # ...but after opening the port, allow the motor time to spin up first:
+    # some YDLIDAR adapters restart it on open, and reopening every 2.5 s
+    # kept it from ever reaching speed.
+    STARTUP_S = 10.0
+
     def _run(self):
+        """Read forever, whatever goes wrong.
+
+        Seen live: the port stayed open, nothing arrived, and the page went on
+        showing "connected, 11.5 Hz" from the last good scans while the guard
+        refused every move for a stale scan. So: any exception reconnects
+        (only SerialException used to — anything else killed this thread
+        silently), and a port that goes quiet is closed and reopened."""
         while True:
             try:
                 with serial.Serial(self.port, self.baud, timeout=0.2) as ser:
                     self.connected, self.error = True, ""
                     ser.reset_input_buffer()
+                    self.buf.clear()
+                    opened = time.monotonic()
                     while True:
                         chunk = ser.read(4096)
                         if chunk:
+                            self.rx_bytes = getattr(self, "rx_bytes", 0) + len(chunk)
                             self.buf += chunk
                             self._consume()
                         elif len(self.buf) > 65536:
                             self.buf.clear()
-            except serial.SerialException as e:
+                        now = time.monotonic()
+                        if self._scan_time > opened:
+                            quiet, limit = now - self._scan_time, self.STALL_S
+                        else:
+                            quiet, limit = now - opened, self.STARTUP_S
+                        if quiet > limit:
+                            raise OSError("no complete scan for %.0f s (%d bytes received"
+                                          " in total) - reopening the port"
+                                          % (quiet, getattr(self, "rx_bytes", 0)))
+            except Exception as e:                                # noqa: BLE001
                 self.connected, self.error = False, str(e)
-                time.sleep(1.5)
+                self.stalls = getattr(self, "stalls", 0) + 1
+                time.sleep(1.0)
 
     def _consume(self):
         while True:
@@ -554,10 +583,20 @@ class Lidar:
                 del self.buf[:2]
                 continue
             self.packets += 1
-            self._emit(fsa, lsa, samples)
+            self._emit(fsa, lsa, samples, ct)
             del self.buf[:need]
 
-    def _emit(self, fsa, lsa, samples):
+    # A revolution is never this big (~240 points at 11 Hz); if the start
+    # marker is somehow missed, close it anyway rather than grow forever.
+    MAX_REV_POINTS = 1000
+
+    def _close_rev(self):
+        self._scan, self._current = self._current, []
+        self._rev_times.append(time.monotonic())
+        self._scan_time = time.monotonic()
+        self._last_angle = None
+
+    def _emit(self, fsa, lsa, samples, ct=0):
         a0, a1 = (fsa >> 1) / 64.0, (lsa >> 1) / 64.0
         span = (a1 - a0) % 360.0
         n = len(samples)
@@ -569,25 +608,35 @@ class Lidar:
             a = (a0 + span * (i / (n - 1) if n > 1 else 0.0)) % 360.0
             pts.append((round((a + angle_correction(d)) % 360.0, 1), round(d)))
         with self._lock:
+            # ONE boundary per revolution, from ONE source.
+            #
+            # The scanner flags the first packet of every revolution (CT bit
+            # 0) - but not necessarily at 0 degrees. Using that flag AND the
+            # angle wrap at 0 split every turn in two: 22.8 "scans" a second,
+            # each half a circle, seen live. So: while the flag is arriving,
+            # it alone decides. Only a scanner that never sends it falls back
+            # to the wrap of each PACKET's start angle (present even when all
+            # of its distances are invalid - a per-POINT wrap never fired with
+            # the view half blocked, which froze the guard).
+            now = time.monotonic()
+            if ct & 0x01:
+                self._ct_seen = now
+            if now - self._ct_seen < 2.0:
+                boundary = bool(ct & 0x01)
+            else:
+                boundary = (self._last_pkt_a0 is not None
+                            and a0 < self._last_pkt_a0 - 180)
+            self._last_pkt_a0 = a0
+            if boundary and len(self._current) > 10:
+                self._close_rev()
             for a, d in pts:
-                # Revolution boundary: the angle stepped backwards past 360.
-                #
-                # The point count guard matters. angle_correction can nudge a
-                # reading near 0 deg back to ~359, and the next point at 1 deg
-                # then looks like a wrap. That splits one revolution into two,
-                # producing a TRUNCATED scan and a bogus rate (measured up to
-                # 16 Hz on a scanner that physically turns at 11). A real
-                # revolution always carries far more than 30 points.
-                if (self._last_angle is not None and a < self._last_angle - 180
-                        and len(self._current) > 30):
-                    self._scan, self._current = self._current, []
-                    self._rev_times.append(time.monotonic())
-                    self._scan_time = time.monotonic()
-                self._last_angle = a
+                if len(self._current) >= self.MAX_REV_POINTS:
+                    self._close_rev()           # a lost marker must not grow forever
                 self._current.append((a, d))
 
     def hz(self):
-        if len(self._rev_times) < 2:
+        # A rate from revolutions that stopped arriving is a lie; 0 says so.
+        if len(self._rev_times) < 2 or not self.fresh(1.5):
             return 0.0
         s = self._rev_times[-1] - self._rev_times[0]
         return (len(self._rev_times) - 1) / s if s > 0 else 0.0
@@ -808,7 +857,45 @@ class SlamRunner:
         self.enabled = True
         self.ms = 0.0
         self._hz = hz
+        self.map_note = ""
+        self._saved_scans = 0
         threading.Thread(target=self._run, daemon=True).start()
+        threading.Thread(target=self._autosave, daemon=True).start()
+
+    AUTOSAVE_S = 20.0
+
+    def _autosave(self):
+        """Save the map whenever it has grown. Places and objects are stored
+        in this map's coordinates, and a restart that forgot the map made
+        every one of them point at nothing — "go to the kitchen" needs the
+        map that "kitchen" was saved in."""
+        while True:
+            time.sleep(self.AUTOSAVE_S)
+            try:
+                self.save_if_changed()
+            except OSError as e:
+                self.map_note = f"autosave failed: {e}"
+
+    def save_if_changed(self):
+        s = self.slam.scans
+        if s and s != self._saved_scans:
+            self.slam.save(MAP_FILE)
+            self._saved_scans = s
+            self.map_note = f"map autosaved · {s} scans · {time.strftime('%H:%M:%S')}"
+
+    def resume(self):
+        """At startup: carry on in the map from last time, if there is one."""
+        if not os.path.exists(MAP_FILE):
+            self.map_note = "new map"
+            return
+        try:
+            blob = self.slam.load(MAP_FILE)
+        except (OSError, ValueError) as e:
+            self.map_note = f"saved map not loaded: {e}"
+            return
+        self._saved_scans = self.slam.scans
+        self.map_note = (f"resumed saved map ({blob.get('scans', 0)} scans). Start the truck "
+                         "where it was switched off, or press Reset map.")
 
     def _run(self):
         period = 1.0 / self._hz
@@ -859,6 +946,7 @@ class SlamRunner:
         d["enabled"] = self.enabled
         d["ms"] = round(self.ms, 1)
         d["counts"] = [self.robot.enc_left.steps, self.robot.enc_right.steps]
+        d["map_note"] = self.map_note
         return d
 
 
@@ -980,55 +1068,128 @@ def body_points(points):
     return out
 
 
-def swept_obstacle(bpts, throttle, steer, stop_mm):
-    """Nearest return inside the region this command would sweep through.
+# Sideways clearance while driving STRAIGHT. Braking distance is along the
+# direction of travel; a wall beside the truck gets no closer as it drives
+# past, so the full SAFETY_MARGIN_MM sideways only jammed it against walls.
+SIDE_MARGIN_MM = 15.0
+# How far ahead a turn on the spot is checked, in degrees of rotation.
+# NOT a few degrees: a scan arrives every ~90 ms and describes where the truck
+# WAS, and the truck coasts after the motors stop. At a normal turn rate that
+# is 15-30 degrees between "the scan shows it" and "the truck has stopped".
+# 6 degrees here let a corner swing into a wall 40 mm away.
+TURN_LOOK_DEG = 30.0
+# Clearance kept between a swinging corner and anything it passes.
+TURN_PAD_MM = 25.0
+# The same while driving an arc. Two values, by who is driving:
+#   a person  10 mm - steering AWAY from a wall 40 mm off swings the tail to
+#             ~15 mm of it, and refusing that is the jam people complained of.
+#   autonomous 20 mm - at 10 the simulated explorer slid past a sofa corner
+#             at 12 mm; at 20 its closest pass in the whole house was 60 mm.
+# Refusing an arc keeps the straight part, so it costs a correction, not a stop.
+ARC_PAD_MM = 10.0
+ARC_PAD_AUTO_MM = 20.0
 
-    A single "distance ahead" number is wrong for a body 400 mm wide with the
-    scanner at one corner: an obstacle off the far shoulder is invisible to a
-    narrow cone, and one beside the scanner reads close while being nowhere
-    near the path. So the test is geometric.
 
-      driving straight  a rectangle the FULL WIDTH of the truck plus margin,
-                        extending stop_mm beyond the leading edge
-      turning on spot   an annulus out to the circumscribing radius, because
-                        a skid-steer sweeps its corners through a circle and
-                        the widest point is a corner, not the nose
+def _arc_hit(bpts, throttle, steer, dist_mm, turn_deg, pad):
+    """Drive the footprint along the path this command really takes and
+    report the first place a point would go INTO it (or deeper into it).
 
-    Returns (distance, description) or (None, "") when clear.
+    Uses the same left/right mix as Robot.drive (left = t + s, right = t - s,
+    scaled together), so an arc is simulated as the pivot it actually is.
+    Stops after dist_mm of travel or turn_deg of rotation, whichever first.
+    Returns (travelled_mm, turned_deg) at the hit, or None if clear.
+
+    "Deeper, not inside": something already within the pad does not count
+    unless this move pushes it further in - otherwise a wall 5 mm away would
+    refuse the very move that leaves it.
     """
-    m = SAFETY_MARGIN_MM
-    worst = None
-    if abs(throttle) > 0.01:
+    left, right = throttle + steer, throttle - steer
+    peak = max(1.0, abs(left), abs(right))
+    left, right = left / peak, right / peak
+    v = (left + right) / 2.0                      # forward, per unit time
+    w = (right - left) / (2.0 * HALF_W)           # rad per unit time, + = left
+    if abs(v) < 1e-6 and abs(w) < 1e-9:
+        return None
+    hl, hw = HALF_L + pad, HALF_W + pad
+    base = [min(hl - abs(x), hw - abs(y)) for x, y in bpts]
+    # Step so no corner moves more than ~10 mm per step.
+    dt = 10.0 / (abs(v) + abs(w) * math.hypot(hl, hw))
+    x = y = th = 0.0
+    travelled = 0.0
+    while True:
+        x += v * math.cos(th + w * dt / 2) * dt
+        y += v * math.sin(th + w * dt / 2) * dt
+        th += w * dt
+        travelled += abs(v) * dt
+        turned = abs(math.degrees(th))
+        if (abs(v) > 1e-6 and travelled > dist_mm) or (abs(w) > 1e-9 and turned > turn_deg):
+            return None
+        c, s_ = math.cos(-th), math.sin(-th)
+        for (px, py), d0 in zip(bpts, base):
+            qx, qy = px - x, py - y
+            rx, ry = qx * c - qy * s_, qx * s_ + qy * c
+            d = min(hl - abs(rx), hw - abs(ry))
+            if d > 0 and d > d0 + 1.0:
+                return travelled, turned
+
+
+_sweep_cache = {"key": None, "val": {}}
+
+
+def swept_obstacle(bpts, throttle, steer, stop_mm, arc_pad=None):
+    """What this command would hit, from the actual footprint on the actual
+    path it drives.
+
+      straight   a lane the width of the truck plus SIDE_MARGIN_MM, out to
+                 stop_mm + SAFETY_MARGIN_MM beyond the leading edge. Returns
+                 the gap to the nearest return in it.
+      spin       the footprint rotated the requested way, up to
+                 TURN_LOOK_DEG, with TURN_PAD_MM around it.
+      arc        forward/back AND turning: the footprint moved along the arc
+                 the wheel mix really produces (it pivots about the slower
+                 side), until stop_mm travelled or TURN_LOOK_DEG turned.
+    Spin and arc return 0 when blocked. Everything returns (None, "") when
+    clear.
+
+    Cached per scan: the guard asks 50 times a second, a scan changes 11.
+    """
+    key = (id(bpts), len(bpts), HALF_L, HALF_W, stop_mm, SAFETY_MARGIN_MM)
+    if _sweep_cache["key"] != key:
+        _sweep_cache["key"], _sweep_cache["val"] = key, {}
+    arc_pad = ARC_PAD_MM if arc_pad is None else arc_pad
+    ck = (round(throttle, 1), round(steer, 1), arc_pad)
+    if ck not in _sweep_cache["val"]:
+        _sweep_cache["val"][ck] = _swept(bpts, throttle, steer, stop_mm, arc_pad)
+    return _sweep_cache["val"][ck]
+
+
+def _swept(bpts, throttle, steer, stop_mm, arc_pad=ARC_PAD_MM):
+    moving, turning = abs(throttle) > 0.01, abs(steer) > 0.01
+    if moving and not turning:
+        m = SAFETY_MARGIN_MM
         ahead = throttle > 0
         near = HALF_L if ahead else -HALF_L
         far = near + (stop_mm + m) * (1 if ahead else -1)
         lo, hi = (near, far) if ahead else (far, near)
+        band = HALF_W + SIDE_MARGIN_MM
+        worst = None
         for x, y in bpts:
-            if lo <= x <= hi and abs(y) <= HALF_W + m:
+            if lo <= x <= hi and abs(y) <= band:
                 d = (x - HALF_L) if ahead else (-HALF_L - x)
                 if worst is None or d < worst:
                     worst = d
         if worst is not None:
             return max(0.0, worst), ("ahead" if ahead else "behind")
-    elif abs(steer) > 0.01:
-        # Turning in place: the corners sweep a circle of radius CORNER_R.
-        #
-        # Half margin here, deliberately. Driving needs clearance for braking
-        # distance — momentum carries the truck FORWARD past where it decided
-        # to stop. Rotating does not: momentum carries a corner around the
-        # same circle, so the swept radius is unchanged and the margin only
-        # has to cover sensor noise and pose error. Using the full driving
-        # margin boxes the robot in against a wall it could physically turn
-        # away from, which is how it ends up stuck with only reverse.
-        m = SAFETY_MARGIN_MM * 0.5
-        for x, y in bpts:
-            r = math.hypot(x, y)
-            if r <= CORNER_R + m:
-                d = r - CORNER_R
-                if worst is None or d < worst:
-                    worst = d
-        if worst is not None:
-            return max(0.0, worst), "in the turning circle"
+    elif turning and not moving:
+        hit = _arc_hit(bpts, 0.0, steer, 0.0, TURN_LOOK_DEG, TURN_PAD_MM)
+        if hit:
+            return 0.0, "turning %s would hit in %.0f°" % (
+                "right" if steer > 0 else "left", hit[1])
+    elif turning:
+        hit = _arc_hit(bpts, throttle, steer, stop_mm, TURN_LOOK_DEG, arc_pad)
+        if hit:
+            return 0.0, "%s %s arc would hit" % (
+                "forward" if throttle > 0 else "reverse", "right" if steer > 0 else "left")
     return None, ""
 
 
@@ -1051,6 +1212,7 @@ class Guard:
         self.reason = ""
         self.creeping = False
         self.clear = {}
+        self.out = (0.0, 0.0)
 
     def survey(self, lidar):
         """Clearance in each direction, for display."""
@@ -1059,12 +1221,21 @@ class Guard:
             return
         b = body_points(lidar.scan())
         out = {}
-        for name, th, st in (("fwd", 1, 0), ("rev", -1, 0), ("turn", 0, 1)):
+        for name, th, st in (("fwd", 1, 0), ("rev", -1, 0), ("left", 0, -1), ("right", 0, 1)):
             d, _ = swept_obstacle(b, th, st, self.stop_mm)
             out[name] = None if d is None else round(d)
+        # "turn" for the page: blocked only if BOTH directions are.
+        out["turn"] = None if out["left"] is None or out["right"] is None else 0
         self.clear = out
 
-    def apply(self, throttle, steer, lidar):
+    def apply(self, throttle, steer, lidar, auto=False):
+        """The command the motors may have. Also kept as self.out, so the
+        explorer can tell "refused outright" from "turn dropped, still
+        moving" - the reason text alone cannot."""
+        self.out = self._apply(throttle, steer, lidar, auto)
+        return self.out
+
+    def _apply(self, throttle, steer, lidar, auto=False):
         self.blocked, self.reason = False, ""
         if not self.enabled or (throttle == 0 and steer == 0):
             return throttle, steer
@@ -1072,55 +1243,54 @@ class Guard:
             self.blocked, self.reason = True, "no fresh LiDAR scan"
             return 0.0, 0.0
 
-        # The camera's veto, checked BEFORE the LiDAR's and only against
-        # forward motion.
-        #
-        # It has to come first because it is the one hazard the scanner
-        # cannot see at all: a stair edge returns nothing to a horizontal
-        # beam, so the LiDAR check below would pass it as clear floor and the
-        # robot would drive off the top step at full confidence.
-        #
-        # Forward only, and no creep. The creep escape exists so the robot can
-        # wriggle out of furniture rather than wait for a human — but creeping
-        # forward over a drop is the exact move it must never make. Reverse
-        # and rotation stay available, which is always enough to leave.
-        if cliff is not None and cliff.enabled and cliff.blocked and throttle > 0:
-            self.blocked = True
-            self.creeping = False
-            self.reason = "camera: " + cliff.reason
-            return 0.0, steer
+        # (The camera floor check that used to veto forward here is gone. With
+        # an unmeasured camera tilt it read walls and ceiling as "drop-offs"
+        # and stalled the truck at random; the LiDAR alone decides now.)
 
         b = body_points(lidar.scan())
-        d, where = swept_obstacle(b, throttle, steer, self.stop_mm)
-        if d is None or d >= self.stop_mm:
+
+        def blocked(t, s_):
+            d, where = swept_obstacle(b, t, s_, self.stop_mm,
+                                      ARC_PAD_AUTO_MM if auto else ARC_PAD_MM)
+            if d is None:
+                return False, None, ""
+            # A straight lane reports a distance to compare with the stop
+            # distance; a spin or an arc reports 0 only when it would hit.
+            return (d < self.stop_mm), d, where
+
+        moving, turning = abs(throttle) > 0.01, abs(steer) > 0.01
+        bad, d_t, where = blocked(throttle, steer)
+        if not bad:
             self.creeping = False
             return throttle, steer
-
         self.blocked = True
-        self.reason = f"{d:.0f} mm {where}"
+        self.reason = f"{d_t:.0f} mm {where}" if moving and not turning else where
 
-        # Kill only the blocked component. Driving into something still leaves
-        # turning available, so it can rotate away.
-        if abs(throttle) > 0.01:
-            alt_t, alt_s = 0.0, steer
-        else:
-            alt_t, alt_s = 0.0, 0.0
+        # The whole command, as the path it really drives, is blocked. Keep
+        # whichever PART is still safe on its own: straight on if only the
+        # turn would hit, turn if only the travel would. (A forward-and-left
+        # used to be checked as forward only; and when forward was blocked the
+        # turn was kept without being checked at all.)
+        if moving and turning:
+            if not blocked(throttle, 0)[0]:
+                return throttle, 0.0
+            if not blocked(0, steer)[0]:
+                return 0.0, steer
+            return 0.0, 0.0
 
-        # Escape hatch. If the requested move is blocked AND everything else
-        # is too, allow a slow creep in the requested direction provided there
-        # is still CREEP_MARGIN_MM of room. Without this the robot wedges
-        # itself against furniture and has to be lifted out by hand — which is
+        # Escape hatch, straight moves only. If this move is blocked AND every
+        # other move is too, creep in the requested direction while there is
+        # still CREEP_MARGIN_MM of room. Without this the robot wedges itself
+        # against furniture and has to be lifted out by hand - which is
         # exactly what happened on the first three house runs.
-        others = []
-        for th_, st_ in ((1, 0), (-1, 0), (0, 1)):
-            dd, _ = swept_obstacle(b, th_, st_, self.stop_mm)
-            others.append(dd is None or dd >= self.stop_mm)
-        if not any(others) and d > CREEP_MARGIN_MM:
+        if moving and not any(not blocked(t_, s2)[0]
+                              for t_, s2 in ((1, 0), (-1, 0), (0, 1), (0, -1))) \
+                and d_t is not None and d_t > CREEP_MARGIN_MM:
             self.creeping = True
-            self.reason += " — creeping out"
-            return throttle * CREEP_THROTTLE, steer * CREEP_THROTTLE
+            self.reason += " - creeping out"
+            return throttle * CREEP_THROTTLE, 0.0
         self.creeping = False
-        return alt_t, alt_s
+        return 0.0, 0.0
 
 
 class Intent:
@@ -1164,11 +1334,11 @@ def control_loop():
         time.sleep(period)
         if robot is None:
             continue
-        th, st, ts, _ = intent.get()
+        th, st, ts, source = intent.get()
         if time.monotonic() - ts > WATCHDOG_S:
             th = st = 0.0                       # deadman: intent went stale
         try:
-            th, st = guard.apply(th, st, lidar)
+            th, st = guard.apply(th, st, lidar, auto=(source == "explore"))
         except Exception:                                     # noqa: BLE001
             th = st = 0.0
         # Only touch the GPIO when something actually changed. Rewriting the
@@ -1492,6 +1662,11 @@ body.docs .b-docs{background:color-mix(in srgb,var(--series-1) 30%,var(--surface
    real state and hiding it makes the map look mysteriously incomplete. */
 .detbox.noplace{border-color:var(--warning);border-style:dashed}
 .detbox.noplace b{background:var(--warning);color:#231a07}
+/* People, for follow mode: their own colour so they never read as furniture,
+   and the one being followed drawn heavier than the rest. */
+.detbox.person{border-color:var(--audio);border-style:dashed}
+.detbox.person b{background:var(--audio);color:#2a0b24}
+.detbox.person.target{border-style:solid;border-width:3px}
 .cliffgrid{position:absolute;inset:auto 0 0 0;height:55%;display:grid;
            pointer-events:none}
 .cliffgrid div{border:1px solid rgba(255,255,255,.045)}
@@ -1525,6 +1700,18 @@ body.docs .b-docs{background:color-mix(in srgb,var(--series-1) 30%,var(--surface
 .calnow{font-size:.78rem;font-weight:600;font-variant-numeric:tabular-nums;
         color:var(--point);min-width:56px}
 .places{display:flex;gap:7px;flex-wrap:wrap;margin:9px 0}
+/* The label question: the frame that made the candidate, its box on top.
+   The box is in the camera's own frame, so both rotate together. */
+/* The map's click menu: floats over the canvas where you clicked. */
+.mapmenu{position:absolute;z-index:5;display:flex;flex-direction:column;gap:6px;
+  min-width:190px;padding:10px;background:var(--surface-1);border:1px solid var(--border);
+  border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.45)}
+.mapmenu button{font-size:.74rem;padding:7px 9px;text-align:left}
+.mapmenu .mm-t{font-size:.72rem;color:var(--text-2);font-weight:600}
+.mapmenu .mm-row{display:flex;gap:6px}
+.mapmenu .mm-row input{flex:1;min-width:0}
+.linkish{background:none;border:none;padding:0;color:inherit;font:inherit;cursor:pointer}
+.linkish:hover{text-decoration:underline}
 .place{display:inline-flex;align-items:center;gap:6px;padding:5px 9px;
   border:1px solid var(--border);border-radius:99px;background:var(--surface-2);
   font-size:.72rem;color:var(--text-1)}
@@ -1681,7 +1868,7 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
     <span id="lbadge" class="badge off"><i class="dot"></i>NO LIDAR</span>
     <span id="ibadge" class="badge off"><i class="dot"></i>NO IMU</span>
     <span id="cbadge" class="badge off"><i class="dot"></i>NO CAM</span>
-    <span id="fbadge" class="badge off"><i class="dot"></i>FLOOR</span>
+    <span id="fbadge" class="badge off" style="display:none"><i class="dot"></i>FLOOR</span>
     <span id="mbadge" class="badge off"><i class="dot"></i>TAGS</span>
     <div class="spacer"></div>
     <span class="livepose" id="toppose">&mdash;</span>
@@ -1887,15 +2074,25 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
   <div class="work">
 
     <div class="card pad0">
-      <div class="view"><canvas id="map"></canvas></div>
+      <div class="viewbar">
+        <button class="chip" onclick="mapFit()">Fit</button>
+        <button class="chip" id="m-follow" onclick="mapFollowToggle()">Follow truck</button>
+        <button class="chip" onclick="mapZoomBy(1.4)">+</button>
+        <button class="chip" onclick="mapZoomBy(1/1.4)">&minus;</button>
+        <span class="note" id="m-goal" style="margin:0"></span>
+        <button class="chip" id="m-cancel" style="display:none" onclick="post('/goto',{stop:true})">Cancel trip</button>
+      </div>
+      <div class="view">
+        <canvas id="map"></canvas>
+        <div id="m-menu" class="mapmenu" style="display:none"></div>
+      </div>
       <p class="note">
-        White is occupied, dark is free space the LiDAR has seen through, grey
-        is unknown. The violet line is the path driven, green dots are
-        recognised objects, cyan squares are known markers, cyan dots are
-        saved stills &mdash; click one to open the
-        picture. Mapping only happens once the robot has moved 40&nbsp;mm or
-        turned 4&deg;; integrating hundreds of identical scans while parked
-        makes the map over-confident about one viewpoint.
+        <b>Click the map</b> to send the truck there or name the room.
+        Scroll or pinch to zoom, drag to pan, double-click to fit. White is
+        wall, dark is free, grey is unknown; violet is the path driven, the
+        dashed line the planned route, green dots are objects, cyan dots are
+        stills (click to open). The map saves itself every 20&nbsp;s and
+        comes back after a restart.
       </p>
     </div>
 
@@ -1980,6 +2177,17 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
       </div>
 
       <div class="card">
+        <h2>Objects &middot; <span id="o-count" class="mono">&mdash;</span></h2>
+        <div class="places" id="o-list"></div>
+        <p class="note">
+          Saved <b>automatically</b> once the camera has seen a thing from
+          three different spots; seeing it again joins the one already there.
+          Nothing to answer. If one is wrong, <b>&times;</b> removes it for
+          good; click its name to rename it (e.g. <i>Dad's chair</i>).
+        </p>
+      </div>
+
+      <div class="card">
         <h2>Places</h2>
         <div class="places" id="places"></div>
         <div class="row2">
@@ -1987,8 +2195,11 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
           <button onclick="savePlace()">Save here</button>
         </div>
         <p class="note">
-          Saved spots are world coordinates in the current map, so save the map
-          before shutting down or they mean nothing next boot.
+          Rooms are spots in this map. Name one here, by clicking the map, or
+          by answering the truck's &ldquo;What room am I in?&rdquo;. Then
+          <b>Go</b> drives there on its own. <b>Reset map</b> clears rooms
+          and objects with it &mdash; they would point at walls that no
+          longer exist.
         </p>
       </div>
     </div>
@@ -2104,7 +2315,6 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
         <button id="t-auto-mm" onclick="toggleAutoShots()">Auto every 500 mm</button>
         <div class="chips" id="overlays" style="margin-left:auto">
           <button class="chip" data-ov="boxes">Boxes</button>
-          <button class="chip" data-ov="floor">Floor grid</button>
           <button class="chip" data-ov="none">Clean</button>
         </div>
         <span class="zoomnote" id="camnote"></span>
@@ -2118,8 +2328,6 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
         LiDAR range that will place it on the map. A <b>dashed amber</b> box
         was recognised but has no range behind it, so it cannot be placed
         &mdash; usually too far, or the scanner is looking under it.
-        <b>Floor grid</b> shows the cliff check instead: amber is something
-        that is not floor, red is a drop-off.
       </p>
     </div>
 
@@ -2139,7 +2347,7 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
         </p>
       </div>
 
-      <div class="card">
+      <div class="card" style="display:none">   <!-- floor check removed -->
         <h2>Floor check &middot; <span id="cliffstate" class="mono">&mdash;</span></h2>
         <div class="tog">
           <button id="t-cliff" onclick="post('/cliff',{enabled:!cliffOn})">Veto forward</button>
@@ -2233,6 +2441,34 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
           against yolov8m at 640 there.
           If the PC goes to sleep the robot falls back to the on-board model
           and says so here; mapping never depends on your laptop being awake.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Person &middot; <span id="p-state" class="mono">&mdash;</span></h2>
+        <div class="tog">
+          <button id="t-person" onclick="post('/person',{enabled:!personOn})">Track person</button>
+        </div>
+        <div class="stat"><span class="k">Distance</span><span class="v num mono" id="p-dist">&mdash;</span></div>
+        <div class="stat"><span class="k">Bearing (+left)</span><span class="v num mono" id="p-bear">&mdash;</span></div>
+        <div class="stat"><span class="k">LiDAR</span><span class="v num mono" id="p-lidar">&mdash;</span></div>
+        <div class="stat"><span class="k">Camera &middot; feet on floor</span><span class="v num mono" id="p-floor">&mdash;</span></div>
+        <div class="stat"><span class="k">Camera &middot; box size</span><span class="v num mono" id="p-size">&mdash;</span></div>
+        <div class="stat"><span class="k">Confidence &middot; people</span><span class="v num mono" id="p-conf">&mdash;</span></div>
+        <div class="stat"><span class="k">Rate &middot; cost</span><span class="v num mono" id="p-rate">&mdash;</span></div>
+        <div class="stat"><span class="k">Running on</span><span class="v mono" id="p-backend">&mdash;</span></div>
+        <div class="aerr" id="p-err"></div>
+        <p class="note">
+          Groundwork for <b>follow mode</b>: finds people, keeps the one it is
+          watching, and measures how far and which way. It does not drive
+          yet. <b>LiDAR</b> is the distance to steer on (legs, to the
+          centimetre); the two camera figures work without it but are rough
+          &mdash; <b>feet on floor</b> needs the feet in frame and a measured
+          camera height and tilt, <b>box size</b> assumes 0.45&nbsp;m of
+          shoulders. The target is ringed on the LiDAR plot.
+          With the detection server set, the PC's <b>/person</b> model runs at
+          ~5 frames a second; without it the Pi's own model manages ~1 and
+          costs CPU, so leave this off when not following.
         </p>
       </div>
 
@@ -2382,6 +2618,12 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
         <div class="ctl-hd"><label for="t-vol">Speech volume</label><span class="num mono" id="t-volv">100%</span></div>
         <input type="range" id="t-vol" min="10" max="200" step="5" value="100">
       </div>
+      <label class="lbl" for="t-url" style="margin-top:12px">Speech server on the PC
+        <span class="hint" id="t-engine"></span></label>
+      <div class="row2 tsay" style="margin-top:0">
+        <input type="text" id="t-url" placeholder="http://192.168.1.7:5005 — empty: the Pi speaks">
+        <button onclick="tpost('/tts/settings', {url: $('t-url').value})">Apply</button>
+      </div>
       <details class="voices" id="t-voicebox">
         <summary>Voices &mdash; download more</summary>
         <div id="t-voices"></div>
@@ -2400,6 +2642,11 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
         cuts off whatever is still talking</b> &mdash; nothing queues up. Speech
         holds a playing song and resumes it afterwards.
         Voices are stored in <b>test/voices/</b>.
+        With a <b>speech server on the PC</b> (tools/tts_server.py, or
+        <b>docker compose up</b> in tools/) the PC makes the audio instead
+        &mdash; a sentence in milliseconds, and no Pi CPU taken from SLAM. If
+        the PC stops answering, the Pi speaks for itself and tries the PC
+        again after 30 s.
       </p>
     </div>
 
@@ -2578,6 +2825,7 @@ let yaw = null, roll = 0, pitch = 0, headingOk = false;
 // and a socket open on the Pi for no reason.
 let camWant = true, camLive = false, camOn = false;
 let cliffOn = false, mkOn = false, mkLearn = false, detOn = false;
+let personOn = false, personT = null;   // person tracker; personT is ringed on the plot
 let objects = [];
 // What goes over the live picture. Boxes by default - a label is only
 // checkable if you can see WHICH thing it was put on.
@@ -2711,7 +2959,7 @@ function draw(){
   // front of the robot and watch that box go amber while the others stay
   // clear. That is the check: if the box covers the obstacle and the guard
   // has not blocked, the geometry is wrong.
-  if(guardOn) drawGuard(g, v);
+  drawGuard(g, v, w, h);
 
   // --- camera wedge, from where the LENS is ------------------------------
   //
@@ -2739,6 +2987,19 @@ function draw(){
     g.beginPath(); g.arc(sx,sy,dot,0,6.2832); g.fill();
   }
 
+  // --- the person being tracked: a ring where they stand, and the line the
+  // camera sees them along. Drawn from the LENS, like the wedge, because the
+  // bearing and distance are both measured from there.
+  if(personT && personT.body){
+    const [px, py] = P(v, personT.body[0], personT.body[1]);
+    const [cx, cy] = P(v, CAM_X, CAM_Y);
+    g.strokeStyle = css('--audio'); g.lineWidth = 2;
+    g.setLineDash([5,4]); g.beginPath(); g.moveTo(cx,cy); g.lineTo(px,py); g.stroke();
+    g.setLineDash([]); g.beginPath(); g.arc(px, py, Math.max(8, 250*v.s), 0, 6.2832); g.stroke();
+    g.fillStyle = css('--audio'); g.textAlign = 'left'; g.textBaseline = 'middle';
+    g.fillText(mm(personT.distance_mm) + ' ' + personT.source, px + Math.max(10, 260*v.s), py);
+  }
+
   // Cluster circles used to be drawn here. They were removed: cluster
   // identity is not stable frame to frame, so the rings flickered and
   // renumbered constantly while telling you nothing the points did not
@@ -2750,58 +3011,93 @@ function draw(){
   drawLegend(g, w, h, v);
 }
 
-// What the guard is testing, drawn exactly as swept_obstacle() computes it.
-function drawGuard(g, v){
-  const m = GUARD_MARGIN;
+// What the guard sees, as one picture: GREEN is open floor the scanner can
+// see into; RED is where the truck's CENTRE cannot go. Every return is drawn
+// as a truck-sized block (the footprint plus the guard's side margin) around
+// it, so "the centre dot touches red" is exactly "the car's outline touches
+// that point" - the same rule the guard enforces. Arrows round the truck are
+// the guard's own verdicts for each move, from /state, never recomputed here.
+const SIDE_MARGIN = 15;                    // SIDE_MARGIN_MM in the Python guard
+const redBuf = document.createElement('canvas');
+function drawGuard(g, v, w, h){
   const hl = TRUCK.len/2, hw = TRUCK.wid/2;
-  const half = hw + m;
+  const [lx, ly] = P(v, LIDAR_X, LIDAR_Y);
 
-  // A direction is blocked when its clearance is under the stop distance.
-  // clearance.* is null when nothing is in that region at all.
-  const blocked = k => clearance[k] != null && clearance[k] < stopMm;
+  // Returns in the body frame, filtered exactly as body_points() filters.
+  const seen = [], obst = [];
+  for(const [a, d] of pts){
+    if(d < 120) continue;
+    const [x, y] = toBody(a, d);
+    seen.push([a, x, y]);
+    if(!(Math.abs(x) <= hl && Math.abs(y) <= hw)) obst.push([x, y]);
+  }
 
-  // Body-frame rectangle -> screen. P() flips both axes, so min/max have to
-  // be taken after projecting rather than assumed.
-  const boxOf = (x0,x1,y0,y1) => {
-    const a = P(v,x0,y0), b = P(v,x1,y1);
-    return [Math.min(a[0],b[0]), Math.min(a[1],b[1]),
-            Math.abs(b[0]-a[0]), Math.abs(b[1]-a[1])];
-  };
-
-  const region = (r, bad, label) => {
-    g.fillStyle = bad ? css('--warning') : css('--text-3');
-    g.globalAlpha = bad ? .20 : .07;
-    g.fillRect(r[0],r[1],r[2],r[3]);
-    g.globalAlpha = bad ? .9 : .45;
-    g.strokeStyle = bad ? css('--warning') : css('--grid');
-    g.lineWidth = 1; g.setLineDash(bad ? [] : [3,3]);
-    g.strokeRect(r[0],r[1],r[2],r[3]); g.setLineDash([]);
-    if(label && r[2] > 40 && r[3] > 14){
-      g.globalAlpha = .85; g.font = '9px ui-monospace,monospace';
-      g.fillStyle = bad ? css('--warning') : css('--text-3');
-      g.textAlign = 'center'; g.textBaseline = 'middle';
-      g.fillText(label, r[0]+r[2]/2, r[1]+r[3]/2);
+  // GREEN: the polygon the scanner sees through, in bearing order. A gap of
+  // more than 8 degrees with no return is unknown, not free, so the outline
+  // goes back to the scanner across it instead of painting it green.
+  if(seen.length > 2){
+    seen.sort((p, q) => p[0] - q[0]);
+    g.beginPath(); g.moveTo(lx, ly);
+    let prev = null;
+    for(const [a, x, y] of seen){
+      const [sx, sy] = P(v, x, y);
+      if(prev !== null && a - prev > 8){ g.lineTo(lx, ly); }
+      g.lineTo(sx, sy);
+      prev = a;
     }
-    g.globalAlpha = 1;
+    g.closePath();
+    g.fillStyle = css('--good'); g.globalAlpha = .26; g.fill(); g.globalAlpha = 1;
+  }
+
+  // RED: the no-go area for the centre. Drawn solid off-screen and laid on
+  // once, so overlapping blocks do not stack into darker patches.
+  const dpr = Math.min(2, devicePixelRatio || 1);
+  if(redBuf.width !== Math.round(w*dpr) || redBuf.height !== Math.round(h*dpr)){
+    redBuf.width = Math.round(w*dpr); redBuf.height = Math.round(h*dpr);
+  }
+  const rg = redBuf.getContext('2d');
+  rg.setTransform(dpr, 0, 0, dpr, 0, 0);
+  rg.clearRect(0, 0, w, h);
+  rg.fillStyle = css('--critical');
+  const bw = (hw + SIDE_MARGIN) * v.s, bh = hl * v.s;     // half-sizes on screen
+  for(const [x, y] of obst){
+    const [sx, sy] = P(v, x, y);
+    if(sx < -bw || sy < -bh || sx > w + bw || sy > h + bh) continue;
+    rg.fillRect(sx - bw, sy - bh, 2*bw, 2*bh);
+  }
+  g.globalAlpha = .42; g.drawImage(redBuf, 0, 0, w, h); g.globalAlpha = 1;
+
+  // The centre: this dot must stay in the green.
+  const [cx, cy] = P(v, 0, 0);
+  g.fillStyle = '#fff';
+  g.beginPath(); g.arc(cx, cy, 3, 0, 6.2832); g.fill();
+
+  // The guard's verdict for each move.
+  const verdict = k => !guardOn ? 'off'
+    : (clearance[k] != null && clearance[k] < stopMm ? 'no' : 'ok');
+  const col = s_ => s_ === 'ok' ? css('--good') : (s_ === 'no' ? css('--critical') : css('--text-3'));
+  const tri = (x, y, up, s_) => {
+    const k = up ? -1 : 1;
+    g.fillStyle = col(s_); g.globalAlpha = s_ === 'off' ? .5 : .95;
+    g.beginPath(); g.moveTo(x, y + k*9); g.lineTo(x - 8, y - k*5); g.lineTo(x + 8, y - k*5);
+    g.closePath(); g.fill(); g.globalAlpha = 1;
   };
+  const [fx, fy] = P(v, hl, 0), [rx, ry] = P(v, -hl, 0);
+  tri(fx, fy - 16, true, verdict('fwd'));
+  tri(rx, ry + 16, false, verdict('rev'));
+  g.font = 'bold 16px system-ui,sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  const [ax, ay] = P(v, 0, hw), [bx, by] = P(v, 0, -hw);
+  [['left', ax - 16, ay, '⟲'], ['right', bx + 16, by, '⟳']].forEach(([k, x, y, t]) => {
+    const s_ = verdict(k);
+    g.fillStyle = col(s_); g.globalAlpha = s_ === 'off' ? .5 : .95;
+    g.fillText(t, x, y); g.globalAlpha = 1;
+  });
 
-  const reach = stopMm + m;
-  region(boxOf(hl, hl + reach, -half, half), blocked('fwd'),
-         clearance.fwd != null ? mm(clearance.fwd) : 'forward');
-  region(boxOf(-hl - reach, -hl, -half, half), blocked('rev'),
-         clearance.rev != null ? mm(clearance.rev) : 'reverse');
-
-  // Turning sweeps a circle of the circumscribing radius. Half margin, as in
-  // the Python: momentum carries a corner around the SAME circle, so only
-  // sensor noise and pose error have to be covered.
-  const cr = (Math.hypot(hl, hw) + m/2) * v.s;
-  const [cxp, cyp] = P(v, 0, 0);
-  const turnBad = blocked('turn');
-  g.strokeStyle = turnBad ? css('--warning') : css('--grid');
-  g.globalAlpha = turnBad ? .9 : .5; g.lineWidth = turnBad ? 1.5 : 1;
-  g.setLineDash([5,4]);
-  g.beginPath(); g.arc(cxp, cyp, cr, 0, 6.2832); g.stroke();
-  g.setLineDash([]); g.globalAlpha = 1;
+  // Key, bottom-left.
+  g.font = '10px ui-monospace,monospace'; g.textAlign = 'left'; g.textBaseline = 'alphabetic';
+  g.fillStyle = css('--text-3');
+  g.fillText(guardOn ? 'green: free  ·  red: the centre dot cannot go there'
+                     : 'GUARD OFF  ·  nothing is being blocked', 8, h - 8);
 }
 
 // The truck, and every sensor drawn where it physically sits.
@@ -3084,15 +3380,25 @@ function sendDrive(){
   fetch('/drive',{method:'POST',headers:{'Content-Type':'application/json'},
                   body:JSON.stringify({throttle,steer})});
 }
+// Typing is not driving. Without this, naming a room "bedroom" or "washroom"
+// sent D, W, A, S to the motors, and a space in "living room" was an e-stop.
+const typing = e => e.target && (e.target.isContentEditable
+  || /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName));
 addEventListener('keydown', e => {
+  if(typing(e)) return;
   if(e.code === 'Space'){ e.preventDefault(); cmd('/estop'); keys.clear(); paint(); return; }
   const k = MAP[e.code]; if(!k || e.repeat) return;
   e.preventDefault();                        // arrow keys must not scroll
   keys.add(k); paint();
   sendDrive();          // go now; waiting for the tick added up to 50 ms
 });
+// keyup is NOT filtered: a key held while focus moves into a box must still
+// release, or it would latch on.
+// Only a key that was driving sends anything on release: typing W-A-S-D into
+// a name box otherwise fired a zero-speed /drive per letter, and each one
+// briefly overrode a trip in progress.
 addEventListener('keyup', e => { const k = MAP[e.code];
-  if(k){ e.preventDefault(); keys.delete(k); paint(); sendDrive(); } });
+  if(k && keys.has(k)){ e.preventDefault(); keys.delete(k); paint(); sendDrive(); } });
 addEventListener('blur', () => { keys.clear(); paint(); });   // never latch on
 for(const [id,k] of Object.entries(PADS)){
   const el = $(id);
@@ -3145,6 +3451,7 @@ function setDetectUrl(){
 }
 
 function setOverlay(v){
+  if(v === 'floor') v = 'boxes';        // the floor grid is gone; old saved choice
   overlay = v;
   try { localStorage.setItem('nav.overlay', v); } catch(e) {}
   document.querySelectorAll('#overlays .chip').forEach(b =>
@@ -3168,14 +3475,29 @@ function drawBoxes(seen){
   el.innerHTML = seen.filter(o => o.box).map(o => {
     const [x0,y0,x1,y1] = o.box;
     // A box with no range behind it was seen but could not be placed.
-    const cls = o.placed ? 'detbox' : 'detbox noplace';
-    const tag = o.label.replace('_',' ') + ' ' + ((o.conf*100)|0) + '%'
-              + (o.range != null ? ' · ' + mm(o.range) : ' · no range');
+    // People (personBoxes) arrive with their own class and caption.
+    const cls = o.cls || (o.placed ? 'detbox' : 'detbox noplace');
+    const tag = o.tag || (o.label.replace('_',' ') + ' ' + ((o.conf*100)|0) + '%'
+              + (o.range != null ? ' · ' + mm(o.range) : ' · no range'));
     return `<div class="${cls}" style="left:${(x0*100).toFixed(2)}%;`
          + `top:${(y0*100).toFixed(2)}%;`
          + `width:${((x1-x0)*100).toFixed(2)}%;`
          + `height:${((y1-y0)*100).toFixed(2)}%"><b>${tag}</b></div>`;
   }).join('');
+}
+
+// The person tracker's boxes, in drawBoxes' shape. Caption: the distance and
+// which sensor it came from, because "1.4 m" from the LiDAR and "1.4 m" from
+// the box size deserve very different amounts of trust.
+function personBoxes(p){
+  if(!p || !p.enabled || !p.people) return [];
+  const t = p.target;
+  return p.people.map(o => {
+    const target = t && o.bearing === t.bearing && o.conf === t.conf;
+    return {box: o.box, cls: 'detbox person' + (target ? ' target' : ''),
+            tag: (target ? '▶ ' : '') + 'person ' + ((o.conf*100)|0) + '%'
+                 + (o.distance_mm != null ? ' · ' + mm(o.distance_mm) + ' ' + o.source : '')};
+  });
 }
 
 // Prose off by default. It is what a new person needs and what everyone else
@@ -3293,45 +3615,129 @@ function showCal(msg, kind, html){
   if(html) el.innerHTML = msg; else el.textContent = msg;
 }
 
+// --- rooms (places) and objects ---------------------------------------------
+// Names are text a person typed or SAID, so they never go into HTML or code
+// unescaped: "Kid's room" used to break its own Go button. Buttons carry an
+// index into the current list instead of the name.
+const escHtml = s => String(s).replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function postJson(u, b){
+  return fetch(u, {method:'POST', headers:{'Content-Type':'application/json'},
+                   body: JSON.stringify(b)}).then(r => r.json());
+}
+
+let placeNames = [];
+let placesData = {};                 // {name: [x, y]} — drawn on the map as room names
 function savePlace(){
   const n = $('pname').value.trim();
-  if(n){ post('/places',{name:n}); $('pname').value=''; }
+  if(n){ postJson('/places', {name: n}).then(refreshPlaces).catch(()=>{}); $('pname').value = ''; }
+}
+function goPlace(i){ if(placeNames[i] != null) goto({name: placeNames[i]}); }
+function delPlace(i){
+  if(placeNames[i] != null) postJson('/places', {name: placeNames[i], delete: true}).then(refreshPlaces).catch(()=>{});
 }
 function renderPlaces(d){
-  const list = Object.entries(d || {});
+  const list = Object.keys(d || {});
+  placeNames = list;
   $('places').innerHTML = list.length
-    ? list.map(([k,v]) =>
-        `<span class="place">${k}` +
-        `<button class="b-auto" onclick="post('/goto',{name:'${k}'})">Go</button>` +
-        `<button class="x" onclick="post('/places',{name:'${k}',delete:true})">×</button>` +
+    ? list.map((k, i) =>
+        `<span class="place">${escHtml(k)}` +
+        `<button class="b-auto" onclick="goPlace(${i})">Go</button>` +
+        `<button class="x" title="forget this room" onclick="delPlace(${i})">×</button>` +
         `</span>`).join('')
-    : '<span class="note">no places saved yet</span>';
+    : '<span class="note">no rooms named yet</span>';
 }
 function refreshPlaces(){
-  fetch('/places').then(r=>r.json()).then(d=>renderPlaces(d.places)).catch(()=>{});
+  fetch('/places').then(r => r.json()).then(d => {
+    placesData = d.places || {}; renderPlaces(placesData); drawMap();
+  }).catch(() => {});
 }
 setInterval(refreshPlaces, 4000); refreshPlaces();
 
+// Send the truck somewhere: {name} for a room, {x, y, name} for a point.
+function goto(body){
+  hideMapMenu();
+  postJson('/goto', body).then(d => {
+    $('m-goal').textContent = d.error || d.message || '';
+  }).catch(() => {});
+}
+
+// Objects are saved automatically; this list is only for corrections.
+let objKeys = [], objNames = [], lastObjHtml = '', editingObj = false;
+function renderObjects(list){
+  if(editingObj) return;             // do not yank the box out from under typing
+  objKeys = list.map(o => o.key);
+  objNames = list.map(o => o.label.replace(/_/g, ' '));
+  $('o-count').textContent = list.length ? list.length + ' saved' : 'none yet';
+  const html = list.length
+    ? list.map((o, i) =>
+        `<span class="place"><button class="linkish" title="rename" onclick="renameObj(${i})">`
+        + `${escHtml(objNames[i])}</button>`
+        + `<button class="x" title="wrong — remove it" onclick="removeObj(${i})">×</button></span>`).join('')
+    : '<span class="note">none yet — drive around with Objects on (Vision tab)</span>';
+  if(html !== lastObjHtml){ $('o-list').innerHTML = html; lastObjHtml = html; }
+}
+function removeObj(i){
+  if(objKeys[i] == null) return;
+  hideMapMenu();
+  postJson('/objects', {key: objKeys[i], remove: true}).then(poll).catch(() => {});
+}
+function renameObj(i){
+  const key = objKeys[i], chip = document.querySelectorAll('#o-list .place')[i];
+  if(key == null || !chip) return;
+  hideMapMenu();
+  editingObj = true;
+  chip.innerHTML = '<input type="text" maxlength="40" style="width:11em">';
+  const inp = chip.querySelector('input');
+  inp.value = objNames[i]; inp.focus(); inp.select();
+  let finished = false;
+  const done = save => {
+    if(finished) return;
+    finished = true; editingObj = false; lastObjHtml = '';
+    const n = inp.value.trim();
+    if(save && n && n !== objNames[i]) postJson('/objects', {key, name: n}).then(poll).catch(() => {});
+    else renderObjects(objects);
+  };
+  inp.addEventListener('keydown', e => {
+    if(e.key === 'Enter') done(true);
+    if(e.key === 'Escape') done(false);
+  });
+  inp.addEventListener('blur', () => done(true));
+}
+
+// --- the map ----------------------------------------------------------------
+//
+// View: mv.s pixels per mm, centred on world (mv.cx, mv.cy); x right, y up.
+//   screen x = w/2 + (x - cx)*s        screen y = h/2 - (y - cy)*s
+// Until the person zooms or pans it re-fits to the explored area on every
+// update, so a growing map never runs off the edge; once they have, it stays
+// where they put it (Fit returns to auto).
+//
+// The server sends only the explored rectangle of the grid (x0, y0, w, h in
+// cells); everything outside it is unknown and painted as such.
+
 function toggleAuto(){ post('/explore', autoOn ? {stop:true} : {start:true}); }
 let slamOn = true, matchOn = true, mapImg = null, trail = [], mapMeta = null;
+let truckPose = null, exGoal = null, exPath = [];
 const mapBuf = document.createElement('canvas');
+const mv = {s: null, cx: 0, cy: 0, follow: false, user: false};
+
+// byte -> grey: 128 unknown, below free (dark), above occupied (white)
+const MAP_LUT = new Uint8Array(256);
+for(let p = 0; p < 256; p++)
+  MAP_LUT[p] = p === 128 ? 40 : (p < 128 ? 22 + (p/128)*14 : 90 + ((p-128)/127)*165);
 
 function fetchMap(){
   fetch('/map').then(r => r.json()).then(d => {
     mapMeta = d; trail = d.trail || [];
-    const raw = atob(d.data), n = d.n;
-    mapBuf.width = n; mapBuf.height = n;
+    if(!truckPose) truckPose = d.pose;
+    const raw = atob(d.data), w = d.w, h = d.h;
+    mapBuf.width = w; mapBuf.height = h;
     const ctx = mapBuf.getContext('2d');
-    const img = ctx.createImageData(n, n);
+    const img = ctx.createImageData(w, h);
     for(let i = 0; i < raw.length; i++){
-      const p = raw.charCodeAt(i);
-      // 128 = unknown -> grey; below = free (dark); above = occupied (white)
-      let v, a;
-      if(p === 128){ v = 40; a = 255; }
-      else if(p < 128){ v = 22 + (p/128)*14; a = 255; }
-      else { v = 90 + ((p-128)/127)*165; a = 255; }
-      const j = i*4;
-      img.data[j] = img.data[j+1] = img.data[j+2] = v; img.data[j+3] = a;
+      const v = MAP_LUT[raw.charCodeAt(i)], j = i*4;
+      img.data[j] = img.data[j+1] = img.data[j+2] = v; img.data[j+3] = 255;
     }
     ctx.putImageData(img, 0, 0);
     mapImg = true;
@@ -3339,20 +3745,61 @@ function fetchMap(){
   }).catch(() => {});
 }
 
+function mapSize(){
+  const b = $('map').parentElement.getBoundingClientRect();
+  return [b.width, b.height];
+}
+function fitView(w, h){
+  const m = mapMeta, r = m.res;
+  const x0 = (m.x0 - m.half)*r, y0 = (m.y0 - m.half)*r;
+  const x1 = x0 + m.w*r, y1 = y0 + m.h*r;
+  mv.s = Math.min(w/(x1 - x0), h/(y1 - y0)) * 0.95;
+  mv.cx = (x0 + x1)/2; mv.cy = (y0 + y1)/2;
+}
+function mapFit(){ mv.user = false; mv.follow = false; syncFollowBtn(); drawMap(); }
+function mapFollowToggle(){
+  mv.follow = !mv.follow; mv.user = true; syncFollowBtn(); drawMap();
+}
+function syncFollowBtn(){ $('m-follow').classList.toggle('sel', mv.follow); }
+// Zoom about a screen point, default the centre, keeping what is under it still.
+function mapZoomBy(f, sx, sy){
+  const [w, h] = mapSize();
+  if(!mapMeta || w < 2) return;
+  if(mv.s == null) fitView(w, h);
+  if(sx == null){ sx = w/2; sy = h/2; }
+  const wx = mv.cx + (sx - w/2)/mv.s, wy = mv.cy - (sy - h/2)/mv.s;
+  mv.s = Math.max(0.004, Math.min(2, mv.s*f));
+  mv.cx = wx - (sx - w/2)/mv.s; mv.cy = wy + (sy - h/2)/mv.s;
+  mv.user = true;
+  drawMap();
+}
+function mapToWorld(sx, sy){
+  const [w, h] = mapSize();
+  return [mv.cx + (sx - w/2)/mv.s, mv.cy - (sy - h/2)/mv.s];
+}
+
 function drawMap(){
   if(tab !== 'map') return;
   const c = $('map');
   const [g, w, h] = fitCanvas(c);
   if(w < 2 || h < 2 || !mapMeta) return;
-  const n = mapMeta.n, S = Math.min(w,h)/n;      // pixels per cell
-  g.imageSmoothingEnabled = false;
-  // grid row 0 is -y, and canvas y grows downward, so flip to put +y up
-  g.save(); g.translate(0, h); g.scale(1, -1);
-  if(mapImg) g.drawImage(mapBuf, 0, 0, n*S, n*S);
-  g.restore();
+  if(mv.s == null || !mv.user) fitView(w, h);
+  if(mv.follow && truckPose){ mv.cx = truckPose.x; mv.cy = truckPose.y; }
+  const s = mv.s;
+  const X = x => w/2 + (x - mv.cx)*s;
+  const Y = y => h/2 - (y - mv.cy)*s;
 
-  const X = mx => (mx/mapMeta.res + mapMeta.half)*S;
-  const Y = my => h - (my/mapMeta.res + mapMeta.half)*S;
+  // Unknown everywhere first, then the explored rectangle on top of it.
+  g.fillStyle = 'rgb(40,40,40)'; g.fillRect(0, 0, w, h);
+  const m = mapMeta, r = m.res;
+  g.imageSmoothingEnabled = false;
+  if(mapImg){
+    g.save();
+    g.translate(X((m.x0 - m.half)*r), Y((m.y0 - m.half)*r));
+    g.scale(s*r, -s*r);                 // grid row 0 is the lowest y: flip
+    g.drawImage(mapBuf, 0, 0);
+    g.restore();
+  }
 
   if(trail.length > 1){
     g.strokeStyle = css('--imu'); g.lineWidth = 1.5; g.globalAlpha = .85;
@@ -3360,63 +3807,180 @@ function drawMap(){
     trail.forEach(([x,y],i) => i ? g.lineTo(X(x),Y(y)) : g.moveTo(X(x),Y(y)));
     g.stroke(); g.globalAlpha = 1;
   }
-  const p = mapMeta.pose;
-  const px = X(p.x), py = Y(p.y), th = -p.deg*Math.PI/180;   // screen y is up
-  g.fillStyle = css('--good');
-  g.beginPath();
-  g.moveTo(px + Math.cos(th)*9, py + Math.sin(th)*9);
-  g.lineTo(px + Math.cos(th+2.5)*6, py + Math.sin(th+2.5)*6);
-  g.lineTo(px + Math.cos(th-2.5)*6, py + Math.sin(th-2.5)*6);
-  g.closePath(); g.fill();
+
+  // The planned route and where it ends.
+  if(exPath && exPath.length > 1){
+    g.strokeStyle = css('--good'); g.lineWidth = 2; g.setLineDash([6, 5]);
+    g.beginPath();
+    exPath.forEach(([x,y],i) => i ? g.lineTo(X(x),Y(y)) : g.moveTo(X(x),Y(y)));
+    g.stroke(); g.setLineDash([]);
+  }
+  if(exGoal){
+    const gx = X(exGoal[0]), gy = Y(exGoal[1]);
+    g.strokeStyle = css('--good'); g.lineWidth = 2;
+    g.beginPath(); g.arc(gx, gy, 9, 0, 6.2832); g.stroke();
+    g.beginPath(); g.arc(gx, gy, 3, 0, 6.2832); g.fillStyle = css('--good'); g.fill();
+  }
+
+  // Room names, large and underneath like a floor plan.
+  g.font = '600 13px system-ui,sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillStyle = css('--text-1') || '#ddd'; g.globalAlpha = .8;
+  Object.entries(placesData).forEach(([name, [x, y]]) => g.fillText(name, X(x), Y(y)));
+  g.globalAlpha = 1; g.textBaseline = 'alphabetic';
 
   // Known markers. Squares, because they are squares.
-  g.fillStyle = css('--cam');
+  g.fillStyle = css('--cam'); g.font = '8px ui-monospace,monospace';
   knownTags.forEach(t => {
     const x = X(t.x), y = Y(t.y);
     g.fillRect(x-3.5, y-3.5, 7, 7);
-    g.font = '8px ui-monospace,monospace'; g.textAlign = 'center';
     g.fillText(t.id, x, y-6);
   });
 
-  // Object labels. Drawn before the photo pins so a pin stays clickable.
-  g.font = '9px ui-monospace,monospace'; g.textAlign = 'center';
-  objects.forEach(o => {
+  // Hit targets, recorded where they are drawn so a click and the picture
+  // can never disagree about where something is.
+  mapHit = [];
+  g.font = '600 11px system-ui,sans-serif'; g.textAlign = 'center';
+  objects.forEach((o, i) => {
     const x = X(o.x), y = Y(o.y);
     g.fillStyle = css('--obj');
-    g.beginPath(); g.arc(x, y, 3.5, 0, 6.2832); g.fill();
-    g.globalAlpha = .9;
-    g.fillText(o.label.replace('_',' '), x, y - 7);
-    g.globalAlpha = 1;
+    g.beginPath(); g.arc(x, y, 4.5, 0, 6.2832); g.fill();
+    // Light text on a dark halo: the dot's green on the dark floor was unreadable.
+    g.lineWidth = 3; g.strokeStyle = 'rgba(0,0,0,.75)'; g.fillStyle = '#e8f5ec';
+    g.strokeText(o.label.replace(/_/g,' '), x, y - 9);
+    g.fillText(o.label.replace(/_/g,' '), x, y - 9);
+    mapHit.push({x, y, kind: 'obj', i, o});
   });
-
-  // Photo pins, and where each one is on screen so a click can find it.
-  // Recorded here rather than recomputed on click: the map is pan-free but
-  // it does rescale with the window, and two copies of the projection would
-  // drift apart the first time one changed.
-  mapHit = [];
-  g.globalAlpha = .9;
+  g.globalAlpha = .9; g.fillStyle = css('--cam');
   shots.forEach(sh => {
     if(sh.x === undefined) return;
     const x = X(sh.x), y = Y(sh.y);
-    g.fillStyle = css('--cam');
     g.beginPath(); g.arc(x, y, 2.6, 0, 6.2832); g.fill();
-    mapHit.push({x, y, file: sh.file});
+    mapHit.push({x, y, kind: 'shot', file: sh.file});
   });
   g.globalAlpha = 1;
+
+  // The truck, from the fast /state poll rather than the 1 Hz map.
+  const p = truckPose || m.pose;
+  const px = X(p.x), py = Y(p.y), th = -p.deg*Math.PI/180;   // screen y is down
+  g.fillStyle = css('--good');
+  g.beginPath();
+  g.moveTo(px + Math.cos(th)*11, py + Math.sin(th)*11);
+  g.lineTo(px + Math.cos(th+2.5)*7, py + Math.sin(th+2.5)*7);
+  g.lineTo(px + Math.cos(th-2.5)*7, py + Math.sin(th-2.5)*7);
+  g.closePath(); g.fill();
+
+  // Scale bar: the largest round length under ~90 px.
+  const steps = [100, 200, 500, 1000, 2000, 5000, 10000];
+  const len = steps.filter(v => v*s <= 90).pop() || steps[0];
+  g.strokeStyle = css('--text-2'); g.fillStyle = css('--text-2'); g.lineWidth = 2;
+  g.beginPath(); g.moveTo(12, h - 14); g.lineTo(12 + len*s, h - 14); g.stroke();
+  g.font = '10px ui-monospace,monospace'; g.textAlign = 'left';
+  g.fillText(len >= 1000 ? (len/1000) + ' m' : len + ' mm', 12, h - 20);
 }
 
-// Click a pin to open the picture taken there. 9 px of slack, because a
-// 2.6 px dot is not a realistic target on a phone.
-$('map').addEventListener('click', e => {
-  const r = $('map').getBoundingClientRect();
-  const cx = e.clientX - r.left, cy = e.clientY - r.top;
-  let best = null, bd = 9;
-  mapHit.forEach(h => {
-    const d = Math.hypot(h.x-cx, h.y-cy);
-    if(d < bd){ bd = d; best = h; }
+// --- map input: drag pans, wheel/pinch zooms, a click opens the menu ---------
+(function mapInput(){
+  const c = $('map');
+  const ptrs = new Map();
+  let moved = false, pinch0 = null;
+  c.addEventListener('wheel', e => {
+    e.preventDefault();
+    mapZoomBy(e.deltaY < 0 ? 1.2 : 1/1.2, e.offsetX, e.offsetY);
+  }, {passive: false});
+  c.addEventListener('pointerdown', e => {
+    hideMapMenu();
+    ptrs.set(e.pointerId, {x: e.offsetX, y: e.offsetY});
+    c.setPointerCapture(e.pointerId);
+    moved = false;
+    if(ptrs.size === 2){
+      const [a, b] = [...ptrs.values()];
+      pinch0 = {d: Math.hypot(a.x-b.x, a.y-b.y), mx: (a.x+b.x)/2, my: (a.y+b.y)/2};
+    }
   });
-  if(best) window.open('/captures/' + encodeURIComponent(best.file));
-});
+  c.addEventListener('pointermove', e => {
+    const last = ptrs.get(e.pointerId);
+    if(!last || mv.s == null) return;
+    const dx = e.offsetX - last.x, dy = e.offsetY - last.y;
+    ptrs.set(e.pointerId, {x: e.offsetX, y: e.offsetY});
+    if(ptrs.size === 2 && pinch0){
+      const [a, b] = [...ptrs.values()];
+      const d = Math.hypot(a.x-b.x, a.y-b.y);
+      if(pinch0.d > 0) mapZoomBy(d/pinch0.d, pinch0.mx, pinch0.my);
+      pinch0.d = d; moved = true;
+      return;
+    }
+    if(!moved && Math.hypot(dx, dy) < 4) return;   // a shaky click is a click
+    moved = true;
+    mv.cx -= dx/mv.s; mv.cy += dy/mv.s;
+    mv.user = true; mv.follow = false; syncFollowBtn();
+    drawMap();
+  });
+  const up = e => {
+    const had = ptrs.delete(e.pointerId);
+    if(ptrs.size < 2) pinch0 = null;
+    if(had && !moved && ptrs.size === 0 && e.type === 'pointerup') mapClick(e.offsetX, e.offsetY);
+  };
+  c.addEventListener('pointerup', up);
+  c.addEventListener('pointercancel', up);
+  c.addEventListener('dblclick', () => { hideMapMenu(); mapFit(); });
+})();
+
+function hideMapMenu(){ const mm_ = $('m-menu'); if(mm_) mm_.style.display = 'none'; }
+
+// A click: a photo pin opens the photo; an object or an empty spot opens a
+// small menu. Nothing moves until a menu item is chosen.
+function mapClick(sx, sy){
+  let best = null, bd = 12;
+  mapHit.forEach(hh => {
+    const d = Math.hypot(hh.x - sx, hh.y - sy);
+    if(d < bd){ bd = d; best = hh; }
+  });
+  if(best && best.kind === 'shot'){ window.open('/captures/' + encodeURIComponent(best.file)); return; }
+
+  const [wx, wy] = best ? [best.o.x, best.o.y] : mapToWorld(sx, sy);
+  const p = truckPose || (mapMeta && mapMeta.pose) || {x: 0, y: 0};
+  const dist = mm(Math.hypot(wx - p.x, wy - p.y));
+  const menu = $('m-menu');
+  if(best){
+    const name = objNames[best.i] || best.o.label;
+    menu.innerHTML =
+      `<div class="mm-t">${escHtml(name)}</div>`
+      + `<button data-a="go" class="b-auto">Go to it · ${dist}</button>`
+      + `<button data-a="rename">Rename</button>`
+      + `<button data-a="remove" class="b-stop">Wrong — remove</button>`
+      + `<button data-a="close">Cancel</button>`;
+  } else {
+    menu.innerHTML =
+      `<div class="mm-t">${(wx/1000).toFixed(1)}, ${(wy/1000).toFixed(1)} m</div>`
+      + `<button data-a="go" class="b-auto">Go here · ${dist}</button>`
+      + `<div class="mm-row"><input type="text" maxlength="40" placeholder="name this room">`
+      + `<button data-a="name">Save</button></div>`
+      + `<button data-a="close">Cancel</button>`;
+  }
+  const [w, h] = mapSize();
+  menu.style.display = '';
+  menu.style.left = Math.max(4, Math.min(w - menu.offsetWidth - 4, sx + 8)) + 'px';
+  menu.style.top = Math.max(4, Math.min(h - menu.offsetHeight - 4, sy + 8)) + 'px';
+  const inp = menu.querySelector('input');
+  const nameIt = () => {
+    const n = inp.value.trim();
+    if(!n) return;
+    postJson('/places', {name: n, x: wx, y: wy}).then(refreshPlaces).catch(() => {});
+    hideMapMenu();
+  };
+  if(inp) inp.addEventListener('keydown', e => {
+    if(e.key === 'Enter') nameIt();
+    if(e.key === 'Escape') hideMapMenu();
+  });
+  menu.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+    const a = b.dataset.a;
+    if(a === 'go') goto({x: wx, y: wy, name: best ? (objNames[best.i] || best.o.label) : ''});
+    else if(a === 'name') nameIt();
+    else if(a === 'rename'){ showTab('map'); renameObj(best.i); }
+    else if(a === 'remove') removeObj(best.i);
+    else hideMapMenu();
+  }));
+}
 
 function fetchShots(){
   fetch('/captures').then(r => r.json()).then(d => {
@@ -3461,8 +4025,12 @@ function poll(){
 
     $('badge').className = 'badge ' + (m.enabled ? 'on':'off');
     $('badge').innerHTML = '<i class="dot"></i>' + (m.enabled ? 'ENABLED':'DISABLED');
-    $('lbadge').className = 'badge ' + (l.connected && l.count ? 'on':'off');
-    $('lbadge').innerHTML = '<i class="dot"></i>' + (l.connected && l.count ? 'SCANNING':'NO LIDAR');
+    // "Scanning" only while scans are actually arriving: an old scan still
+    // has points, which is how a frozen scanner once looked perfectly healthy.
+    const lok = l.connected && l.count && l.hz > 0;
+    $('lbadge').className = 'badge ' + (lok ? 'on' : (l.connected ? 'warn' : 'off'));
+    $('lbadge').innerHTML = '<i class="dot"></i>' + (lok ? 'SCANNING' : (l.connected ? 'LIDAR STALLED' : 'NO LIDAR'));
+    $('lbadge').title = l.error || (l.age_s != null ? 'last scan ' + l.age_s + ' s ago' : '');
     $('trip').classList.toggle('show', !!m.tripped);
 
     const cl = gd.clear || {};
@@ -3566,9 +4134,11 @@ function poll(){
                            +' mm / '+sl.correction.deg.toFixed(1)+'°';
     $('pms').textContent = sl.ms.toFixed(1)+' ms';
     $('pcnt').textContent = sl.counts[0]+' / '+sl.counts[1];
-    $('slamnote').textContent = sl.imu_heading
+    $('slamnote').textContent = (sl.imu_heading
       ? 'Heading from the IMU; scan matching correcting the rest.'
-      : 'No IMU heading fix — heading is coming from wheel difference, which slip corrupts fast.';
+      : 'No IMU heading fix — heading is coming from wheel difference, which slip corrupts fast.')
+      + (sl.map_note ? '  ·  ' + sl.map_note : '');
+    truckPose = sl.pose;
 
     const ex = d.explore || {};
     autoOn = !!ex.running;
@@ -3579,6 +4149,13 @@ function poll(){
         + `${ex.cal_stage && ex.cal_stage!=='done' ? ex.cal_stage : ex.message}`
         + `  ·  frontiers ${ex.frontiers}  path ${ex.path_len}  ${ex.elapsed}s`
       : (ex.message || 'idle');
+    // The trip, on the map tab: where to, the route, and a way to call it off.
+    const trip = ex.running && ex.state === 'goto';
+    exGoal = trip ? ex.goal_xy : null;
+    exPath = ex.running ? (ex.path_mm || []) : [];
+    $('m-cancel').style.display = trip ? '' : 'none';
+    $('m-goal').textContent = trip ? '→ ' + ex.goal + ' · ' + (ex.message || '')
+      : (['done', 'failed'].includes(ex.state) ? ex.message : '');
     const cr = ex.cal_results || {}, cn = ex.cal_notes || [];
     if(Object.keys(cr).length || cn.length){
       $('calbox').style.display = 'block';
@@ -3648,7 +4225,7 @@ function poll(){
     $('f-geom').textContent = (cf.pitch != null)
       ? cf.pitch.toFixed(0)+'° down, '+cf.height.toFixed(0)+' mm up' : '—';
     $('f-ms').textContent = cf.ms != null ? cf.ms.toFixed(1)+' ms' : '—';
-    $('cliffbanner').classList.toggle('show', fbad);
+    $('cliffbanner').classList.remove('show');     // floor check removed
     $('cliffbanner').textContent = (cf.cliff ? '⚠ Drop-off — ' : '⚠ Low obstacle — ')
       + cf.reason + '. The LiDAR cannot see this; forward is vetoed.';
     drawCliff(cf);
@@ -3706,12 +4283,14 @@ function poll(){
     $('tu-dist').textContent  = sl.distance_mm != null ? mm(sl.distance_mm) : '—';
 
     // A drop-off is worth noticing from any tab.
-    $('pip-vision').classList.toggle('show', !!(d.cliff && d.cliff.blocked));
+    $('pip-vision').classList.remove('show');
 
     // --- object labels ---
     const dt = d.detect || {};
     detOn = !!dt.enabled;
     objects = dt.objects || [];
+    renderObjects(objects);
+    drawMap();                  // truck, route and objects move faster than the 1 Hz grid
     $('t-detect').classList.toggle('g-on', detOn && dt.ok);
     $('objstate').textContent = !dt.ok ? (dt.error || 'not available')
       : (detOn ? (dt.committed + ' placed') : 'off');
@@ -3727,12 +4306,31 @@ function poll(){
     if(document.activeElement !== $('d-url') && dt.url !== undefined
        && $('d-url').value !== dt.url) $('d-url').value = dt.url;
     // What is in view now, then what has been committed to the map.
-    drawBoxes(dt.seen);
+    // People share the overlay with furniture, in their own colour.
+    const pr = d.person || {};
+    personOn = !!pr.enabled;
+    personT = personOn ? pr.target : null;
+    drawBoxes((dt.seen || []).concat(personBoxes(pr)));
+    $('t-person').classList.toggle('g-on', personOn);
+    const pt = pr.target, fmm = v => v != null ? mm(v) : '—';
+    $('p-state').textContent = !personOn ? 'off'
+      : pt ? (pr.people.length > 1 ? pr.people.length + ' people' : 'tracking')
+      : 'looking…';
+    $('p-dist').textContent  = pt && pt.distance_mm != null ? mm(pt.distance_mm) + ' · ' + pt.source : '—';
+    $('p-bear').textContent  = pt ? (pt.bearing > 0 ? '+' : '') + pt.bearing.toFixed(1) + '°' : '—';
+    $('p-lidar').textContent = pt ? fmm(pt.lidar_mm) + (pt.lidar_mm != null ? ' · ' + pt.lidar_points + ' pts' : '') : '—';
+    $('p-floor').textContent = pt ? fmm(pt.floor_mm) : '—';
+    $('p-size').textContent  = pt ? fmm(pt.size_mm) : '—';
+    $('p-conf').textContent  = pt ? ((pt.conf*100)|0) + '% · ' + pr.people.length : '—';
+    $('p-rate').textContent  = personOn ? (pr.hz || 0).toFixed(1) + ' Hz · ' + (pr.ms || 0).toFixed(0) + ' ms' : '—';
+    $('p-backend').textContent = pr.backend || '—';
+    $('p-err').textContent = pr.error || '';
     $('detlist').innerHTML = (dt.seen || []).map(o =>
         `<span class="tag ${o.placed?'fix':'on'}">${o.label} ${(o.conf*100)|0}%`
         + (o.range != null ? ' · '+mm(o.range) : ' · no range') + `</span>`).join('')
       + (dt.objects || []).slice(0,10).map(o =>
-        `<span class="tag" title="${o.n} sightings">${o.label}</span>`).join('');
+        `<span class="tag" title="${o.n} sightings${o.status === 'confirmed' ? ', confirmed' : ' — waiting for a yes or no (Map tab)'}">`
+        + `${o.label}${o.status === 'confirmed' ? '' : '?'}</span>`).join('');
 
     drawCompass(); drawHorizon();
   }).catch(() => {
@@ -4326,7 +4924,12 @@ function ttsPoll(){
   fetch('/tts/state').then(r => r.json()).then(d => {
     renderTtsBrief(d);
     const installed = d.voices.filter(v => v.installed);
-    tSetup = !d.have_piper
+    if(document.activeElement !== $('t-url')) $('t-url').value = d.url || '';
+    $('t-engine').textContent = !d.url ? '· Pi speaks'
+      : d.engine === 'pc' ? '· PC speaks' : '· PC not answering, Pi speaks';
+    $('t-engine').title = d.remote_error || '';
+    tSetup = d.url ? ''
+      : !d.have_piper
       ? 'Piper is not installed. On the Pi, in the venv:  pip install "piper-tts>=1.3"  — then restart web_nav.py.'
       : !installed.length ? 'No voice yet — open "Voices" below and press Download on one (about 60 MB).' : '';
     if(!installed.length) $('t-voicebox').open = true;
@@ -4489,7 +5092,10 @@ def state():
             "ahead": Lidar.sector_min(pts, 0, GUARD_SECTOR_DEG),
             "hz": round(lidar.hz(), 1), "bad": lidar.bad,
             "connected": lidar.connected, "error": lidar.error,
-            "port": lidar.port,
+            "port": lidar.port, "stalls": getattr(lidar, "stalls", 0),
+            "rx_bytes": getattr(lidar, "rx_bytes", 0), "packets": lidar.packets,
+            "age_s": (round(time.monotonic() - lidar._scan_time, 1)
+                      if lidar._scan_time else None),
         },
         imu=imu.state,
         guard={"enabled": guard.enabled, "stop_mm": guard.stop_mm,
@@ -4507,6 +5113,7 @@ def state():
         markers=markers.state,
         cliff=cliff.state,
         detect=detector.state,
+        person=tracker.state,
         audio=speaker.brief if speaker else None,
         display=screen.state if screen else None,
         tts=talker.brief if talker else None,
@@ -4695,11 +5302,14 @@ def tuning_get():
 
 @app.route("/tuning", methods=["POST"])
 def tuning_set():
-    """Apply values, and optionally persist them.
+    """Apply values and save them to the SD card automatically.
 
-    Applied live but NOT saved unless asked. Tuning is mostly trying things,
-    and most of what you try is worse than what you had — a value should have
-    to earn its place in the file.
+    It used to apply live and save only on the SAVE button, on the theory
+    that most tries are worse than what you had. In practice the button was
+    missed, and truck size and LiDAR mounting were lost on every restart and
+    re-tuned by hand. Now every change is kept; Revert still goes back to
+    the code defaults. Saved 1.5 s after the last change, so dragging a
+    slider is one write to the card, not fifty.
     """
     d = request.get_json(force=True, silent=True) or {}
     done = {}
@@ -4707,9 +5317,115 @@ def tuning_set():
         done = tuning.revert()
     else:
         done = tuning.apply(d.get("values") or {})
-    saved = tuning.save() if d.get("save") or d.get("revert") else None
+    saved = None
+    if d.get("save") or d.get("revert"):
+        saved = tuning.save()
+    elif done:
+        _autosave_tuning()
     return jsonify(ok=True, applied=done, saved=saved,
                    snapshot=tuning.snapshot())
+
+
+_tune_timer = [None]
+
+
+def _autosave_tuning(delay=1.5):
+    """Save tuning.json once the changes stop for `delay` seconds."""
+    if _tune_timer[0] is not None:
+        _tune_timer[0].cancel()
+
+    def run():
+        try:
+            tuning.save()
+        except OSError as e:
+            print(f"  tuning autosave failed: {e}")
+    _tune_timer[0] = threading.Timer(delay, run)
+    _tune_timer[0].daemon = True
+    _tune_timer[0].start()
+
+
+# A named place counts as "the room the truck is in" within this distance.
+# Rooms are points, not regions — there is no room segmentation — so this is
+# roughly half a small room's width.
+ROOM_RADIUS_MM = 3000.0
+
+
+def room_at(x, y, within_mm=4000.0):
+    """The named place nearest to a point — rooms are places the person has
+    named, so "the sofa in the living room" is the nearest name."""
+    best, bd = None, within_mm
+    for name, (px, py) in load_places().items():
+        d = math.hypot(px - x, py - y)
+        if d < bd:
+            best, bd = name, d
+    return best
+
+
+@app.route("/labels")
+def labels_list():
+    """Detections waiting for a person's yes or no, oldest-asked first."""
+    pend = detector.map.pending()
+    for p in pend:
+        p["room"] = room_at(p["x"], p["y"])
+    return jsonify(pending=pend, rotation=CAM_ROTATION)
+
+
+@app.route("/labels/answer", methods=["POST"])
+def labels_answer():
+    """{key, answer: yes|no|skip, name?}. yes + name relabels ("it's a bed")."""
+    d = request.get_json(force=True, silent=True) or {}
+    key = d.get("key") or ""
+    c = detector.map.cells.get(key)
+    if c is None:
+        return jsonify(error=f"no candidate {key!r}"), 404
+    try:
+        detector.map.answer(key, d.get("answer"), d.get("name"), room_at(c["x"], c["y"]))
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    detector.map.save()
+    return jsonify(ok=True, cell=c, pending=len(detector.map.pending()))
+
+
+@app.route("/objects", methods=["POST"])
+def objects_ctl():
+    """{key, remove: true} drops a wrong object for good; {key, name} renames
+    one ("that's Dad's chair"). Objects are saved automatically, so this is
+    the only correction a person ever has to make."""
+    d = request.get_json(force=True, silent=True) or {}
+    key = d.get("key") or ""
+    if key not in detector.map.cells:
+        return jsonify(error=f"no object {key!r}"), 404
+    if d.get("remove"):
+        detector.map.remove(key)
+    elif (d.get("name") or "").strip():
+        detector.map.cells[key]["name"] = d["name"].strip()[:40]
+        detector.map.cells[key]["renamed"] = True     # a person's name wins over votes
+    detector.map.save()
+    return jsonify(ok=True, objects=detector.map.committed())
+
+
+@app.route("/labels/asked", methods=["POST"])
+def labels_asked():
+    """The voice assistant has just asked about this one: it goes to the back
+    of the queue, so an unanswered question is not repeated straight away."""
+    detector.map.mark_asked((request.get_json(force=True, silent=True) or {}).get("key", ""))
+    return jsonify(ok=True)
+
+
+@app.route("/labels/photo/<path:name>")
+def labels_photo(name):
+    from flask import send_from_directory
+    import detect as _detect                                  # noqa: PLC0415
+    return send_from_directory(_detect.ASK_DIR, name, mimetype="image/jpeg")
+
+
+@app.route("/person", methods=["POST"])
+def person_ctl():
+    """Person tracker on/off. Measuring only — nothing here drives."""
+    d = request.get_json(force=True, silent=True) or {}
+    if "enabled" in d:
+        tracker.enabled = bool(d["enabled"])
+    return jsonify(tracker.state)
 
 
 @app.route("/detect", methods=["POST"])
@@ -4731,19 +5447,28 @@ def detect_ctl():
 
 @app.route("/cliff", methods=["POST"])
 def cliff_ctl():
-    d = request.get_json(force=True, silent=True) or {}
-    if "enabled" in d:
-        cliff.enabled = bool(d["enabled"])
-    if d.get("relearn"):
-        cliff.relearn()
-    return jsonify(ok=True, enabled=cliff.enabled)
+    """The floor check was removed; this stays so an old page gets an answer."""
+    return jsonify(ok=True, enabled=False, removed=True)
 
 
 @app.route("/slam", methods=["POST"])
 def slam_ctl():
     d = request.get_json(force=True, silent=True) or {}
     if d.get("reset"):
+        explorer.stop("map reset")          # its path is in the old frame
         slam.slam.reset()
+        # Everything else pinned in the old map's coordinates goes with it:
+        # objects and rooms would float over walls that no longer exist.
+        detector.map.forget()
+        detector.map.save()
+        save_places({})
+        # And the autosave, or the next boot would resume the old map.
+        try:
+            os.remove(MAP_FILE)
+        except OSError:
+            pass
+        slam._saved_scans = 0
+        slam.map_note = "map reset · objects and rooms cleared"
     if "enabled" in d:
         slam.enabled = bool(d["enabled"])
     if "matching" in d:
@@ -4952,6 +5677,10 @@ def ai_status():
         navigation={"running": ex.get("running"), "state": ex.get("state"),
                     "message": ex.get("message"), "goal": ex.get("goal")},
         places=sorted(load_places()),
+        # For the assistant's questions while mapping: which named room the
+        # truck is in (None = somewhere unnamed), and labels awaiting a yes/no.
+        room_here=room_at(slam.slam.pose.x, slam.slam.pose.y, ROOM_RADIUS_MM),
+        label_questions=len(detector.map.pending()),
         audio=speaker.brief if speaker else None,
         speech=talker.brief if talker else None,
         microphone=({k: v for k, v in ears.state.items() if k != "log"} if ears else None),
@@ -5021,7 +5750,7 @@ def lan_ip():
 
 def main():
     global robot, lidar, imu, slam, explorer, camera, markers, cliff, detector
-    global speaker, screen, http_port, talker, ears, assistant
+    global speaker, screen, http_port, talker, ears, assistant, tracker
     ap = argparse.ArgumentParser(description="drive + lidar + imu")
     ap.add_argument("-p", "--lidar-port", help="serial port (default: auto-detect)")
     ap.add_argument("-b", "--baud", type=int, default=LIDAR_BAUD)
@@ -5041,6 +5770,10 @@ def main():
                     help="off-board detection server, e.g. "
                          "http://192.168.1.5:8000/detect — bigger model "
                          "on your PC. Remembered between runs.")
+    ap.add_argument("--tts-url", default=None,
+                    help="off-board speech server, e.g. http://192.168.1.7:5005 "
+                         "(tools/tts_server.py) — the PC makes the audio, the "
+                         "Pi plays it. Remembered between runs.")
     args = ap.parse_args()
 
     if args.no_guard:
@@ -5059,6 +5792,8 @@ def main():
     speaker = audio.Audio()
     app.register_blueprint(audio.blueprint(speaker))
     talker = tts.Tts(speaker)
+    if args.tts_url:
+        talker.set(url=args.tts_url)
     app.register_blueprint(tts.blueprint(talker))
     ears = voice.Ears(talker)
     app.register_blueprint(voice.blueprint(ears))
@@ -5077,6 +5812,7 @@ def main():
     slam.slam = Slam(COUNTS_PER_REV, WHEEL_DIAM_MM, TRACK_WIDTH_MM,
                      lidar_off=(lidar_cal.x, lidar_cal.y, lidar_cal.yaw),
                      body=(TRUCK_LENGTH_MM, TRUCK_WIDTH_MM))
+    slam.resume()
 
     def guarded_drive(throttle, steer):
         """The explorer publishes intent like everything else, so there is one
@@ -5094,8 +5830,9 @@ def main():
     # the cliff detector is read by the guard, so both need their consumers
     # to exist first.
     from cliff import CliffDetector                           # noqa: PLC0415
-    cliff = CliffDetector(camera,
-                          enabled=camera.cam is not None and not args.no_cliff)
+    # Floor check REMOVED from driving: kept only as an always-off object so
+    # the status fields that mention it still exist.
+    cliff = CliffDetector(camera, enabled=False)
     from markers import MarkerLocator                         # noqa: PLC0415
     markers = MarkerLocator(camera, slam, learn=args.learn_markers)
 
@@ -5104,6 +5841,10 @@ def main():
     from detect import Detector                                # noqa: PLC0415
     detector = Detector(camera, lidar, slam, enabled=not args.no_detect,
                         url=args.detect_url)
+    # People, for follow mode. Off until asked: on the Pi's own model it costs
+    # CPU, and it borrows the detector's server URL and model either way.
+    from person import PersonTracker                          # noqa: PLC0415
+    tracker = PersonTracker(detector, lambda: body_points(lidar.scan()), slam=slam)
 
     # Hand the tuning registry the live objects it points at. After this,
     # every number in docs/TUNING.md is reachable from the Tune tab.
@@ -5144,10 +5885,11 @@ def main():
     print(f"  tune:  {len(_defaults)} tunables"
           f"{f' · {len(_loaded)} from tuning.json' if _loaded else ''}"
           f"{f' · {len(_missing)} UNBOUND: ' + ','.join(_missing) if _missing else ''}")
+    n_sure = sum(o["status"] == "confirmed" for o in detector.map.committed())
     print(f"  yolo:  {detector.backend}"
           f"{' · ' + detector.url if detector.url else ''}"
           f"{' — ' + detector.error if detector.error else ''}"
-          f"{f' · {len(detector.map.committed())} objects on the map'}")
+          f" · {n_sure} labels on the map, {len(detector.map.pending())} to confirm")
     print(f"  cliff: {'on' if cliff.enabled else 'off'}"
           f" · camera {CAM_PITCH_DEG:.0f}° down at {CAM_HEIGHT_MM:.0f} mm")
     print(f"  guard: {'on' if guard.enabled else 'off'} at {guard.stop_mm:.0f} mm")
@@ -5171,11 +5913,28 @@ def main():
     print(f"  MAX_DUTY {MAX_DUTY:.2f} · watchdog {WATCHDOG_S}s")
     print("\n  *** WHEELS OFF THE GROUND ***\n")
     try:
-        app.run(host="0.0.0.0", port=args.http_port, threaded=True)
+        # "::" is IPv6 AND IPv4 on Linux (dual-stack). 0.0.0.0 was IPv4 only,
+        # and shiv.local resolves to the Pi's IPv6 address first, so anything
+        # using the name - the Claude Code truck tools, some phones - got
+        # "connection refused" while the IP address worked.
+        try:
+            app.run(host="::", port=args.http_port, threaded=True)
+        except OSError:
+            app.run(host="0.0.0.0", port=args.http_port, threaded=True)
     finally:
         # Runs on Ctrl-C and on any exception, so the motors never stay on.
         if explorer:
             explorer.stop("shutting down")
+        try:
+            slam.save_if_changed()          # the last 20 s of mapping too
+        except Exception as e:                                # noqa: BLE001
+            print(f"  map not saved: {e}")
+        if _tune_timer[0] is not None and _tune_timer[0].is_alive():
+            _tune_timer[0].cancel()
+            try:
+                tuning.save()                # a slider moved in the last 1.5 s
+            except OSError as e:
+                print(f"  tuning not saved: {e}")
         robot.close()
         camera.close()
         if talker:

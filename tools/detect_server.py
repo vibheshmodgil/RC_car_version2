@@ -57,8 +57,10 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODEL = None
+PERSON_MODEL = None     # plain COCO, class 0 only — see /person below
 ARGS = None
 STATS = {"frames": 0, "ms": 0.0, "started": time.time()}
+PERSON_STATS = {"frames": 0, "ms": 0.0}
 
 # What an open-vocabulary model is asked to look for. This is the whole point
 # of using one: the list is a runtime argument, not a property of the weights,
@@ -113,12 +115,17 @@ def load_model(name, device, classes):
     return m
 
 
-def infer(jpeg, rotation, conf, imgsz):
+def infer(jpeg, rotation, conf, imgsz, model=None, keep=None, stats=None, classes=None):
     """JPEG bytes -> [{label, conf, box}] with box as fractions 0-1.
 
     Boxes come back in the ROTATED frame — the same frame the robot computes
     bearings from. The robot maps them back for its overlay.
+
+    model/keep/stats default to the furniture detector; /person passes its own.
     """
+    model = MODEL if model is None else model
+    keep = KEEP if keep is None else keep
+    stats = STATS if stats is None else stats
     from PIL import Image
     img = Image.open(io.BytesIO(jpeg)).convert("RGB")
     # Rotate to match the robot's display setting, so the model sees the room
@@ -129,14 +136,14 @@ def infer(jpeg, rotation, conf, imgsz):
     w, h = img.size
 
     t0 = time.perf_counter()
-    res = MODEL.predict(img, conf=conf, imgsz=imgsz, verbose=False)[0]
+    res = model.predict(img, conf=conf, imgsz=imgsz, classes=classes, verbose=False)[0]
     ms = (time.perf_counter() - t0) * 1000.0
 
     out = []
     names = res.names
     for b in res.boxes:
         label = names[int(b.cls[0])]
-        if label not in KEEP:
+        if label not in keep:
             continue
         x0, y0, x1, y1 = (float(v) for v in b.xyxy[0])
         out.append({
@@ -147,8 +154,8 @@ def infer(jpeg, rotation, conf, imgsz):
                     round(max(0.0, min(1.0, x1 / w)), 4),
                     round(max(0.0, min(1.0, y1 / h)), 4)],
         })
-    STATS["frames"] += 1
-    STATS["ms"] = ms
+    stats["frames"] += 1
+    stats["ms"] = ms
     return out, ms, (w, h)
 
 
@@ -173,6 +180,9 @@ class Handler(BaseHTTPRequestHandler):
                          "device": ARGS.device or "cpu",
                          "imgsz": ARGS.imgsz, "frames": STATS["frames"],
                          "last_ms": round(STATS["ms"], 1),
+                         "person_model": ARGS.person_model or None,
+                         "person_frames": PERSON_STATS["frames"],
+                         "person_last_ms": round(PERSON_STATS["ms"], 1),
                          "uptime_s": int(time.time() - STATS["started"])})
 
     def do_POST(self):
@@ -183,6 +193,16 @@ class Handler(BaseHTTPRequestHandler):
             jpeg = self.rfile.read(n)
             rot = float(self.headers.get("X-Rotation", 0) or 0)
             conf = float(self.headers.get("X-Conf", ARGS.conf) or ARGS.conf)
+            if self.path.rstrip("/").endswith("/person"):
+                # The follow tracker: every frame it can get, people only.
+                # Not printed — at 5 Hz that would bury the furniture lines.
+                if PERSON_MODEL is None:
+                    return self._send(404, {"ok": False, "error": "started with --person-model \"\""})
+                dets, ms, size = infer(jpeg, rot, conf, ARGS.person_imgsz, PERSON_MODEL,
+                                       {"person"}, PERSON_STATS, classes=[0])
+                return self._send(200, {"ok": True, "detections": dets,
+                                        "ms": round(ms, 1), "size": list(size),
+                                        "model": ARGS.person_model})
             dets, ms, size = infer(jpeg, rot, conf, ARGS.imgsz)
             print("  %4d  %5.0f ms  %s"
                   % (STATS["frames"], ms,
@@ -197,7 +217,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global MODEL, ARGS
+    global MODEL, PERSON_MODEL, ARGS
     ap = argparse.ArgumentParser(description="Off-board detection for the robot")
     # yolov8m-worldv2, not x. Measured on a CPU-only desktop at 640 px:
     #   s   220 ms      m   596 ms      x  1682 ms
@@ -222,6 +242,12 @@ def main():
     ap.add_argument("--device", default=None,
                     help="cuda / mps / cpu. Left alone, the best available "
                          "is chosen automatically.")
+    # A plain COCO model for /person, the follow tracker. COCO's "person" is
+    # the most-trained class there is, and a fixed-vocabulary s model at 416
+    # px is quick enough on a laptop CPU for several frames a second.
+    ap.add_argument("--person-model", default="yolov8s.pt",
+                    help="COCO model for /person (people only). \"\" disables it.")
+    ap.add_argument("--person-imgsz", type=int, default=416)
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--host", default="0.0.0.0")
     ARGS = ap.parse_args()
@@ -241,6 +267,12 @@ def main():
     classes = [c.strip() for c in ARGS.classes.split(",") if c.strip()]
     print("\n  loading %s ..." % ARGS.model)
     MODEL = load_model(ARGS.model, ARGS.device, classes)
+    if ARGS.person_model:
+        print("  loading %s for /person ..." % ARGS.person_model)
+        from ultralytics import YOLO
+        PERSON_MODEL = YOLO(ARGS.person_model)
+        if ARGS.device:
+            PERSON_MODEL.to(ARGS.device)
     if classes:
         print("  open vocabulary, %d classes: %s%s"
               % (len(classes), ", ".join(classes[:8]),

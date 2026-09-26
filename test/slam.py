@@ -2,7 +2,8 @@
 SLAM — odometry, occupancy grid, and scan matching.
 
 Shared library like pins.py and imu.py; not run directly. web_nav.py imports
-it. Pure Python and the standard library, so nothing new to install.
+it. Pure Python in the per-scan hot paths; NumPy (already on the Pi for
+onnxruntime) only for whole-grid passes — display, save, load.
 
 The three pieces, and why each exists
 -------------------------------------
@@ -42,7 +43,18 @@ get wrong and it mirrors the whole map.
 import base64
 import math
 import os
+import threading
+import time
 from array import array
+
+import numpy as np
+
+# The map's side. The robot starts in the MIDDLE, so this is 15 m in every
+# direction. It was 12 m (6 m each way) and a house ran off the edge of it:
+# walls simply stopped being drawn half-way down the hall. Cheap now that the
+# whole-grid passes are NumPy and only the explored part goes to the browser.
+MAP_SIZE_MM = 30000
+MAP_RES_MM = 50
 
 # Log-odds increments per observation. Occupied evidence counts for more than
 # free evidence per look, but free space is seen far more often (every cell
@@ -130,6 +142,11 @@ def robot_to_world(pts, pose):
     return [(pose.x + x * c - y * s, pose.y + x * s + y * c) for x, y in pts]
 
 
+def _wrap(a):
+    """Angle to [-pi, pi)."""
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
 # ---------------------------------------------------------------------------
 
 class DiffOdometry:
@@ -148,6 +165,15 @@ class DiffOdometry:
         self.pose = Pose()
         self._last_l = self._last_r = None
         self._yaw0 = None
+        # World heading = IMU heading since _yaw0 + th_off. The offset is what
+        # lets anything else correct the heading at all: without it every
+        # update overwrote pose.th with the raw IMU value, so a scan-match
+        # heading correction lasted exactly one step and gyro drift grew into
+        # rotated double walls. Set to the current heading whenever _yaw0 is
+        # (re)taken, so a reset or a loaded map keeps its heading too.
+        self.th_off = 0.0
+        self._last_yaw = None
+        self._glitches = 0
         self.using_imu = False
         self.distance = 0.0          # total path length, mm
 
@@ -156,6 +182,35 @@ class DiffOdometry:
         """Distance one encoder count represents. Derived, never stored, so
         retuning either input takes effect on the very next update."""
         return math.pi * self.wheel / max(1e-9, self.cpr)
+
+    # More than this between two updates (~0.2 s) is not a turn this truck can
+    # make. Seen live, motors off: 15 -> 255 -> 15 degrees in one second.
+    MAX_YAW_STEP_DEG = 60.0
+    GLITCH_ACCEPT = 3
+
+    def _sane_yaw(self, yaw):
+        """Drop a one-off IMU heading spike. A jump that PERSISTS for
+        GLITCH_ACCEPT readings is real (the IMU re-zeroed, say): accept it,
+        but shift _yaw0 by the jump so the world heading stays continuous."""
+        if yaw is None:
+            return None
+        last = self._last_yaw
+        if last is None:
+            self._last_yaw = yaw
+            return yaw
+        jump = ((yaw - last + 180) % 360) - 180
+        if abs(jump) <= self.MAX_YAW_STEP_DEG:
+            self._glitches = 0
+            self._last_yaw = yaw
+            return yaw
+        self._glitches += 1
+        if self._glitches < self.GLITCH_ACCEPT:
+            return last
+        self._glitches = 0
+        if self._yaw0 is not None:
+            self._yaw0 = (self._yaw0 + jump) % 360
+        self._last_yaw = yaw
+        return yaw
 
     def reset(self, keep_heading=True):
         self.pose = Pose(0.0, 0.0, self.pose.th if keep_heading else 0.0)
@@ -168,6 +223,7 @@ class DiffOdometry:
             self._last_l, self._last_r = left_counts, right_counts
             if yaw_deg is not None:
                 self._yaw0 = yaw_deg
+                self.th_off = self.pose.th
             return self.pose
 
         dl = (left_counts - self._last_l) * self.mm_per_count
@@ -177,13 +233,16 @@ class DiffOdometry:
         d_centre = (dl + dr) / 2.0
         self.distance += abs(d_centre)
 
+        yaw_deg = self._sane_yaw(yaw_deg)
         if yaw_deg is not None:
             # Absolute heading from the IMU, referenced to wherever we started.
             # The IMU reports a compass bearing (clockwise); world theta is
             # counter-clockwise, hence the negation.
             if self._yaw0 is None:
                 self._yaw0 = yaw_deg
-            self.pose.th = -math.radians(((yaw_deg - self._yaw0 + 180) % 360) - 180)
+                self.th_off = self.pose.th
+            self.pose.th = _wrap(-math.radians(((yaw_deg - self._yaw0 + 180) % 360) - 180)
+                                 + self.th_off)
             self.using_imu = True
         else:
             # Fallback: infer the turn from the wheel difference. Works, but
@@ -199,7 +258,7 @@ class DiffOdometry:
 # ---------------------------------------------------------------------------
 
 class OccupancyGrid:
-    def __init__(self, size_mm=12000, res_mm=50):
+    def __init__(self, size_mm=MAP_SIZE_MM, res_mm=MAP_RES_MM):
         self.lidar_off = (0.0, 0.0, 0.0)     # set by Slam
         self.res = res_mm
         self.n = int(size_mm / res_mm)
@@ -325,21 +384,50 @@ class OccupancyGrid:
         could correct. The display only needs a monotonic mapping, and this
         one is visually indistinguishable.
         """
-        scale = 127.0 / L_CLAMP
-        out = bytearray(len(self.grid))
-        for i, v in enumerate(self.grid):
-            b = int(v * scale) + 128
-            out[i] = 0 if b < 0 else (255 if b > 255 else b)
-        return bytes(out)
+        return _quantise(self.array()).tobytes()
+
+    def array(self):
+        """The grid as an (n, n) float32 view, row = cy. A view, not a copy:
+        read it, do not keep it across a clear()."""
+        return np.frombuffer(self.grid, dtype=np.float32).reshape(self.n, self.n)
+
+    # Cells of margin around the explored part, so the frontier is visible.
+    CROP_MARGIN = 20
+
+    def bounds(self):
+        """(x0, y0, x1, y1) cell bounds of everything ever observed, with a
+        margin; a few metres around the start if nothing is yet."""
+        a = self.array()
+        rows = np.flatnonzero(a.any(axis=1))
+        cols = np.flatnonzero(a.any(axis=0))
+        m = self.CROP_MARGIN
+        if rows.size == 0:
+            r = int(3000 // self.res)
+            return self.half - r, self.half - r, self.half + r, self.half + r
+        return (max(0, int(cols[0]) - m), max(0, int(rows[0]) - m),
+                min(self.n, int(cols[-1]) + 1 + m), min(self.n, int(rows[-1]) + 1 + m))
 
     def as_payload(self):
+        """Only the explored rectangle: a 30 m grid is 360k cells, a house
+        explored so far is a fraction of that, and this goes out at 1 Hz."""
+        x0, y0, x1, y1 = self.bounds()
+        crop = _quantise(self.array()[y0:y1, x0:x1])
         return {
             "n": self.n,
             "res": self.res,
             "half": self.half,
             "hits": self.hits,
-            "data": base64.b64encode(self.to_bytes()).decode("ascii"),
+            "x0": x0, "y0": y0, "w": x1 - x0, "h": y1 - y0,
+            "data": base64.b64encode(crop.tobytes()).decode("ascii"),
         }
+
+
+def _quantise(a):
+    """log-odds -> one byte, 128 = unknown. Rounded, not truncated: with
+    truncation every save/load cycle nudged each cell one step toward
+    unknown, so a map reloaded a few times slowly forgot its walls."""
+    b = np.rint(a * (127.0 / L_CLAMP)).astype(np.int32) + 128
+    return np.clip(b, 0, 255).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +623,7 @@ class Slam:
     """Odometry predicts, scan matching corrects, the grid remembers."""
 
     def __init__(self, counts_per_rev, wheel_diam_mm, track_mm,
-                 size_mm=12000, res_mm=50, match=True, lidar_off=(0.0, 0.0, 0.0),
+                 size_mm=MAP_SIZE_MM, res_mm=MAP_RES_MM, match=True, lidar_off=(0.0, 0.0, 0.0),
                  body=(0.0, 0.0)):
         self.odom = DiffOdometry(counts_per_rev, wheel_diam_mm, track_mm)
         self.grid = OccupancyGrid(size_mm, res_mm)
@@ -567,6 +655,10 @@ class Slam:
         # clear of both, so ordinary rooms are never refused and a corridor
         # slide is never trusted.
         self.min_conf = 0.25
+        # Share of each matched heading correction applied (see update()).
+        self.HEADING_GAIN = 0.3
+        # No mapping when heading changed more than this since the last update.
+        self.MAX_SPIN_RAD = math.radians(10.0)
 
         # --- loop closure -------------------------------------------------
         # Keyframes are (pose, scan) kept every KEY_MM / KEY_DEG. They exist
@@ -594,6 +686,10 @@ class Slam:
         self.loops = 0
         self._last_key = None
         self._loop_cooldown = 0
+        self._loop_busy = False
+        self._loop_last = 0.0
+        self._loop_done = None
+        self._loop_gen = 0            # bumped by reset/load: late results are dropped
 
     def reset(self):
         self.odom.reset(keep_heading=False)
@@ -605,6 +701,8 @@ class Slam:
         self.keys = []
         self._last_key = None
         self.rejected = self.loops = 0
+        self._loop_gen += 1
+        self._loop_done = None
 
     def _moved_enough(self):
         p = self._last_map_pose
@@ -638,6 +736,13 @@ class Slam:
             self.conf = conf
             trusted = conf >= self.min_conf
             if trusted:
+                # Heading: take a fraction of the matcher's correction into
+                # the IMU offset. A persistent error (gyro drift) is removed
+                # over a few steps; one noisy 2-degree match is averaged away
+                # instead of being kept forever.
+                dth = _wrap(corrected.th - pose.th) * self.HEADING_GAIN
+                self.odom.th_off = _wrap(self.odom.th_off + dth)
+                corrected.th = _wrap(pose.th + dth)
                 # Feed the correction back into odometry, or it re-accumulates
                 # the same drift from the same wrong origin on the next step.
                 self.odom.pose = corrected
@@ -656,7 +761,12 @@ class Slam:
         # the next pass, but a smear laid down at a wrong pose never leaves,
         # and every later match aligns against it. Refusing to map is cheap;
         # mapping wrong compounds.
-        if points and trusted and self._moved_enough():
+        # Not while spinning fast. One scan takes ~85 ms to sweep, so at
+        # speed it is smeared across several degrees, and a turn on the spot
+        # is never matched (see `moved`) — mapping it laid rotated copies of
+        # every wall. Seen live: a 135-degree spin in 2 s, then 20 refusals.
+        spin = abs(_wrap(pose.th - before.th))
+        if points and trusted and spin <= self.MAX_SPIN_RAD and self._moved_enough():
             self.grid.integrate(self.pose, points)
             self.scans += 1
             self._last_map_pose = self.pose.copy()
@@ -668,6 +778,14 @@ class Slam:
         if self.loop_enabled:
             self._close_loop(points)
         return self.pose
+
+    # Loop closure runs BESIDE the SLAM loop, not in it. One attempt is a
+    # 700 mm x 15 degree search: ~160 ms on a PC, several times that on the
+    # Pi. It used to run inline on every update wherever the truck had been
+    # before (the cooldown only followed a SUCCESS), and live that held SLAM
+    # at 300-430 ms an update against a 200 ms budget - a lagging pose that
+    # the guard and the path follower both then fought.
+    LOOP_EVERY_S = 2.0
 
     # --- keyframes and loop closure ---------------------------------------
 
@@ -704,10 +822,24 @@ class Slam:
         stops the drift growing and re-anchors the robot, which is the part
         that keeps a return-home mission honest.
         """
+        # A finished attempt: apply its correction to where the truck is NOW.
+        # It was computed for the pose at the start of the attempt, so the
+        # offset it found is carried over, not the absolute position.
+        done = self._loop_done
+        if done is not None:
+            self._loop_done = None
+            snap, fixed = done
+            now_p = self.odom.pose
+            self.apply_fix(now_p.x + (fixed.x - snap.x), now_p.y + (fixed.y - snap.y),
+                           self.LOOP_GAIN)
+            self.loops += 1
+            self._loop_cooldown = 20          # do not re-close against the same place
         if not points or len(self.keys) < self.LOOP_MIN_TRAIL:
             return
         if self._loop_cooldown > 0:
             self._loop_cooldown -= 1
+            return
+        if self._loop_busy or time.monotonic() - self._loop_last < self.LOOP_EVERY_S:
             return
 
         p, now = self.pose, len(self.trail)
@@ -727,24 +859,38 @@ class Slam:
         # Built from what that place looked like THEN, so the comparison is
         # against old evidence rather than against the accumulated map the
         # pose has already drifted along with.
-        local = OccupancyGrid(size_mm=self.grid.n * self.grid.res,
-                              res_mm=self.grid.res)
-        local.lidar_off = self.grid.lidar_off
-        for kp, kpts in near[-self.LOOP_MAX_KEYS:]:
-            local.integrate(kp, kpts)
-        if local.hits == 0:
-            return
-        m = ScanMatcher(lin_mm=self.LOOP_RADIUS_MM, lin_step=self.grid.res * 2,
-                        ang_deg=15.0, ang_step=3.0, decimate=4, coarse=1)
-        m.off = self.matcher.off
-        fixed, conf = m.match(local, p, points)
-        if conf < self.min_conf * 1.5:
-            return                    # a loop closure has to be better than
-                                      # ordinary, not merely acceptable
-        self.apply_fix(fixed.x, fixed.y, self.LOOP_GAIN)
-        self.loops += 1
-        # Do not re-close against the same place every tick.
-        self._loop_cooldown = 20
+        self._loop_busy = True
+        self._loop_last = time.monotonic()
+        snap = p.copy()
+        keys = near[-self.LOOP_MAX_KEYS:]
+        pts = list(points)
+        off = self.matcher.off
+        lidar_off = self.grid.lidar_off
+        gen = self._loop_gen
+
+        def attempt():
+            try:
+                local = OccupancyGrid(size_mm=self.grid.n * self.grid.res,
+                                      res_mm=self.grid.res)
+                local.lidar_off = lidar_off
+                for kp, kpts in keys:
+                    local.integrate(kp, kpts)
+                if local.hits == 0:
+                    return
+                m = ScanMatcher(lin_mm=self.LOOP_RADIUS_MM, lin_step=self.grid.res * 2,
+                                ang_deg=15.0, ang_step=3.0, decimate=4, coarse=1)
+                m.off = off
+                fixed, conf = m.match(local, snap, pts)
+                # A loop closure has to be better than ordinary, not merely
+                # acceptable.
+                if conf >= self.min_conf * 1.5 and gen == self._loop_gen:
+                    self._loop_done = (snap, fixed)
+            except Exception:                                  # noqa: BLE001
+                pass
+            finally:
+                self._loop_busy = False
+
+        threading.Thread(target=attempt, daemon=True).start()
 
     def apply_fix(self, x, y, gain=0.35):
         """Pull the pose toward an absolute position measurement.
@@ -794,9 +940,7 @@ class Slam:
             "trail": [[round(x), round(y)] for x, y in self.trail[-3000:]],
             # log-odds quantised to one byte; the extra precision buys nothing
             # once a cell is past the clamp anyway
-            "grid": base64.b64encode(bytes(
-                max(0, min(255, int((v / L_CLAMP) * 127) + 128))
-                for v in self.grid.grid)).decode("ascii"),
+            "grid": base64.b64encode(self.grid.to_bytes()).decode("ascii"),
         }
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
@@ -808,15 +952,19 @@ class Slam:
         import base64, json
         with open(path) as f:
             blob = json.load(f)
-        if blob.get("n") != self.grid.n or blob.get("res") != self.grid.res:
+        bn = blob.get("n")
+        if blob.get("res") != self.grid.res or not bn or bn > self.grid.n:
             raise ValueError(
                 "saved map is %sx%s @ %s mm, this one is %sx%s @ %s mm"
-                % (blob.get("n"), blob.get("n"), blob.get("res"),
+                % (bn, bn, blob.get("res"),
                    self.grid.n, self.grid.n, self.grid.res))
-        raw = base64.b64decode(blob["grid"])
-        g = self.grid.grid
-        for i, b in enumerate(raw):
-            g[i] = (b - 128) / 127.0 * L_CLAMP
+        raw = np.frombuffer(base64.b64decode(blob["grid"]), dtype=np.uint8)
+        # Both grids have the start at their centre, so a smaller map saved
+        # before the grid grew drops into the middle of this one unchanged.
+        o = self.grid.half - bn // 2
+        self.grid.clear()
+        self.grid.array()[o:o + bn, o:o + bn] = \
+            (raw.reshape(bn, bn).astype(np.float32) - 128) / 127.0 * L_CLAMP
         self.grid.hits = blob.get("hits", 0)
         p = blob.get("pose") or {}
         self.pose = Pose(p.get("x", 0.0), p.get("y", 0.0), p.get("th", 0.0))
@@ -828,6 +976,11 @@ class Slam:
         self.trail = [tuple(v) for v in blob.get("trail", [])] or [(self.pose.x, self.pose.y)]
         self.scans = blob.get("scans", 0)
         self._last_map_pose = None
+        # Loop-closure keyframes belong to whatever map was in memory before.
+        self.keys = []
+        self._last_key = None
+        self._loop_gen += 1
+        self._loop_done = None
         return blob
 
     @property

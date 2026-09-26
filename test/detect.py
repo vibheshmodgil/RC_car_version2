@@ -35,6 +35,13 @@ frame would plant "bed" in the hallway permanently with no way to remove it.
 So detections VOTE into a coarse cell and a label is only committed once
 COMMIT_VOTES sightings agree. A sofa seen from three angles is a sofa.
 
+Three sightings means three VIEWPOINTS (VIEW_MM / VIEW_DEG): a truck parked
+in front of a hallucination sees it every frame, and frames are not evidence.
+Committing is automatic — asking a person about every chair proved tedious
+in practice — and the same label seen again within MERGE_MM joins the object
+already there instead of making a second one. A wrong label is removed with
+its × on the Map tab, and is never proposed in that spot again.
+
 The cost, honestly
 ------------------
 A Pi 4 has no accelerator. YOLOv8n at 320x320 costs roughly 250-400 ms per
@@ -79,6 +86,8 @@ from pins import (  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = os.path.join(HERE, "yolov8n.onnx")
 STORE = os.path.join(HERE, "objects.json")
+# Photos of candidates waiting for a person's yes/no. Pi-side, never synced.
+ASK_DIR = os.path.join(HERE, "asks")
 SERVER_FILE = os.path.join(HERE, "detect_server.json")
 
 # How long to wait on the PC before giving up on a frame. Generous enough for
@@ -98,6 +107,22 @@ IOU_MIN = 0.45                 # non-max suppression overlap
 
 # A label is committed to the map after this many agreeing sightings.
 COMMIT_VOTES = 3
+# ...each from a different viewpoint: the robot moved or turned this much
+# since that label's last counted vote in that cell.
+VIEW_MM = 250.0
+VIEW_DEG = 15.0
+# The same label this close to an existing one is the same object. Range and
+# bearing error put one sofa's sightings up to a metre apart, which used to
+# split it across cells into "sofa", "sofa", "sofa".
+MERGE_MM = 1500.0
+# ANY label this close to an existing object is the same thing seen as
+# something else. Live, one TV unit became "armchair", "television" and
+# "sofa" within 30 cm. Now it is one object, named by its most-voted label.
+SAME_SPOT_MM = 600.0
+# Seen, but never an object on a FLOOR map: the camera looks up at it, the
+# LiDAR range behind it is a wall, and it lands pinned to that wall. Live, a
+# "ceiling fan" appeared on the map as if it stood in a doorway.
+IGNORE_LABELS = {"ceiling_fan"}
 # Votes land in cells this big, so the same object seen from different
 # distances still lands in one place. Furniture is metre-scale; finer than
 # this just splits one sofa into three.
@@ -291,7 +316,7 @@ def nms(boxes, scores, iou_thres=IOU_MIN):
     return keep
 
 
-def decode(out, scale, pad, src_w, src_h):
+def decode(out, scale, pad, src_w, src_h, keep=None):
     """YOLOv8 ONNX output -> [(label, conf, cx_fraction, box)].
 
     The output is (1, 84, N): four box values then eighty class scores, per
@@ -306,8 +331,12 @@ def decode(out, scale, pad, src_w, src_h):
     only way to see whether a label belongs to the thing you think it does.
     Returned as fractions of the source frame, so the overlay does not care
     what resolution the stream is running at.
+
+    keep: the labels to return, default KEEP (furniture). person.py passes
+    {"person"} — the one COCO class this map deliberately leaves out.
     """
     import numpy as np
+    keep = KEEP if keep is None else keep
     p = np.squeeze(out[0])
     if p.shape[0] < p.shape[1]:
         p = p.T                                   # (8400, 84)
@@ -324,7 +353,7 @@ def decode(out, scale, pad, src_w, src_h):
     out_list = []
     for i in nms(boxes, conf):
         name = COCO[int(ids[i])] if int(ids[i]) < len(COCO) else "?"
-        if name not in KEEP:
+        if name not in keep:
             continue
         # Undo the letterbox to get back to the ORIGINAL frame, which is
         # what the bearing is computed from and what the overlay draws on.
@@ -381,9 +410,25 @@ class ObjectMap:
     def _key(x, y):
         return "%d,%d" % (int(math.floor(x / CELL_MM)), int(math.floor(y / CELL_MM)))
 
-    def vote(self, label, x, y):
-        c = self.cells.setdefault(self._key(x, y),
-                                  {"x": x, "y": y, "votes": {}, "t": 0.0})
+    def vote(self, label, x, y, pose=None):
+        """Returns (key, cell, reached) — reached is True on the sighting that
+        makes this label a candidate, which is when its photo is taken.
+
+        pose: the robot's (x, y, th) when it saw this. A vote only counts from
+        a new viewpoint — a truck parked in front of one hallucination would
+        otherwise out-vote it into a candidate in a few seconds."""
+        key = self._same_object(label, x, y) or self._key(x, y)
+        c = self.cells.setdefault(key, {"x": x, "y": y, "votes": {}, "t": 0.0})
+        # A label the person said no to, here, is not asked about again.
+        if label in c.get("rejected", ()):
+            return key, c, False
+        if pose is not None:
+            views = c.setdefault("views", {})
+            last = views.get(label)
+            if last is not None and math.hypot(pose[0] - last[0], pose[1] - last[1]) < VIEW_MM \
+                    and abs((math.degrees(pose[2] - last[2]) + 180) % 360 - 180) < VIEW_DEG:
+                return key, c, False
+            views[label] = [round(pose[0]), round(pose[1]), round(pose[2], 3)]
         # Running mean of position, so repeated sightings sharpen the spot
         # rather than the last one winning.
         n = sum(c["votes"].values()) + 1
@@ -391,20 +436,115 @@ class ObjectMap:
         c["y"] += (y - c["y"]) / n
         c["votes"][label] = c["votes"].get(label, 0) + 1
         c["t"] = time.time()
-        return c
+        reached = c["votes"][label] == COMMIT_VOTES and c.get("status") != "confirmed"
+        if reached:
+            c["status"], c["name"] = "confirmed", label
+        elif c.get("status") == "confirmed" and not c.get("renamed"):
+            # One object per spot: it carries its most-seen label.
+            top = self._top(c)[0]
+            if top and top != c.get("name"):
+                c["name"] = top
+        return key, c, reached
+
+    def _same_object(self, label, x, y):
+        """Key of the cell this sighting belongs to: the nearest confirmed
+        object of ANY label within SAME_SPOT_MM, else the nearest cell with
+        this label within MERGE_MM, else None."""
+        best, bd = None, SAME_SPOT_MM
+        for key, c in self.cells.items():
+            if c.get("status") == "confirmed":
+                d = math.hypot(c["x"] - x, c["y"] - y)
+                if d < bd:
+                    best, bd = key, d
+        if best is not None:
+            return best
+        best, bd = None, MERGE_MM
+        for key, c in self.cells.items():
+            # A rejected label counts too, so its votes land where they are
+            # refused instead of starting the same wrong object next door.
+            if label in c["votes"] or c.get("name") == label or label in c.get("rejected", ()):
+                d = math.hypot(c["x"] - x, c["y"] - y)
+                if d < bd:
+                    best, bd = key, d
+        return best
+
+    def remove(self, key):
+        """A person says this label is wrong: drop it, and never propose that
+        label in this spot again."""
+        c = self.cells.get(key)
+        if c is None:
+            raise KeyError(f"no object {key}")
+        label = c.get("name") or self._top(c)[0]
+        if label:
+            c.setdefault("rejected", []).append(label)
+            c["votes"].pop(label, None)
+        for k in ("status", "name", "photo", "box"):
+            c.pop(k, None)
+
+    @staticmethod
+    def _top(c):
+        return max(c["votes"].items(), key=lambda kv: kv[1]) if c["votes"] else (None, 0)
 
     def committed(self):
-        """Only what has been seen enough times to believe."""
+        """Every object on the map, by its name (the detector's label, or
+        what a person renamed it to)."""
         out = []
-        for c in self.cells.values():
-            if not c["votes"]:
-                continue
-            label, n = max(c["votes"].items(), key=lambda kv: kv[1])
-            if n >= COMMIT_VOTES:
-                out.append({"label": label, "x": round(c["x"]),
-                            "y": round(c["y"]), "n": n})
-        out.sort(key=lambda d: -d["n"])
+        for key, c in list(self.cells.items()):
+            label, n = self._top(c)
+            if c.get("status") == "confirmed":
+                out.append({"key": key, "label": c.get("name") or label, "x": round(c["x"]),
+                            "y": round(c["y"]), "n": n, "status": "confirmed",
+                            "room": c.get("room")})
+        out.sort(key=lambda d: (d["status"] != "confirmed", -d["n"]))
         return out
+
+    # --- asking a person --------------------------------------------------
+    #
+    # The detector proposes; a person decides. Three agreeing sightings make
+    # a CANDIDATE, not a label: the truck asks "is this a sofa?" (cockpit or
+    # voice) and only a yes puts it on the map. A detector that is right 80%
+    # of the time still plants a wrong label in every fifth room, and nothing
+    # downstream can tell which one.
+
+    def pending(self):
+        """Candidates waiting for an answer, oldest-asked first."""
+        out = []
+        for key, c in list(self.cells.items()):
+            label, n = self._top(c)
+            if label and n >= COMMIT_VOTES and c.get("status") in (None, "skipped"):
+                out.append({"key": key, "label": label, "n": n, "x": round(c["x"]),
+                            "y": round(c["y"]), "photo": c.get("photo"),
+                            "box": c.get("box"), "asked": c.get("asked", 0.0)})
+        out.sort(key=lambda d: d["asked"])
+        return out
+
+    def answer(self, key, answer, name=None, room=None):
+        """yes / no / skip. yes with a name labels it by that name — "no,
+        it's a bed" arrives as yes + name="bed"."""
+        c = self.cells.get(key)
+        if c is None:
+            raise KeyError(f"no candidate {key}")
+        label, _ = self._top(c)
+        if answer == "yes":
+            c["status"], c["name"] = "confirmed", (name or label or "").strip()[:40]
+            c["room"] = room
+        elif answer == "no":
+            # Forget this label here and never ask about it here again; the
+            # cell stays open, because a wrong guess does not mean empty.
+            c.setdefault("rejected", []).append(label)
+            c["votes"].pop(label, None)
+            c.pop("status", None)
+            c.pop("photo", None)
+        elif answer == "skip":
+            c["status"], c["asked"] = "skipped", time.time()
+        else:
+            raise ValueError("answer must be yes, no or skip")
+        return c
+
+    def mark_asked(self, key):
+        c = self.cells.get(key)
+        if c is not None:
+            c["asked"] = time.time()
 
     def forget(self, label=None):
         if label is None:
@@ -412,6 +552,9 @@ class ObjectMap:
         else:
             for c in self.cells.values():
                 c["votes"].pop(label, None)
+                if c.get("name") == label:
+                    c.pop("status", None)
+                    c.pop("name", None)
 
     def save(self):
         tmp = self.path + ".tmp"
@@ -428,6 +571,12 @@ class ObjectMap:
                 self.cells = json.load(f).get("cells", {})
         except (OSError, ValueError):
             self.cells = {}
+        # Candidates from when a person had to say yes: they have the votes,
+        # so they are objects now like any other.
+        for c in self.cells.values():
+            label, n = self._top(c)
+            if label and n >= COMMIT_VOTES and c.get("status") in (None, "skipped"):
+                c["status"], c["name"] = "confirmed", label
         return len(self.cells)
 
 
@@ -502,10 +651,6 @@ class Detector:
             time.sleep(period)
             if not self.enabled or self.camera is None or self.camera.cam is None:
                 continue
-            # Mapping outranks labelling. Always.
-            if getattr(self.slam, "ms", 0.0) > self.slam_budget_ms:
-                self.skipped += 1
-                continue
             try:
                 t0 = time.perf_counter()
                 self._tick()
@@ -517,14 +662,25 @@ class Detector:
 
     def _tick(self):
         rot = self.rotation
+        # Where the truck is and what the LiDAR sees NOW, as the frame is
+        # taken — not after the PC answers. The answer takes 0.4-1 s, and a
+        # pose read then put every object seen during a turn tens of degrees
+        # off, on whatever the scan happened to hit by then.
+        pose = self.slam.slam.pose.copy()
+        scan = self.lidar.scan() if self.lidar else []
         dets = self._remote(rot) if self.url else None
         if dets is None:
+            # Mapping outranks labelling — but only the Pi's OWN model costs
+            # the Pi anything. Skipping remote frames too meant detection
+            # stopped whenever the truck moved (SLAM is busiest then), so it
+            # only ever looked while parked, and a parked truck can never
+            # collect the three viewpoints an object needs.
+            if getattr(self.slam, "ms", 0.0) > self.slam_budget_ms:
+                self.skipped += 1
+                return
             dets = self._onboard(rot)
         if dets is None:
             return
-
-        pose = self.slam.slam.pose
-        scan = self.lidar.scan() if self.lidar else []
         seen = []
         for label, conf, xf, box in dets:
             bearing = self._bearing(xf, rot)
@@ -535,12 +691,29 @@ class Detector:
                    "range": None if rng is None else round(rng),
                    "box": [round(v, 4) for v in box],
                    "placed": False}
-            if rng is not None:
+            if rng is not None and label.replace(" ", "_") not in IGNORE_LABELS:
                 wx, wy = self._world(pose, bearing, rng)
-                self.map.vote(label, wx, wy)
+                key, _cell, reached = self.map.vote(label, wx, wy, (pose.x, pose.y, pose.th))
+                if reached:
+                    self._keep_photo(key, box)
                 rec["placed"] = True
             seen.append(rec)
         self.seen = seen
+
+    def _keep_photo(self, key, box):
+        """The frame that made this a candidate, so the person being asked
+        "is this a sofa?" can see which thing the truck means. The box is in
+        the camera's own (unrotated) frame, the same as the JPEG."""
+        jpeg = self.camera.frame() if self.camera is not None else None
+        c = self.map.cells[key]
+        c["box"] = [round(v, 4) for v in box]
+        if jpeg:
+            os.makedirs(ASK_DIR, exist_ok=True)
+            name = "ask-%s.jpg" % key.replace(",", "_").replace("-", "m")
+            with open(os.path.join(ASK_DIR, name), "wb") as f:
+                f.write(jpeg)
+            c["photo"] = name
+        self.map.save()
 
     def _remote(self, rot):
         """Ask the PC. Returns None if it could not be reached, so the caller
@@ -657,6 +830,8 @@ class Detector:
             "remote_ms": round(self.remote_ms, 1),
             "ms": round(self.ms, 1), "frames": self.frames,
             "skipped": self.skipped, "seen": self.seen,
-            "objects": objs, "committed": len(objs),
+            "objects": objs,
+            "committed": sum(o["status"] == "confirmed" for o in objs),
+            "asking": sum(o["status"] == "ask" for o in objs),
             "cells": len(self.map.cells), "votes_needed": COMMIT_VOTES,
         }

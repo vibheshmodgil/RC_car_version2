@@ -63,12 +63,13 @@ measure rotation and field, both independent of where on a rigid body they sit.
 | File | Owns |
 |---|---|
 | `pins.py` | **Every** GPIO number, robot dimension, sensor offset. Single source of truth. |
-| `slam.py` | Odometry, occupancy grid, scan matching, map persistence |
-| `explore.py` | Frontier detection, A* planning, the autonomous drive loop |
+| `slam.py` | Odometry, occupancy grid (30 m, NumPy for whole-grid passes), scan matching, background loop closure, map persistence |
+| `explore.py` | Frontier detection, clearance-aware A* planning, the path follower, look-around and make-room manoeuvres - for auto-mapping and click-to-go alike |
 | `imu.py` | IMU chip detection and fusion (BNO055 / ICM-20948 / MPU-9250) |
 | `camera.py` | CSI camera, MJPEG off the hardware encoder, raw frames for analysis |
 | `markers.py` | ArUco detection, the learned tag map, pose fixes |
-| `cliff.py` | Floor appearance check — drops and low obstacles |
+| `cliff.py` | Floor appearance check. **No longer consulted by the guard** - kept, always off |
+| `person.py` | Person tracker for follow mode: box, bearing, distance from LiDAR / floor / box size |
 | `tuning.py` | The registry of every live-tunable value |
 | `audio.py` | Speaker player: tones, beeps, MP3 via ffmpeg, the `/audio/*` Flask routes |
 | `tts.py` | Text to speech: Piper in a nice-10 worker process, sentence queue, voice downloads, `/tts/*` routes |
@@ -111,14 +112,16 @@ tolerates reading a value one cycle stale.
 
 | Thread | Rate | Job |
 |---|---|---|
-| Control loop | 50 Hz | Applies the latest intent through the guard |
-| LiDAR reader | ~11 Hz | Parses serial frames into a scan |
+| Control loop | 50 Hz | Applies the latest intent through the guard (larger arc margin when the explorer drives) |
+| LiDAR reader | ~11 Hz | Parses serial frames; a revolution ends on the scanner's start flag. Reopens the port after 2.5 s without a scan |
 | IMU reader | 50 Hz | Polls the chip, runs fusion |
 | SLAM | 5 Hz | Odometry, scan match, integrate, auto-capture |
+| Loop closure | ≤ every 2 s | Background thread: the wide 700 mm / 15° search, applied as an offset when done |
+| Map autosave | 20 s | Writes `house_map.json` when it has grown |
+| Explorer | 10 Hz, while running | Auto-mapping or click-to-go; one thread per run (generation-counted) |
 | Markers | 4 Hz | ArUco detection, pose fixes |
-| Cliff | 5 Hz | Floor grid comparison |
-| Detection | ~1 Hz | YOLOv8n, skipped whenever SLAM is over budget |
-| Flask | per request | The page, `/state`, MJPEG streams |
+| Detection | ~1 Hz | Pose and scan taken at the photo; skipped for SLAM only when it runs on the Pi's own model |
+| Flask | per request | The page, `/state`, MJPEG streams - on IPv4 **and** IPv6, so `shiv.local` works |
 
 **Why the control loop is separate.** Motor commands used to be applied inside
 the HTTP handler, so every keypress waited on a guard evaluation *and* on the
@@ -129,6 +132,17 @@ returns; a dedicated thread applies it at a steady 50 Hz.
 **Why SLAM is 5 Hz and not 10.** A scan match costs ~96 ms on a Pi 4, so a
 10 Hz loop has no headroom. At walking pace 5 Hz still gives an update every
 ~100 mm, finer than the 40 mm mapping gate needs.
+
+**Why loop closure is off the SLAM thread.** One attempt costs ~160 ms on a PC
+and several times that on the Pi. Inline, and retried on every failed update,
+it held SLAM at 300-430 ms an update in a real house. It now runs beside SLAM
+at most every 2 s; its correction is applied relative to where the truck was
+when the attempt began. A map reset or load discards a result still in flight.
+
+**Heading.** World heading is the IMU's relative heading plus an offset the
+scan matcher corrects (30 % of each matched correction). Before, the IMU value
+overwrote the matcher every update, so gyro drift became rotated double walls.
+One-off IMU spikes (> 60° in an update) are dropped.
 
 **Degradation is per-sensor.** No IMU still gives drive + LiDAR. No LiDAR
 still gives drive + IMU. Nothing refuses to start because a sensor is missing
@@ -240,14 +254,14 @@ None of these are synced back to Windows; all are gitignored.
 
 | File | Written by |
 |---|---|
-| `house_map.json` | the occupancy grid, on Save map |
-| `places.json` | named spots you saved |
+| `house_map.json` | the occupancy grid — autosaved every 20 s and on exit, resumed at startup, deleted by Reset map |
+| `places.json` | named rooms (cockpit, a click on the map, or the voice "What room am I in?"); cleared by Reset map |
 | `marker_map.json` | learned ArUco tag positions |
 | `lidar_cal.json` | scanner mounting, from the calibration controls |
 | `drive_invert.json` | motor direction toggles |
 | `tuning.json` | values changed on the Tune tab and saved |
 | `imu_calib.json` | magnetometer hard-iron offsets |
-| `objects.json` | voted furniture labels in world coordinates |
+| `objects.json` | furniture labels in world coordinates — saved automatically after 3 sightings from different spots, one per object; cleared by Reset map |
 | `yolov8n.onnx` | the detection model — copied in by hand, never synced |
 | `captures/` | stills plus `index.json` with the pose of each |
 

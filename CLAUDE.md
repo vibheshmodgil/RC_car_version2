@@ -105,10 +105,10 @@ at 0.40 in `test/pins.py` for exactly this.
 - ⚠ Camera orientation — if the preview is upside down, set `CAM_HFLIP` and
   `CAM_VFLIP` in `pins.py`. Check with `camera_test.py --stream`.
 - ⚠ `CAM_HEIGHT_MM` and `CAM_PITCH_DEG` are guesses (120 mm, 15° down). The
-  cliff detector converts image rows to floor distance with them, so its
-  numbers are fiction until both are measured. **A camera at 0° tilt cannot
-  do cliff detection at all** — the nearest floor it sees is past stopping
-  distance. Tilt it down 15–25°.
+  person tracker's floor distance uses them. The camera floor check (cliff
+  detection) was **removed from the guard** because, with these unmeasured
+  and the camera tilted up, it read walls as drop-offs and stalled the truck.
+  **Nothing detects stair edges now.**
 - ⚠ `MARKER_SIZE_MM` must equal the size of the tags actually printed
   (black square only, measured with a ruler). Every marker distance scales
   linearly with it, and nothing else in the system can catch the error.
@@ -137,7 +137,8 @@ Speaker_truck/
 ├── CLAUDE.md
 ├── Start_pi.md           # full bring-up runbook + test ladder
 ├── docs/
-│   ├── TUNING.md         # every variable that decides whether SLAM works
+│   ├── CHANGES.md        # what the testing rounds found and changed, and how it was checked
+│   ├── TUNING.md         # every variable that decides whether SLAM, guard, explorer work
 │   ├── ARCHITECTURE.md   # coordinate frame, thread model, file ownership
 │   └── TROUBLESHOOTING.md
 ├── WIRING.md             # architecture, power rails, ⚠ items to verify
@@ -160,10 +161,11 @@ Speaker_truck/
 │   ├── display_test.py   # colours, orientation, speed, --ip
 │   ├── markers.py        # ArUco absolute position fix (shared library)
 │   ├── marker_test.py    # print tags, check detection range
-│   ├── cliff.py          # camera floor check — stairs the LiDAR cannot see
+│   ├── cliff.py          # camera floor check — no longer used by the guard
 │   ├── tuning.py         # registry of every live-tunable value
 │   ├── calibrate.py      # measure scanner yaw + odometry scale by pushing
 │   ├── detect.py         # YOLOv8n furniture labels pinned to the map
+│   ├── person.py         # person tracker for follow mode: box, bearing, LiDAR/camera distance
 │   ├── slam.py           # occupancy grid + scan matching
 │   ├── explore.py        # frontier explorer
 │   ├── web_nav.py        # the cockpit — drive, LiDAR, IMU, camera, map, audio, LCD
@@ -175,10 +177,15 @@ Speaker_truck/
 │   ├── voices/           # Piper voice models, ~60 MB each — Pi-side, never synced
 │   ├── tts.json          # chosen voice, speed, recent phrases — Pi-side
 │   ├── talk_cert.pem     # self-signed https cert for /talk, made on first run — Pi-side
-│   ├── objects.json      # voted object labels — Pi-side
+│   ├── objects.json      # object labels: votes, and what a person confirmed — Pi-side
+│   ├── asks/             # photos behind "is this a sofa?" questions — Pi-side, never synced
 │   └── yolov8n.onnx      # detection model — copied in, never synced
+├── .dockerignore         # keeps the root's .pt weights out of the Docker build
 ├── tools/                # runs on the PC, not the Pi
 │   ├── detect_server.py  # bigger detection model, reached over the LAN
+│   ├── tts_server.py     # Piper speech on the PC, streamed to the Pi's speaker
+│   ├── Dockerfile        # one image for tts_server + detect_server
+│   ├── docker-compose.yml # `docker compose up -d --build` — Ollama stays native
 │   └── truck_mcp.py      # MCP server for Claude Code — thin wrapper over test/truck_api.py
 └── .venv/                # Python venv — created ON THE PI, never synced
 ```

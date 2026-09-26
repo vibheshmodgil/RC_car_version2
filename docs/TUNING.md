@@ -125,10 +125,13 @@ It is not cosmetic. It decides three things at once:
    stands. Set the box too *large* instead and real obstacles silently vanish.
 2. **Where the guard measures from.** Clearances are quoted from the leading
    edge, not the centre.
-3. **The turning check.** The circumscribing radius comes from the diagonal,
-   because a skid-steer turns about its centre and its widest point is a
-   corner, not the nose. A box that is too small makes it agree to rotations
-   it cannot physically complete.
+3. **The turning check.** The guard rotates this box on the spot (and moves
+   it along the arc of a forward-and-turn) and refuses the move if a scan
+   point would end up inside it. A box that is too small makes it agree to
+   rotations it cannot physically complete.
+
+Size and LiDAR mounting are saved to `tuning.json` automatically, 1.5 s after
+the last change - there is no need to press SAVE.
 
 ### Measuring it
 
@@ -378,9 +381,29 @@ still move slowly in whichever has the most room, provided that is at least
 the creep margin. A guard that cannot be escaped is a guard that gets switched
 off — which is worse than a guard that occasionally creeps.
 
-The camera's cliff veto deliberately does **not** get a creep escape. Creeping
-out of furniture is right; creeping forward over a drop is the one move it
-must never make.
+### One rule, per move
+
+The guard allows a move only if no LiDAR point would end up inside the
+truck's outline along the path that move actually drives - using the same
+left/right wheel mix as the motors, so an arc is checked as the pivot it is:
+
+| Move | What is checked |
+|---|---|
+| straight | a lane the truck's width + **15 mm** each side, out to the stop distance + margin |
+| spin on the spot | the outline rotated up to **30°** the way you asked, **25 mm** clear |
+| forward/back + turn | the outline moved along the real arc, **10 mm** clear when you drive, **20 mm** when the explorer does |
+
+30°, not a few degrees: a scan arrives every ~90 ms and the truck coasts, so
+it turns 15-30° between "the scan shows it" and "stopped". If only one part
+of a combined move is unsafe, that part alone is dropped (straight on, or
+turn only). A move that takes the truck *away* from something already close
+is never refused, so it cannot trap itself. The Drive plot draws it: green is
+free floor, red is where the truck's centre cannot go, and the four arrows
+are the guard's verdicts.
+
+The camera floor check no longer vetoes anything - with the camera tilt
+unmeasured it read walls as drop-offs and stalled the truck at random.
+**Nothing detects stair edges.**
 
 ---
 
@@ -393,10 +416,12 @@ thing the algorithm does.
 
 | Knob | Default | |
 |---|---|---|
-| Cruise throttle | 1.0 | Fraction of the speed limit |
-| Turn tolerance | 25° | Bearing error before turning in place |
-| Lookahead | 450 mm | |
-| Goal reached | 350 mm | |
+| Cruise throttle | 1.0 | Fraction of the speed limit; eased off as the heading error grows |
+| Spin above | 35° | Bearing error before turning on the spot; it spins until under 10° (hysteresis - no zig-zag) |
+| Lookahead | 450 mm | In open space |
+| Lookahead near walls | 150 mm | In doorways and beside furniture, so it does not cut door frames |
+| Keep-away weight | 8 | How much dearer a route is right beside an obstacle - routes run down the middle |
+| Goal reached | 250 mm | |
 | Stuck timeout | 6 s | |
 | Replan interval | 3.0 s | |
 | Free threshold | −1.0 | Log-odds to drive through a cell |
@@ -408,8 +433,17 @@ free before the planner will drive through it, but only mildly suspect to be
 treated as an obstacle. Symmetric thresholds make the robot confidently plan
 through things.
 
-**Lookahead is the corner-cutting knob.** Short is twitchy; long cuts corners
-into walls. If it clips doorframes, reduce it.
+**The planner and the guard agree.** Walls are grown by half the truck's
+width plus the guard's 15 mm side margin, so the planner never routes where
+the guard would refuse to drive straight. The steering aims at the path point
+one lookahead AHEAD OF THE NEAREST point on the path - not the path's start,
+which after 450 mm of driving is behind the truck (that bug spun it round
+every few seconds). When the guard blocks for 0.8 s the explorer replans.
+
+Measured in a simulated house (hall, two rooms, 550-700 mm doors, furniture):
+every trip arrives, closest pass 60 mm or more, no guard stops; auto-mapping
+covers ~61 of 65 m² in about 100 s. The version before this failed three of
+four trips and mapped 25 m² in three minutes before getting stuck.
 
 **Replanning is deliberately lazy.** SLAM already costs ~100 ms per update, so
 a stale-but-cheap plan plus a reactive guard beats a perfect plan that arrives

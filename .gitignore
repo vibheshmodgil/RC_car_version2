@@ -20,6 +20,7 @@ house_map.json
 places.json
 lidar_cal.json
 captures/
+asks/
 marker_map.json
 tuning.json
 objects.json

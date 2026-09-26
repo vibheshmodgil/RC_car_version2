@@ -238,6 +238,113 @@ class TruckApi:
         self.post("/audio/stop_music")
         return "Music stopped."
 
+    def music(self, action):
+        """pause | resume | next | previous — the player's own buttons."""
+        a = self.get("/audio/state")
+        if action == "pause":
+            if not a.get("playing"):
+                return "No music is playing."
+            self.post("/audio/pause")
+            return "Music paused."
+        if action == "resume":
+            if a.get("playing"):
+                return "Music is already playing."
+            if not a.get("track"):
+                return "Nothing is paused. Ask for a song by name."
+            self.post("/audio/pause")                 # the toggle: paused -> playing
+            return f"Resuming {a['track']}."
+        if action in ("next", "previous"):
+            r = self.post("/audio/skip", {"back": action == "previous"})
+            return f"Playing {r.get('track') or 'the next song'}."
+        return f"unknown music action {action!r}; use pause, resume, next or previous"
+
+    def volume(self, change):
+        """up | down | a percentage of full volume. Steps of a quarter, like
+        a volume button, rather than a jump the listener did not expect."""
+        a = self.get("/audio/state")
+        top = float(a.get("max_volume") or 1.5)
+        now = float(a.get("volume") or 1.0)
+        if change == "up":
+            new = now + 0.25 * top
+        elif change == "down":
+            new = now - 0.25 * top
+        else:
+            try:
+                new = float(str(change).rstrip("%")) / 100.0 * top
+            except ValueError:
+                return f"unknown volume {change!r}; use up, down or a percentage"
+        new = max(0.1 * top, min(top, new))
+        self.post("/audio/levels", {"volume": round(new, 2)})
+        return f"Volume {round(100 * new / top)} percent."
+
+    # --- map ----------------------------------------------------------------
+
+    def save_place(self, name):
+        """Name the spot the truck is standing on, for go_to_place later."""
+        name = (name or "").strip()
+        if not name:
+            return "A place needs a name."
+        self.post("/places", {"name": name})
+        return f"Saved this spot as {name}."
+
+    def explore(self, action):
+        """Start or stop autonomous mapping. Starting needs the motors already
+        enabled by a person: /explore would arm them itself, and a voice
+        command must never be what makes the truck start moving on its own."""
+        if action == "stop":
+            self.post("/explore", {"stop": True})
+            self.post("/stop")
+            return "Mapping stopped."
+        if action != "start":
+            return f"unknown mapping action {action!r}; use start or stop"
+        s = self.ai_status()
+        if not s["motors"]["enabled"]:
+            return "Not started: motors are DISABLED. Ask the person to press ENABLE in the cockpit."
+        if not (s.get("lidar") or {}).get("connected", True):
+            return "Not started: the LiDAR is not connected, so I cannot map."
+        r = self.post("/explore", {"start": True, "calibrate": False})
+        return f"Mapping started: {r.get('state')} {r.get('message') or ''}".strip()
+
+    # --- labels a person confirms ------------------------------------------
+
+    def label_questions(self):
+        """Detections waiting for a yes/no, oldest-asked first."""
+        return self.get("/labels").get("pending", [])
+
+    def label_questions_text(self):
+        qs = self.label_questions()
+        if not qs:
+            return "Nothing waiting to be checked."
+        return "Waiting for a yes or no: " + "; ".join(
+            f"{q['key']}: a {q['label'].replace('_', ' ')}" + (f" near {q['room']}" if q.get("room") else "")
+            + f" (seen {q['n']} times)" for q in qs[:10])
+
+    def answer_label(self, key, answer, name=None):
+        """answer: yes | no | skip. yes with a name relabels it."""
+        self.post("/labels/answer", {"key": key, "answer": answer, "name": name})
+        return {"yes": f"Labelled {name or 'it'} on the map." if name else "Confirmed; it is on the map now.",
+                "no": "Removed; I will not ask about it there again.",
+                "skip": "Skipped; I will ask later."}.get(answer, "Done.")
+
+    def label_asked(self, key):
+        self.post("/labels/asked", {"key": key})
+
+    def save_map(self):
+        # /map/save overwrites house_map.json, with no backup. Saving an empty
+        # map (no LiDAR, or just restarted) would replace a real one with
+        # nothing — it happened once while testing this tool.
+        scans = (self.get("/state").get("slam") or {}).get("scans", 0)
+        if not scans:
+            return "Not saved: the map is empty, and saving would erase the map saved before."
+        r = self.post("/map/save")
+        return f"Map saved, {r.get('scans', scans)} scans."
+
+    def take_photo(self):
+        """Save the current camera view to test/captures/ on the Pi."""
+        r = self.post("/camera/snap")
+        return f"Photo saved as {r.get('file')}." if r.get("ok") else \
+            f"Could not take a photo: {r.get('error') or 'no frame'}."
+
     def stop_sound(self):
         self.post("/tts/stop")
         self.post("/audio/stop")

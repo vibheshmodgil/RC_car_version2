@@ -310,14 +310,23 @@ REGISTRY = [
       ("attr", "explorer", "CRUISE"), 0.2, 1.0, 0.05,
       doc="Throttle the explorer asks for. The speed limit caps the actual "
           "duty, so this is a fraction of that."),
-    T("expl_turn_tol", "Turn tolerance", EXPL,
-      ("attr", "explorer", "TURN_TOLERANCE"), 5, 90, 5, unit="deg",
-      doc="Bearing error beyond which it turns in place rather than arcing "
-          "toward the target."),
+    T("expl_spin_enter", "Spin above", EXPL,
+      ("attr", "explorer", "SPIN_ENTER"), 15, 90, 5, unit="deg",
+      doc="Bearing error beyond which it turns on the spot. It keeps turning "
+          "until the error is under 10 degrees, then drives - the gap is "
+          "what stops it zig-zagging."),
     T("expl_lookahead", "Lookahead", EXPL,
       ("attr", "explorer", "LOOKAHEAD_MM"), 100, 1500, 50, unit="mm",
-      doc="How far down the planned path it aims. Short is twitchy, long cuts "
-          "corners into walls."),
+      doc="How far down the planned path it aims in open space. Short is "
+          "twitchy, long cuts corners."),
+    T("expl_lookahead_min", "Lookahead near walls", EXPL,
+      ("attr", "explorer", "LOOKAHEAD_MIN_MM"), 100, 600, 25, unit="mm",
+      doc="The lookahead in doorways and beside furniture. Shorter follows "
+          "the centred path more tightly around door frames."),
+    T("expl_clear_weight", "Keep-away weight", EXPL,
+      ("module", "explore", "CLEAR_WEIGHT"), 0, 20, 0.5,
+      doc="How much more a route costs right beside an obstacle. Higher "
+          "keeps routes in the middle of open space; 0 hugs walls."),
     T("expl_goal_mm", "Goal reached", EXPL,
       ("attr", "explorer", "GOAL_REACHED_MM"), 100, 1000, 50, unit="mm",
       doc="How close counts as arrived. Too tight and it dances around a "
