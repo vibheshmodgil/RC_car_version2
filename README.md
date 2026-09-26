@@ -16,9 +16,11 @@ from. No ROS, no build step - plain Python and one self-contained HTML page.
 | **Autonomous mapping** | Frontier exploration with a clearance-aware A* planner. Looks around to start, makes room to turn in tight corners, and stops when the reachable house is mapped. |
 | **Click to go** | Click the map: *Go here*, or name the room. Named rooms get a **Go** button, and the voice assistant can drive to them. |
 | **Collision guard** | One rule: no LiDAR point may end up inside the truck's outline along the path a move really drives - straight, spin or arc. Drawn live: green is free floor, red is where the truck's centre cannot go. |
+| **Follow me** | Locks on to one person - clothing colours plus where they are walking - and follows at ~1.6 m, past other people and round furniture, tracking their legs in the LiDAR when the camera cannot see them. Where they walked is drawn on the map; when it loses them it searches from there. The guard keeps it off everyone. |
 | **Voice** | Speak into a phone; a free local model (Ollama on your PC) answers out loud and can drive, look, name rooms and go to them. |
 | **ArUco localisation** | Printed tags give an absolute position fix - the only input outside SLAM's closed loop. |
 | **Object labels** | Open-vocabulary detection pins "sofa", "wardrobe", "chest of drawers" to the map, one object per spot, automatically - no questions asked. |
+| **System monitor** | A task manager in the cockpit. Pi CPU per core and per thread, temperature, under-voltage, and the PC's YOLO / Piper / Ollama load. |
 | **Live tuning** | Every parameter adjustable while driving, saved to the SD card automatically. |
 | **Self-calibration** | Push the robot half a metre and it measures its own scanner rotation and odometry scale, with a residual. |
 
@@ -28,16 +30,116 @@ random. **Nothing detects stair edges** - keep the truck away from stairs.
 
 ### The cockpit
 
-Six tabs over a status bar that never scrolls away - **Drive** (LiDAR plot with
-the guard's red/green view, mounting), **Map** (zoomable map, click to go, rooms,
-objects, SLAM tuning), **Sensors**, **Vision** (camera, markers, objects,
-person), **Audio** (music, speech, voice assistant), **Tune**.
+Seven tabs over a status bar that never scrolls away:
 
-**New here? This page is the whole path.** Fifteen minutes from a cold laptop
-to a moving robot. Everything else links out from the bottom.
+- **Drive:** the LiDAR plot with the guard's red/green view, and mounting.
+- **Map:** the zoomable map, click to go, rooms, objects, the person's trail, and SLAM tuning.
+- **Sensors.**
+- **Vision:** camera, markers, objects, and the person / follow controls.
+- **Audio:** music, speech and the voice assistant.
+- **Tune.**
+- **System:** a task manager for the Pi and the PC.
+
+**Starting it up?** Go straight to [▶ Start everything](#-start-everything---every-session).
+**New here?** Everything else on this page, and the documents linked at the bottom.
 
 > ⚠ **Wheels off the ground.** The motor drivers currently fitted cannot
 > survive a stall on these motors. See [the blocker](#-before-you-drive-it).
+
+## ▶ Start everything - every session
+
+Three machines are involved. Do them in this order.
+
+| Machine | Runs | Port |
+|---|---|---|
+| **PC** (Windows) | Docker: object/person detection (YOLO) + speech (Piper) | 8000, 5005 |
+| **PC** (Windows) | Ollama, natively, on the GPU: the voice assistant's model | 11434 |
+| **Pi** (on the truck) | `test/web_nav.py`: sensors, SLAM, guard, motors, the cockpit | 5004 |
+
+**PC helpers are optional.** Without them the truck still drives, maps and
+follows. Detection then runs on the Pi's own small model, and speech is slow.
+
+### 1. PC - start the helpers (PowerShell)
+
+Start **Docker Desktop** from the Start menu and wait until it says *Engine
+running*. Then:
+
+```powershell
+cd C:\Users\vibhe\OneDrive\Desktop\Speaker_truck\tools
+docker compose up -d                 # add --build after changing anything in tools/ or test/sysstats.py
+docker compose ps                    # both "tools-detect-1" and "tools-tts-1" should be Up
+curl.exe -s http://localhost:8000/   # detection: {"ok": true, ...} once the models are loaded (~20 s)
+curl.exe -s http://localhost:5005/   # speech:    {"ok": true, ...}
+```
+
+**Ollama** starts by itself with Windows (a llama in the system tray). Check it:
+
+```powershell
+curl.exe -s http://localhost:11434/api/tags      # lists qwen3-vl:4b-instruct
+ipconfig                                          # note the PC's IPv4 address, e.g. 192.168.1.7
+```
+
+### 2. PC - copy the latest code to the Pi
+
+```powershell
+cd C:\Users\vibhe\OneDrive\Desktop\Speaker_truck
+scp -r test shiv@shiv.local:/home/shiv/Desktop/Speaker_truck/
+```
+
+`shiv.local` not found? Find the Pi's IP ([§1 below](#1-find-the-pi)), or read it off
+the truck's LCD, and use that instead.
+
+### 3. Pi - start the truck (from the PC)
+
+Power the truck on, wait ~40 s for it to boot, then, with **your PC's IP** in
+place of `192.168.1.7`:
+
+```powershell
+ssh -t shiv@shiv.local "cd ~/Desktop/Speaker_truck && source .venv/bin/activate && TRUCK_OLLAMA_URL=http://192.168.1.7:11434 python test/web_nav.py --tts-url http://192.168.1.7:5005 --detect-url http://192.168.1.7:8000/detect"
+```
+
+No PC helpers? Just `python test/web_nav.py` inside the same `ssh`.
+Leave this window open: it is the truck's log, and **Ctrl+C** stops the truck.
+
+### 4. Browser - drive
+
+Open **http://shiv.local:5004** (or `http://<pi-ip>:5004`), click the page once,
+then press **ENABLE**. It turns solid green (**● ENABLED**) when the motors are armed.
+
+- **Map tab:** *START AUTO-MAP*, click the map to go somewhere, *Reset map*.
+- **Vision tab → Person → Follow:** follow me.
+- **Phone:** open `https://<pi-ip>:5443/talk` and talk to it. The self-signed
+  certificate warning is expected, so accept it.
+- **System tab:** is anything overloaded? CPU per thread on the Pi, and YOLO,
+  Piper and Ollama on the PC.
+
+### 5. Optional - let Claude Code drive it
+
+Once, on the PC:
+
+```powershell
+claude mcp add -s user truck -e TRUCK_URL=http://shiv.local:5004 -- python C:\Users\vibhe\OneDrive\Desktop\Speaker_truck\tools\truck_mcp.py
+```
+
+### Stop
+
+- **Truck:** **STOP** / **E-STOP** in the cockpit, then Ctrl+C in the ssh window.
+- **PC helpers:** `cd tools; docker compose down`. Leaving them running costs
+  nothing while idle.
+- **Pi:** `ssh shiv@shiv.local "sudo shutdown now"` before cutting the battery.
+  This protects the SD card.
+
+### First time on a new PC or a fresh SD card
+
+| Once | Where |
+|---|---|
+| Pi: OS, venv, apt packages, `pip install -r requirements.txt` | [Start_pi.md](Start_pi.md) and *Python venv* in [CLAUDE.md](CLAUDE.md) |
+| Pi: `test/yolov8n.onnx` for on-board detection | *Object detection* in `requirements.txt` |
+| PC: Docker image, ~10 min: `cd tools; docker compose up -d --build` | [tools/docker-compose.yml](tools/docker-compose.yml) |
+| PC: `ollama pull qwen3-vl:4b-instruct`, `OLLAMA_HOST=0.0.0.0:11434`, firewall rule for 11434 | [Start_pi.md §5.12](Start_pi.md) |
+| PC: a Piper voice | Downloaded by the speech container on first use |
+
+If something doesn't come up, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
 ---
 
@@ -183,12 +285,14 @@ Full detail and what each result should look like: **[Start_pi.md](Start_pi.md)*
 | Mapping / scan matching internals | `test/slam.py` |
 | Autonomous exploration, click-to-go, path planning | `test/explore.py` |
 | The collision guard | `test/web_nav.py` - `swept_obstacle()` and `Guard` |
+| The System tab (CPU per thread on the Pi; YOLO, Piper, Ollama on the PC) | `test/sysstats.py` (the numbers, on both machines), `SysMonitor` in `test/web_nav.py`. The PC half needs `docker compose up -d --build` after a change |
 | Camera, markers | `test/camera.py`, `test/markers.py` (`test/cliff.py` is no longer used for driving) |
 | The truck's status screen | `test/display.py` (`render_status`) — wiring in [WIRING.md §14](WIRING.md) |
 | Text to speech (voices, queue) | `test/tts.py` — Piper, `pip install "piper-tts>=1.3"` |
 | Speaker playback, beeps, the horn | `test/audio.py` — shared by `web_nav.py`, `web_dashboard.py`, `speaker_test.py` |
 | Object detection | `test/detect.py` — needs `yolov8n.onnx` in `test/` |
-| Person tracking (follow mode groundwork) | `test/person.py` — Vision tab → Person → Track person; the PC's `/person` model via the detection server |
+| Person tracking | `test/person.py` — finds people, distance, clothing-colour signature |
+| Follow mode | `test/follow.py` — Vision tab → Person → **Follow**, or say "follow me" |
 | Better detection, off-board | `tools/detect_server.py` — run it on your PC, paste the URL into the Objects panel |
 | Faster speech, off-board | `tools/tts_server.py` — the PC makes the audio (~0.1 s a sentence instead of 5–17 s), paste `http://<pc-ip>:5005` into the Speak card |
 | Run both PC helpers in Docker | `tools/docker-compose.yml` — `cd tools && docker compose up -d --build`; Ollama stays native on Windows |

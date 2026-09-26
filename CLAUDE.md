@@ -163,9 +163,11 @@ Speaker_truck/
 │   ├── marker_test.py    # print tags, check detection range
 │   ├── cliff.py          # camera floor check — no longer used by the guard
 │   ├── tuning.py         # registry of every live-tunable value
+│   ├── sysstats.py       # task-manager numbers from /proc — Pi System tab + PC containers
 │   ├── calibrate.py      # measure scanner yaw + odometry scale by pushing
 │   ├── detect.py         # YOLOv8n furniture labels pinned to the map
 │   ├── person.py         # person tracker for follow mode: box, bearing, LiDAR/camera distance
+│   ├── follow.py         # follow mode: lock one person (colours + motion), follow, search when lost
 │   ├── slam.py           # occupancy grid + scan matching
 │   ├── explore.py        # frontier explorer
 │   ├── web_nav.py        # the cockpit — drive, LiDAR, IMU, camera, map, audio, LCD

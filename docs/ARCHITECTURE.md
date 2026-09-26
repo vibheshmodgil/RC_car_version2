@@ -69,7 +69,9 @@ measure rotation and field, both independent of where on a rigid body they sit.
 | `camera.py` | CSI camera, MJPEG off the hardware encoder, raw frames for analysis |
 | `markers.py` | ArUco detection, the learned tag map, pose fixes |
 | `cliff.py` | Floor appearance check. **No longer consulted by the guard** - kept, always off |
-| `person.py` | Person tracker for follow mode: box, bearing, distance from LiDAR / floor / box size |
+| `person.py` | Person tracker: box, bearing, distance from LiDAR / floor / box size, clothing-colour signature |
+| `follow.py` | Follow mode: one locked person as a track (position, velocity, colours), LiDAR leg tracking, follow control, search when lost |
+| `sysstats.py` | Task-manager numbers from `/proc` (CPU per core and per thread, RAM, temperature). Used by the System tab on the Pi and copied into the PC's Docker image |
 | `tuning.py` | The registry of every live-tunable value |
 | `audio.py` | Speaker player: tones, beeps, MP3 via ffmpeg, the `/audio/*` Flask routes |
 | `tts.py` | Text to speech: Piper in a nice-10 worker process, sentence queue, voice downloads, `/tts/*` routes |
@@ -119,6 +121,7 @@ tolerates reading a value one cycle stale.
 | Loop closure | ≤ every 2 s | Background thread: the wide 700 mm / 15° search, applied as an offset when done |
 | Map autosave | 20 s | Writes `house_map.json` when it has grown |
 | Explorer | 10 Hz, while running | Auto-mapping or click-to-go; one thread per run (generation-counted) |
+| Follower | 10 Hz, while following | Track update (camera + LiDAR legs), follow control or search; borrows the explorer for routes |
 | Markers | 4 Hz | ArUco detection, pose fixes |
 | Detection | ~1 Hz | Pose and scan taken at the photo; skipped for SLAM only when it runs on the Pi's own model |
 | Flask | per request | The page, `/state`, MJPEG streams - on IPv4 **and** IPv6, so `shiv.local` works |

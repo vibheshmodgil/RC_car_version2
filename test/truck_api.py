@@ -305,6 +305,21 @@ class TruckApi:
         r = self.post("/explore", {"start": True, "calibrate": False})
         return f"Mapping started: {r.get('state')} {r.get('message') or ''}".strip()
 
+    def follow(self, action):
+        """Follow the nearest person in view ("start"), or stop following.
+        Like mapping, starting needs the motors already enabled by a person."""
+        if action == "stop":
+            self.post("/follow", {"stop": True})
+            return "Stopped following."
+        if action != "start":
+            return f"unknown follow action {action!r}; use start or stop"
+        if not self.ai_status()["motors"]["enabled"]:
+            return "Not started: motors are DISABLED. Ask the person to press ENABLE in the cockpit."
+        r = self.post("/follow", {"start": True})
+        if r.get("error"):
+            return f"Not started: {r['error']}"
+        return "Following you. Walk slowly; say stop when you want me to stop."
+
     # --- labels a person confirms ------------------------------------------
 
     def label_questions(self):

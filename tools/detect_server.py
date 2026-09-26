@@ -56,6 +56,12 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+try:                                    # task-manager numbers for the cockpit's System tab
+    import sysstats
+    SAMPLER = sysstats.Sampler()
+except ImportError:                     # run outside the image without test/ on the path
+    SAMPLER = None
+
 MODEL = None
 PERSON_MODEL = None     # plain COCO, class 0 only — see /person below
 ARGS = None
@@ -183,7 +189,8 @@ class Handler(BaseHTTPRequestHandler):
                          "person_model": ARGS.person_model or None,
                          "person_frames": PERSON_STATS["frames"],
                          "person_last_ms": round(PERSON_STATS["ms"], 1),
-                         "uptime_s": int(time.time() - STATS["started"])})
+                         "uptime_s": int(time.time() - STATS["started"]),
+                         "stats": SAMPLER.sample() if SAMPLER else None})
 
     def do_POST(self):
         try:

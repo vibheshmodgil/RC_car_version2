@@ -1,7 +1,8 @@
-# tools/Dockerfile is built from the repo root but needs only these three
+# tools/Dockerfile is built from the repo root but needs only these four
 # files. Everything else — hundreds of MB of .pt weights, the LiDAR manual —
 # would otherwise be sent to Docker on every build.
 *
 !test/tts.py
+!test/sysstats.py
 !tools/tts_server.py
 !tools/detect_server.py

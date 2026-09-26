@@ -214,6 +214,15 @@ async def save_place(name: str) -> str:
 
 
 @mcp.tool()
+async def follow(action: str) -> str:
+    """Follow the nearest person in view: "start" or "stop". It keeps to that
+    person (clothing colours + where they are walking), steers round
+    obstacles, and the collision guard still applies. Refused unless a person
+    has already pressed ENABLE. Progress is in status."""
+    return await _call(api.follow, action)
+
+
+@mcp.tool()
 async def mapping(action: str) -> str:
     """Autonomous exploration that builds the map: "start" or "stop". Start is
     refused unless a person has already pressed ENABLE and the LiDAR is

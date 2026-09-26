@@ -19,5 +19,5 @@ RUN pip install --no-cache-dir "piper-tts>=1.3" numpy pillow ultralytics \
     "git+https://github.com/ultralytics/CLIP.git"
 
 WORKDIR /app
-COPY test/tts.py tools/tts_server.py tools/detect_server.py ./
+COPY test/tts.py test/sysstats.py tools/tts_server.py tools/detect_server.py ./
 ENV PYTHONUNBUFFERED=1

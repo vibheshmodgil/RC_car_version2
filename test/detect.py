@@ -369,6 +369,37 @@ def decode(out, scale, pad, src_w, src_h, keep=None):
     return out_list
 
 
+_conns = threading.local()
+
+
+def _post(url, body, headers, timeout):
+    """POST over a connection KEPT OPEN per thread and server. A new TCP
+    connection per frame cost the tracker 100-700 ms live: the PC side is
+    Docker Desktop on Windows, whose port forwarding is slow to set up each
+    incoming connection. One retry on a fresh connection if the old one died."""
+    import http.client
+    import urllib.parse
+    u = urllib.parse.urlsplit(url)
+    key = (u.hostname, u.port or 80)
+    pool = getattr(_conns, "pool", None)
+    if pool is None:
+        pool = _conns.pool = {}
+    for attempt in (0, 1):
+        conn = pool.get(key)
+        if conn is None:
+            conn = pool[key] = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
+        conn.timeout = timeout
+        try:
+            conn.request("POST", u.path or "/", body=body, headers=headers)
+            r = conn.getresponse()
+            return r.status, r.read()
+        except (http.client.HTTPException, OSError):
+            conn.close()
+            pool.pop(key, None)
+            if attempt:
+                raise
+
+
 def remote_detect(url, jpeg, rotation, conf, timeout=REMOTE_TIMEOUT_S):
     """Send one JPEG to the PC and get boxes back.
 
@@ -380,15 +411,13 @@ def remote_detect(url, jpeg, rotation, conf, timeout=REMOTE_TIMEOUT_S):
     on-board path uses, so everything downstream is identical whichever
     backend produced them.
     """
-    import urllib.request
-    req = urllib.request.Request(
-        url, data=jpeg, method="POST",
-        headers={"Content-Type": "image/jpeg",
-                 "Content-Length": str(len(jpeg)),
-                 "X-Rotation": str(int(rotation)),
-                 "X-Conf": str(conf)})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        d = json.loads(r.read().decode())
+    status, body = _post(url, jpeg, {"Content-Type": "image/jpeg",
+                                     "Content-Length": str(len(jpeg)),
+                                     "X-Rotation": str(int(rotation)),
+                                     "X-Conf": str(conf)}, timeout)
+    if status >= 500:
+        raise DetectError(f"server HTTP {status}")
+    d = json.loads(body.decode())
     if not d.get("ok"):
         raise DetectError(d.get("error", "server refused the frame"))
     return d.get("detections", []), d.get("ms", 0.0), d.get("model", "?")

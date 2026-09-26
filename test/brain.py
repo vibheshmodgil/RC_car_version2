@@ -278,6 +278,10 @@ TOOLS = [
      "parameters": {"type": "object", "properties": {
          "action": {"type": "string", "enum": ["start", "stop"]}},
          "required": ["action"]}},
+    {"name": "follow", "description": "Follow the person in front of you (start), or stop following. Use when asked to follow or come along.",
+     "parameters": {"type": "object", "properties": {
+         "action": {"type": "string", "enum": ["start", "stop"]}},
+         "required": ["action"]}},
     {"name": "save_map", "description": "Save the map built so far.",
      "parameters": {"type": "object", "properties": {}}},
     {"name": "take_photo", "description": "Save a camera picture for the person to see later.",
@@ -285,7 +289,7 @@ TOOLS = [
 ]
 
 # Tools whose result text is already the spoken answer — see _quick_reply.
-SPOKEN_RESULTS = ("music", "volume", "save_place", "mapping", "save_map", "take_photo")
+SPOKEN_RESULTS = ("music", "volume", "save_place", "mapping", "save_map", "take_photo", "follow")
 
 
 def _system_prompt(voice_id, can_see):
@@ -1000,6 +1004,8 @@ class Brain:
                 return self.api.save_place(args.get("name", "")), None, None
             if name == "mapping":
                 return self.api.explore(args.get("action", "")), None, None
+            if name == "follow":
+                return self.api.follow(args.get("action", "")), None, None
             if name == "save_map":
                 return self.api.save_map(), None, None
             if name == "take_photo":

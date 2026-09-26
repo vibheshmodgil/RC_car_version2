@@ -58,6 +58,12 @@ for _p in (_HERE, os.path.join(_HERE, "..", "test")):
     sys.path.insert(0, os.path.abspath(_p))
 import tts                                                     # noqa: E402
 
+try:                                    # task-manager numbers for the cockpit's System tab
+    import sysstats                                            # noqa: E402
+    SAMPLER = sysstats.Sampler()
+except ImportError:
+    SAMPLER = None
+
 VOICE_DIR = os.environ.get("TTS_VOICE_DIR", os.path.join(_HERE, "voices"))
 # onnxruntime's default is a thread per core that busy-waits between runs.
 # Inside Docker Desktop's VM that fought the rest of the PC: measured 0.6-1.1 s
@@ -128,7 +134,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         have = sorted(f[:-5] for f in os.listdir(VOICE_DIR) if f.endswith(".onnx")) \
             if os.path.isdir(VOICE_DIR) else []
-        self._json(200, {"ok": True, "loaded": sorted(_voices), "downloaded": have})
+        self._json(200, {"ok": True, "loaded": sorted(_voices), "downloaded": have,
+                         "stats": SAMPLER.sample() if SAMPLER else None})
 
     def do_POST(self):
         if self.path.rstrip("/") != "/say":

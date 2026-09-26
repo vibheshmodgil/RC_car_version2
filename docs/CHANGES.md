@@ -14,6 +14,80 @@ How things were tested:
 
 ---
 
+## Follow mode
+
+Lock on to one person and follow them - `test/follow.py`, the **Follow** button
+on the Vision tab, or "follow me" to the voice assistant / Claude Code.
+
+| Design point | Why |
+|---|---|
+| The target is a **track**: world position + velocity + clothing-colour signature | The old "same bearing = same person" handed over to anyone walking past |
+| Colours decide who it is: below 0.40 similarity a detection is *not* them however near; 0.60 to take them back after losing sight | Different shirts score ~0.25, the same shirt in different light ~1.0 (camera-frame test) |
+| Legs in the LiDAR between camera frames and outside the 54° view - grouped into people, skipped when two are close | Averaging every return near the target let a passer-by drag the track away |
+| Two look-alikes both fit and too close to tell: coast on the prediction, don't guess | A same-coloured person crossing through the target's spot took over |
+| Velocity = slope over ~1.2 s, jumps limited to walking speed | Per-step velocity swung ±500 mm/s, so coasting went anywhere |
+| Lost: close by → turn to look; far or behind a wall → go where they were heading | Spinning first cost 15 s at every doorway |
+| Guard with the autonomous margin on every command; routes round obstacles via the explorer | "Without colliding" is the guard's job and cannot be bypassed |
+
+Simulation (real `follow.py`, guard and planner; two-legged walkers, camera
+only inside 54° with line of sight):
+
+| Scenario | 0.6-2 m from them | On the wrong person | Closest to anyone |
+|---|---|---|---|
+| Hall, slow walk with pauses | 100 % | 0 s | 964 mm |
+| Through a door and round the sofa | 96 % | 0 s | 887 mm |
+| Someone crosses in between | 100 % | 0 s | 763 mm |
+| Someone walks alongside, then leaves | 100 % | 0 s | 864 mm |
+| Same clothes, crossing through their spot | 100 % | 0 s | 780 mm |
+| They walk at 0.6 m/s | 57 % (truck max ~0.3 m/s) | 0 s | 964 mm |
+
+Live on the truck (Sept 2026): person seen in 61 % of samples at ~4 Hz, lost
+for 0.8-1.6 s at a time, colour match 0.63-1.0, followed across ~8 m. It
+falls back to ~3.7 m when the guard refuses a turning arc, because the motors
+are capped at 0.4 duty.
+
+### Lost while standing still: no more driving up to them
+
+Live, the camera lost someone standing ~2.5 m away. The search drove the
+planner's path to where they were last seen, heading 34° off the spot (outside
+the camera's ±27°), and stopped 0.75 m from the person. Two causes, both fixed:
+
+- The search went to the trail's last point, which leaves out LiDAR-only
+  readings, so it could be metres behind where they actually were. It now goes
+  to the track's last measured position.
+- On the way, if the LiDAR sees legs (not a mapped obstacle) at that spot
+  within following distance, with nothing in between, the truck stops, turns
+  the camera onto the spot, and looks for 1.5 s before searching further.
+
+Sim, person standing still while the camera misses them for 22 s: closest
+approach 326 mm -> 1020 mm, searching 17.6 s -> 9.6 s. The other scenarios
+are unchanged (0 s on the wrong person, 0 s backing off from nobody).
+
+### System tab
+
+A task manager in the cockpit. On the Pi it shows CPU (total and per core),
+RAM, temperature, under-voltage (`vcgencmd get_throttled`), and this
+program's CPU split by thread, named by what each thread runs
+(`SlamRunner._run`, `Lidar._loop`...). On the PC it shows the detection
+container (people and objects: frames/s, ms per frame, container CPU and RAM,
+the Docker VM's load), the speech container, and the models Ollama has loaded
+with how much of each is on the GPU. Polling runs only while the tab is open.
+
+### Person trail on the map
+
+Where they walked is drawn on the map (the **Person trail** chip turns it on
+and off; Reset map clears it). When the truck loses them, it searches along
+the trail: it goes to where they were last seen, then turns to face the way
+they were heading, looks round, and follows the trail onward.
+
+The first live trail had spikes several metres long through walls. They came
+from ranges that looked past thin legs and from LiDAR-only readings on
+something else. Now a point is only recorded from a trusted reading: not a
+rejected jump, and not LiDAR alone more than 2 s after the camera last saw
+them. Each point is also averaged over the last 4 positions. In the
+live-like sim, the longest single step fell from 3.0 m to 0.8 m, and the
+worst point off their real path fell from 2.9 m to 1.4 m.
+
 ## Round 3 - mapping the whole house, then voice
 
 | Problem (seen) | Change | Checked |

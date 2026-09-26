@@ -49,7 +49,11 @@ import detect
 from cliff import ground_distance
 from pins import CAM_HFOV, CAM_OFFSET_X, CAM_OFFSET_Y, cam_vfov
 
-CONF_MIN = 0.45
+# 0.30, not 0.45: live, backlit and through a purple-cast (NoIR) camera, the
+# person was found in only 16 % of passes. A false box is cheap here - the
+# follower rejects anyone who is neither where the target should be nor
+# dressed like them.
+CONF_MIN = 0.30
 # Loop rate: what the backend can sustain, not a wish. The PC answers in
 # ~100 ms; the Pi's own model takes ~500 ms and has SLAM to share with.
 HZ_REMOTE = 5.0
@@ -65,6 +69,41 @@ SHOULDER_MM = 450.0
 LOST_S = 1.5
 # The same person, frame to frame, if their bearing moved less than this.
 SAME_TARGET_DEG = 15.0
+
+
+def signature(planes, box):
+    """A clothing-colour fingerprint of one person: a histogram of the
+    TORSO's colour (the middle half of the box's width, 20-55 % of its
+    height - shirt, not background, not legs), plus a little brightness.
+
+    Chroma (U, V) carries most of it because it barely changes with how
+    brightly lit someone is; two people in different shirts differ in it at
+    once. planes = the camera's raw (Y, U, V) lores frame; box = the person
+    in RAW-frame fractions. Returns a normalised vector, or None."""
+    if planes is None or box is None:
+        return None
+    y, u, v = planes
+    h, w = u.shape
+    x0, y0, x1, y1 = box
+    bw, bh = x1 - x0, y1 - y0
+    i0, i1 = int((y0 + 0.20 * bh) * h), int((y0 + 0.55 * bh) * h)
+    j0, j1 = int((x0 + 0.25 * bw) * w), int((x1 - 0.25 * bw) * w)
+    i1, j1 = max(i1, i0 + 2), max(j1, j0 + 2)
+    uu, vv = u[i0:i1, j0:j1], v[i0:i1, j0:j1]
+    if uu.size < 12:
+        return None
+    hc = np.histogram2d(uu.ravel(), vv.ravel(), bins=8, range=[[0, 256], [0, 256]])[0].ravel()
+    hy = np.histogram(y[2 * i0:2 * i1, 2 * j0:2 * j1], bins=4, range=(0, 256))[0]
+    sig = np.concatenate([hc / max(1.0, hc.sum()), 0.35 * hy / max(1.0, hy.sum())])
+    return sig / sig.sum()
+
+
+def similarity(a, b):
+    """How alike two signatures are: 1 identical, 0 nothing in common
+    (Bhattacharyya coefficient). None if either is missing."""
+    if a is None or b is None:
+        return None
+    return float(np.sum(np.sqrt(np.asarray(a) * np.asarray(b))))
 
 
 def person_url(detect_url):
@@ -96,14 +135,25 @@ class PersonTracker:
         self._t_prev = None
         self._remote_down_until = 0.0
         self._remote_why = ""
+        # Bumped on every detection pass, so a consumer (follow.py) can tell
+        # a NEW set of people from the same list read twice.
+        self.seq = 0
+        self.stamp = 0.0
+        self.parts_ms = {}
         threading.Thread(target=self._run, daemon=True).start()
 
     # --- the loop ---------------------------------------------------------
 
     def _run(self):
+        last = 0.0
         while True:
             remote = bool(self.det.url)
-            time.sleep(1.0 / (HZ_REMOTE if remote else HZ_ONBOARD))
+            # Sleep only what is LEFT of the period. It used to sleep the whole
+            # period after every pass, so a 0.38 s pass ran at 1.7 Hz instead
+            # of 2.6 - and following needs every detection it can get.
+            period = 1.0 / (HZ_REMOTE if remote else HZ_ONBOARD)
+            time.sleep(max(0.01, period - (time.monotonic() - last)))
+            last = time.monotonic()
             cam = self.det.camera
             if not self.enabled or cam is None or cam.cam is None:
                 self.backend = "off" if not self.enabled else "no camera"
@@ -155,14 +205,27 @@ class PersonTracker:
 
     def _tick(self):
         rot = self.det.rotation
+        # Pose, scan and pixels as the frame is TAKEN: the PC answers 0.1-1 s
+        # later, and a pose read then puts a person seen mid-turn tens of
+        # degrees off - onto whatever the scan hit by then.
+        t0 = time.perf_counter()
+        pose = self.slam.slam.pose.copy() if self.slam is not None else None
+        pts = self.body_points() or []
+        planes = self._planes()
+        t1 = time.perf_counter()
         found = self._detect(rot)
+        t2 = time.perf_counter()
         if found is None:
             return
-        pts = self.body_points() or []
-        pose = self.slam.slam.pose if self.slam is not None else None
-        people = [self._measure(conf, box, rot, pts, pose) for conf, box in found]
+        people = [self._measure(conf, box, rot, pts, pose, planes) for conf, box in found]
+        # Where a pass's time goes, for the page: the frame and scan, the
+        # model (on the PC: the network round trip too), and the geometry.
+        self.parts_ms = {"capture": round((t1 - t0) * 1000), "detect": round((t2 - t1) * 1000),
+                         "measure": round((time.perf_counter() - t2) * 1000)}
         people.sort(key=lambda p: -p["conf"])
         self.people = people
+        self.seq += 1
+        self.stamp = time.monotonic()
         if people:
             self.target = self._pick(people)
             self._last_t = time.monotonic()
@@ -178,7 +241,14 @@ class PersonTracker:
 
     # --- one person -------------------------------------------------------
 
-    def _measure(self, conf, box, rot, pts, pose):
+    def _planes(self):
+        cam = self.det.camera
+        try:
+            return cam.cam.yuv_planes() if cam is not None and cam.cam is not None else None
+        except Exception:                                      # noqa: BLE001
+            return None
+
+    def _measure(self, conf, box, rot, pts, pose, planes=None):
         x0, y0, x1, y1 = box
         bearing = self.det._bearing((x0 + x1) / 2, rot)
         # Angular span of the box's middle BOX_INNER, body frame, +left.
@@ -188,6 +258,19 @@ class PersonTracker:
         lidar, n = self._lidar_range(pts, min(left, right), max(left, right))
         floor = self._floor_range(y1, bearing, rot)
         size = self._size_range(x1 - x0, rot)
+        # The floor figure rests on the camera's height and tilt, which are
+        # still guesses: live it read 240 mm for someone 2 m away, which
+        # would have had the follower backing off from nobody. Only believed
+        # when it roughly agrees with the box size.
+        if floor is not None and size is not None and not (0.5 * size <= floor <= 2.0 * size):
+            floor = None
+        # The LiDAR too, when it disagrees with the box badly. Legs are thin at
+        # the scanner's height; live it read 4.34 m THROUGH someone standing
+        # at 2.4 m (the box said 2.37), and the track jumped between the two.
+        # Much farther than the box: it saw past them. Much nearer: something
+        # in front of them. Either way it is not their distance.
+        if lidar is not None and size is not None and not (0.6 * size <= lidar <= 1.6 * size):
+            lidar, n = None, 0
         for d, src in ((lidar, "lidar"), (floor, "floor"), (size, "size")):
             if d is not None:
                 dist, source = d, src
@@ -195,8 +278,11 @@ class PersonTracker:
         else:
             dist, source = None, "none"
 
+        raw_box = detect.unrotate_box(box, rot)
+        sig = signature(planes, raw_box)
         rec = {"conf": round(conf, 2), "bearing": round(bearing, 1),
-               "box": [round(v, 4) for v in detect.unrotate_box(box, rot)],
+               "box": [round(v, 4) for v in raw_box],
+               "sig": None if sig is None else [round(float(v), 5) for v in sig],
                "lidar_mm": _r(lidar), "lidar_points": n,
                "floor_mm": _r(floor), "size_mm": _r(size),
                "distance_mm": _r(dist), "source": source}
@@ -253,8 +339,11 @@ class PersonTracker:
         t = self.target
         return {"enabled": self.enabled, "backend": self.backend, "error": self.error,
                 "ms": round(self.ms, 1), "hz": round(self.hz, 1), "frames": self.frames,
-                "people": self.people if self.enabled else [],
-                "target": t if self.enabled else None,
+                "parts_ms": self.parts_ms,
+                "people": ([{k: v for k, v in p.items() if k != "sig"} for p in self.people]
+                           if self.enabled else []),
+                "target": ({k: v for k, v in t.items() if k != "sig"}
+                           if self.enabled and t else None),
                 "age_s": round(time.monotonic() - self._last_t, 1) if t else None}
 
 

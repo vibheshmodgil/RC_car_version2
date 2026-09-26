@@ -1338,7 +1338,7 @@ def control_loop():
         if time.monotonic() - ts > WATCHDOG_S:
             th = st = 0.0                       # deadman: intent went stale
         try:
-            th, st = guard.apply(th, st, lidar, auto=(source == "explore"))
+            th, st = guard.apply(th, st, lidar, auto=(source in ("explore", "follow")))
         except Exception:                                     # noqa: BLE001
             th = st = 0.0
         # Only touch the GPIO when something actually changed. Rewriting the
@@ -1354,6 +1354,7 @@ def control_loop():
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = audio.MAX_UPLOAD_MB * 1024 * 1024
 robot = lidar = imu = slam = explorer = camera = None
+follower = None
 speaker = None
 screen = None
 talker = None
@@ -1365,6 +1366,123 @@ intent = Intent()
 guard = Guard()
 from calibrate import PushMeasure  # noqa: E402
 pusher = PushMeasure()
+import sysstats  # noqa: E402
+
+
+class SysMonitor:
+    """The System tab: who is using the CPU, on the Pi and on the PC.
+
+    Pi: whole-machine and per-core CPU, RAM, temperature, under-voltage, and
+    this program's threads by name (SLAM, LiDAR, person tracker...).
+    PC: the detect and speech containers report their own numbers on GET
+    (tools/*_server.py, same sysstats module); Ollama says which models it
+    has loaded and how much of each is on the GPU (/api/ps).
+
+    Polls only while someone has the tab open (asked in the last WATCH_S):
+    the PC round trips are cheap but not free, and nobody reads them otherwise.
+    """
+
+    PERIOD_S = 2.0
+    WATCH_S = 15.0
+
+    def __init__(self):
+        self.sampler = sysstats.Sampler()
+        self.asked = 0.0
+        self.data = {}
+        self._frames = {}                  # (url, key) -> (t, frames), for frames/s
+        self._throttle_t = 0.0
+        self._throttle = None
+        threading.Thread(target=self._loop, daemon=True, name="sysmon").start()
+
+    def snapshot(self):
+        self.asked = time.monotonic()
+        return self.data
+
+    def _loop(self):
+        while True:
+            time.sleep(self.PERIOD_S)
+            if time.monotonic() - self.asked > self.WATCH_S:
+                continue
+            try:
+                self.data = self._collect()
+            except Exception as e:                            # noqa: BLE001
+                self.data = {"error": "%s: %s" % (type(e).__name__, e)}
+
+    @staticmethod
+    def _get(url, timeout=1.5):
+        import urllib.request                                 # noqa: PLC0415
+        t0 = time.monotonic()
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            d = json.loads(r.read().decode())
+        return d, round((time.monotonic() - t0) * 1000.0)
+
+    def _rate(self, key, frames):
+        now = time.monotonic()
+        prev = self._frames.get(key)
+        self._frames[key] = (now, frames)
+        if prev is None or frames is None or frames < prev[1]:
+            return None
+        return round((frames - prev[1]) / max(1e-3, now - prev[0]), 1)
+
+    def _pi_throttled(self):
+        """vcgencmd get_throttled, every 10 s: under-voltage on a battery
+        robot shows up as random slowness long before anything resets."""
+        now = time.monotonic()
+        if now - self._throttle_t > 10.0:
+            self._throttle_t = now
+            try:
+                import subprocess                             # noqa: PLC0415
+                out = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True,
+                                     text=True, timeout=2).stdout
+                v = int(out.strip().split("=")[1], 16)
+                self._throttle = {"raw": hex(v), "undervolt_now": bool(v & 0x1),
+                                  "throttled_now": bool(v & 0x4), "undervolt_since_boot": bool(v & 0x10000),
+                                  "throttled_since_boot": bool(v & 0x40000)}
+            except Exception:                                 # noqa: BLE001
+                self._throttle = None
+        return self._throttle
+
+    def _collect(self):
+        pi = self.sampler.sample()
+        pi["throttle"] = self._pi_throttled()
+        pc = {}
+        durl = getattr(detector, "url", None) if detector is not None else None
+        if durl:
+            base = durl.rsplit("/detect", 1)[0] if "/detect" in durl else durl.rstrip("/")
+            try:
+                d, ping = self._get(base + "/")
+                pc["detect"] = {"ok": True, "url": base, "ping_ms": ping,
+                                "model": d.get("model"), "device": d.get("device"),
+                                "last_ms": d.get("last_ms"), "fps": self._rate((base, "f"), d.get("frames")),
+                                "person_model": d.get("person_model"),
+                                "person_last_ms": d.get("person_last_ms"),
+                                "person_fps": self._rate((base, "p"), d.get("person_frames")),
+                                "stats": d.get("stats")}
+            except Exception as e:                            # noqa: BLE001
+                pc["detect"] = {"ok": False, "url": base, "error": str(e)[:80]}
+        turl = getattr(talker, "url", None) if talker is not None else None
+        if turl:
+            try:
+                d, ping = self._get(turl.rstrip("/") + "/")
+                pc["tts"] = {"ok": True, "url": turl, "ping_ms": ping, "voices": d.get("loaded"),
+                             "stats": d.get("stats")}
+            except Exception as e:                            # noqa: BLE001
+                pc["tts"] = {"ok": False, "url": turl, "error": str(e)[:80]}
+        ourl = getattr(assistant, "ollama_url", None) if assistant is not None else None
+        if ourl:
+            try:
+                d, ping = self._get(ourl.rstrip("/") + "/api/ps")
+                pc["ollama"] = {"ok": True, "url": ourl, "ping_ms": ping, "models": [
+                    {"name": m.get("name"), "size_mb": round((m.get("size") or 0) / 2**20),
+                     "vram_mb": round((m.get("size_vram") or 0) / 2**20),
+                     "expires": m.get("expires_at")} for m in d.get("models") or []]}
+            except Exception as e:                            # noqa: BLE001
+                pc["ollama"] = {"ok": False, "url": ourl, "error": str(e)[:80]}
+        return {"t": time.time(), "pi": pi, "pc": pc}
+
+
+sysmon = SysMonitor()
+
 
 PAGE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -1478,6 +1596,10 @@ button:hover{filter:brightness(1.25)}
 button:active{transform:translateY(1px)}
 .b-enable{background:color-mix(in srgb,var(--good) 20%,var(--surface-2));
           border-color:color-mix(in srgb,var(--good) 40%,transparent);color:var(--good)}
+/* The top ENABLE button shows the motors' state itself: grey and plain while
+   they are off, solid green once armed - it used to look the same either way. */
+#b-arm{background:var(--surface-2);border-color:var(--border);color:var(--text-2)}
+#b-arm.armed{background:var(--good);border-color:var(--good);color:#0d1117;font-weight:700}
 .b-stop{background:color-mix(in srgb,var(--warning) 18%,var(--surface-2));
         border-color:color-mix(in srgb,var(--warning) 40%,transparent);color:var(--warning)}
 .b-estop{background:var(--critical);border-color:var(--critical);color:#fff}
@@ -1571,6 +1693,13 @@ canvas#map{image-rendering:pixelated;background:var(--surface-2);border-radius:8
       border-bottom:1px solid var(--border);font-size:.73rem;gap:10px}
 .stat:last-child{border-bottom:none}
 .stat .k{color:var(--text-3)}
+.sbar{position:relative;height:7px;border-radius:4px;background:var(--surface-2);overflow:hidden;margin:2px 0 6px}
+.sbar i{position:absolute;left:0;top:0;bottom:0;border-radius:4px;background:var(--good)}
+.sbar i.mid{background:var(--warning)} .sbar i.hi{background:var(--critical)}
+.cores{display:grid;grid-template-columns:repeat(auto-fill,minmax(60px,1fr));gap:6px;margin:4px 0 8px}
+.cores div{font-size:.62rem;color:var(--text-3)}
+.sysnote{font-size:.7rem;color:var(--text-3);margin:12px 2px;line-height:1.5}
+.v.bad{color:var(--critical)} .v.ok{color:var(--good)}
 .stat .v{font-weight:600;text-align:right}
 .rows{display:flex;gap:12px;justify-content:center;margin-top:9px}
 .rd{text-align:center;flex:1}
@@ -1881,7 +2010,7 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
       <button class="b-save" id="b-save" onclick="tuneSave()"
               title="Write tuned values to tuning.json on the Pi">SAVED</button>
       <button class="b-docs" id="b-docs" onclick="toggleDocs()" title="Show or hide the explanations">?</button>
-      <button class="b-enable" onclick="cmd('/enable')">ENABLE</button>
+      <button id="b-arm" class="b-enable" onclick="cmd('/enable')" title="Arm the motors">ENABLE</button>
       <button class="b-stop" onclick="cmd('/stop')">STOP</button>
       <button class="b-estop" onclick="cmd('/estop')">E-STOP</button>
     </div>
@@ -1896,6 +2025,7 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
     <button class="tab" data-tab="vision" onclick="showTab('vision')">Vision<i class="pip" id="pip-vision"></i></button>
     <button class="tab" data-tab="audio" onclick="showTab('audio')">Audio<i class="pip" id="pip-audio"></i></button>
     <button class="tab" data-tab="tune" onclick="showTab('tune')">Tune</button>
+    <button class="tab" data-tab="system" onclick="showTab('system')">System</button>
   </div>
 </div>
 
@@ -2077,6 +2207,7 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
       <div class="viewbar">
         <button class="chip" onclick="mapFit()">Fit</button>
         <button class="chip" id="m-follow" onclick="mapFollowToggle()">Follow truck</button>
+        <button class="chip" id="m-person" onclick="togglePersonTrail()" title="Show or hide the followed person's trail">Person trail</button>
         <button class="chip" onclick="mapZoomBy(1.4)">+</button>
         <button class="chip" onclick="mapZoomBy(1/1.4)">&minus;</button>
         <span class="note" id="m-goal" style="margin:0"></span>
@@ -2448,7 +2579,9 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
         <h2>Person &middot; <span id="p-state" class="mono">&mdash;</span></h2>
         <div class="tog">
           <button id="t-person" onclick="post('/person',{enabled:!personOn})">Track person</button>
+          <button id="t-follow" class="b-auto" onclick="post('/follow', followOn ? {stop:true} : {start:true, enable:true})">Follow</button>
         </div>
+        <div class="stat"><span class="k">Follow</span><span class="v mono" id="f-state">off</span></div>
         <div class="stat"><span class="k">Distance</span><span class="v num mono" id="p-dist">&mdash;</span></div>
         <div class="stat"><span class="k">Bearing (+left)</span><span class="v num mono" id="p-bear">&mdash;</span></div>
         <div class="stat"><span class="k">LiDAR</span><span class="v num mono" id="p-lidar">&mdash;</span></div>
@@ -2459,9 +2592,14 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
         <div class="stat"><span class="k">Running on</span><span class="v mono" id="p-backend">&mdash;</span></div>
         <div class="aerr" id="p-err"></div>
         <p class="note">
-          Groundwork for <b>follow mode</b>: finds people, keeps the one it is
-          watching, and measures how far and which way. It does not drive
-          yet. <b>LiDAR</b> is the distance to steer on (legs, to the
+          <b>Follow</b> locks on to the nearest person in view and follows
+          them at about 1&nbsp;m: it knows them by their clothes' colours and
+          where they are walking, follows their legs in the LiDAR when the
+          camera cannot see them, goes round furniture, and goes to where they
+          were last seen if it loses them. The guard still stops it short of
+          anyone. Walk slowly - the truck tops out near 0.3&nbsp;m/s. Driving
+          by hand, STOP, or starting a trip ends it. Or say <i>"follow me"</i>.
+          <b>LiDAR</b> is the distance to steer on (legs, to the
           centimetre); the two camera figures work without it but are rough
           &mdash; <b>feet on floor</b> needs the feet in frame and a measured
           camera height and tilt, <b>box size</b> assumes 0.45&nbsp;m of
@@ -2707,6 +2845,35 @@ details.voices summary{cursor:pointer;font-size:.62rem;text-transform:uppercase;
 </div>
 
 <!-- ===================================================== TUNE =========== -->
+<div class="tabpanel" id="tab-system">
+  <div class="cols2">
+    <div class="card">
+      <h2>Raspberry Pi <span class="hint" id="sy-pi-note"></span></h2>
+      <div id="sy-pi"></div>
+    </div>
+    <div class="card">
+      <h2>Pi &mdash; this program, by thread <span class="hint">% of the whole Pi (1 core = 25 %)</span></h2>
+      <div id="sy-threads"></div>
+    </div>
+    <div class="card">
+      <h2>PC &mdash; detection (YOLO) <span class="hint" id="sy-det-note"></span></h2>
+      <div id="sy-det"></div>
+    </div>
+    <div class="card">
+      <h2>PC &mdash; language model (Ollama) <span class="hint" id="sy-oll-note"></span></h2>
+      <div id="sy-oll"></div>
+    </div>
+    <div class="card">
+      <h2>PC &mdash; speech (Piper) <span class="hint" id="sy-tts-note"></span></h2>
+      <div id="sy-tts"></div>
+    </div>
+  </div>
+  <p class="sysnote">Updated every 2 s while this tab is open. PC figures come from inside
+  Docker, so "Docker VM" is the Linux VM Docker Desktop runs on Windows: it shares the PC's
+  cores, but Ollama and other Windows programs are not counted in it. Ollama does not report
+  CPU; it reports which models are loaded and how much of each sits on the GPU.</p>
+</div>
+
 <div class="tabpanel" id="tab-tune">
   <div class="tuneact">
     <button class="b-enable" onclick="tuneSave()">Save to tuning.json</button>
@@ -2825,7 +2992,7 @@ let yaw = null, roll = 0, pitch = 0, headingOk = false;
 // and a socket open on the Pi for no reason.
 let camWant = true, camLive = false, camOn = false;
 let cliffOn = false, mkOn = false, mkLearn = false, detOn = false;
-let personOn = false, personT = null;   // person tracker; personT is ringed on the plot
+let personOn = false, personT = null, followOn = false;   // person tracker; personT is ringed on the plot
 let objects = [];
 // What goes over the live picture. Boxes by default - a label is only
 // checkable if you can see WHICH thing it was put on.
@@ -3719,6 +3886,16 @@ function renameObj(i){
 function toggleAuto(){ post('/explore', autoOn ? {stop:true} : {start:true}); }
 let slamOn = true, matchOn = true, mapImg = null, trail = [], mapMeta = null;
 let truckPose = null, exGoal = null, exPath = [];
+let followInfo = null;                 // follow mode: the person's trail, last seen, search goal
+let showPersonTrail = true;
+try { showPersonTrail = localStorage.getItem('nav.personTrail') !== 'off'; } catch(e) {}
+function togglePersonTrail(){
+  showPersonTrail = !showPersonTrail;
+  try { localStorage.setItem('nav.personTrail', showPersonTrail ? 'on' : 'off'); } catch(e) {}
+  syncPersonChip(); drawMap();
+}
+function syncPersonChip(){ const c = $('m-person'); if(c) c.classList.toggle('sel', showPersonTrail); }
+syncPersonChip();
 const mapBuf = document.createElement('canvas');
 const mv = {s: null, cx: 0, cy: 0, follow: false, user: false};
 
@@ -3760,7 +3937,7 @@ function mapFit(){ mv.user = false; mv.follow = false; syncFollowBtn(); drawMap(
 function mapFollowToggle(){
   mv.follow = !mv.follow; mv.user = true; syncFollowBtn(); drawMap();
 }
-function syncFollowBtn(){ $('m-follow').classList.toggle('sel', mv.follow); }
+function syncFollowBtn(){ $('m-follow').classList.toggle('sel', mv.follow); syncPersonChip(); }
 // Zoom about a screen point, default the centre, keeping what is under it still.
 function mapZoomBy(f, sx, sy){
   const [w, h] = mapSize();
@@ -3820,6 +3997,29 @@ function drawMap(){
     g.strokeStyle = css('--good'); g.lineWidth = 2;
     g.beginPath(); g.arc(gx, gy, 9, 0, 6.2832); g.stroke();
     g.beginPath(); g.arc(gx, gy, 3, 0, 6.2832); g.fillStyle = css('--good'); g.fill();
+  }
+
+  // Follow mode: where the person has walked, where they were last seen and,
+  // while searching, where the truck is going to look for them.
+  if(followInfo && showPersonTrail){
+    const tr = followInfo.trail;
+    g.strokeStyle = css('--audio'); g.lineWidth = 2.5; g.globalAlpha = .9;
+    g.beginPath();
+    tr.forEach(([x, y], i) => i ? g.lineTo(X(x), Y(y)) : g.moveTo(X(x), Y(y)));
+    g.stroke(); g.globalAlpha = 1;
+    if(followInfo.last_seen){
+      const [lx, ly] = followInfo.last_seen;
+      g.fillStyle = css('--audio');
+      g.beginPath(); g.arc(X(lx), Y(ly), 6, 0, 6.2832); g.fill();
+      g.font = '600 11px system-ui,sans-serif'; g.textAlign = 'center';
+      g.fillText(followInfo.state === 'searching' ? 'last seen' : 'person', X(lx), Y(ly) - 10);
+    }
+    if(followInfo.search_goal && followInfo.state === 'searching'){
+      const [sx, sy] = followInfo.search_goal;
+      g.strokeStyle = css('--audio'); g.setLineDash([4, 4]); g.lineWidth = 2;
+      g.beginPath(); g.arc(X(sx), Y(sy), 12, 0, 6.2832); g.stroke(); g.setLineDash([]);
+      g.fillStyle = css('--audio'); g.fillText('searching here', X(sx), Y(sy) - 16);
+    }
   }
 
   // Room names, large and underneath like a floor plan.
@@ -4024,6 +4224,9 @@ function poll(){
     }
 
     $('badge').className = 'badge ' + (m.enabled ? 'on':'off');
+    $('b-arm').classList.toggle('armed', !!m.enabled);
+    $('b-arm').textContent = m.enabled ? '● ENABLED' : 'ENABLE';
+    $('b-arm').title = m.enabled ? 'Motors armed - STOP or E-STOP to halt' : 'Arm the motors';
     $('badge').innerHTML = '<i class="dot"></i>' + (m.enabled ? 'ENABLED':'DISABLED');
     // "Scanning" only while scans are actually arriving: an old scan still
     // has points, which is how a frozen scanner once looked perfectly healthy.
@@ -4325,6 +4528,13 @@ function poll(){
     $('p-rate').textContent  = personOn ? (pr.hz || 0).toFixed(1) + ' Hz · ' + (pr.ms || 0).toFixed(0) + ' ms' : '—';
     $('p-backend').textContent = pr.backend || '—';
     $('p-err').textContent = pr.error || '';
+    const fo = d.follow || {};
+    followInfo = (fo.trail && fo.trail.length) ? fo : null;
+    followOn = !!fo.running;
+    $('t-follow').textContent = followOn ? 'Stop following' : 'Follow';
+    $('t-follow').classList.toggle('g-on', followOn);
+    $('f-state').textContent = fo.running ? fo.message
+      : (fo.message ? fo.message : 'off');
     $('detlist').innerHTML = (dt.seen || []).map(o =>
         `<span class="tag ${o.placed?'fix':'on'}">${o.label} ${(o.conf*100)|0}%`
         + (o.range != null ? ' · '+mm(o.range) : ' · no range') + `</span>`).join('')
@@ -4335,6 +4545,7 @@ function poll(){
     drawCompass(); drawHorizon();
   }).catch(() => {
     $('badge').className = 'badge off';
+    $('b-arm').classList.remove('armed'); $('b-arm').textContent = 'ENABLE';
     $('badge').innerHTML = '<i class="dot"></i>NO LINK';
     camLive = false; applyCam();      // tear the stream down with everything else
   });
@@ -4357,6 +4568,82 @@ poll();
 
 let tab = 'drive';
 
+// ---- System tab: task manager for the Pi and the PC --------------------
+function sysEsc(x){ return String(x == null ? '' : x).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]); }
+function sysBar(pct, max){
+  const f = Math.max(0, Math.min(100, 100 * (pct || 0) / (max || 100)));
+  const cls = f > 85 ? 'hi' : f > 60 ? 'mid' : '';
+  return `<div class="sbar"><i class="${cls}" style="width:${f.toFixed(0)}%"></i></div>`;
+}
+function sysStat(k, v, cls){ return `<div class="stat"><span class="k">${sysEsc(k)}</span><span class="v num mono ${cls||''}">${v}</span></div>`; }
+function sysMachine(st, label){
+  if(!st || !st.host) return sysStat(label, 'no numbers (not Linux?)');
+  const h = st.host;
+  let o = sysStat(label + ' CPU', `${(h.cpu_pct||0).toFixed(0)} % of ${h.cores} cores` + (h.load1 != null ? ` · load ${h.load1}` : ''));
+  o += sysBar(h.cpu_pct);
+  if(h.per_core && h.per_core.length && h.per_core.length <= 16)
+    o += '<div class="cores">' + h.per_core.map((c, i) => `<div>core ${i} · ${c.toFixed(0)}%${sysBar(c)}</div>`).join('') + '</div>';
+  const mp = h.mem_total_mb ? 100 * h.mem_used_mb / h.mem_total_mb : 0;
+  o += sysStat(label + ' RAM', `${(h.mem_used_mb/1024).toFixed(1)} / ${(h.mem_total_mb/1024).toFixed(1)} GB`) + sysBar(mp);
+  if(h.temp_c != null) o += sysStat('Temperature', `${h.temp_c.toFixed(1)} °C`, h.temp_c > 80 ? 'bad' : '');
+  return o;
+}
+function sysProc(st, label){
+  const p = (st && st.proc) || {};
+  return sysStat(label, `${(p.cpu_pct||0).toFixed(1)} % CPU · ${p.rss_mb != null ? p.rss_mb + ' MB' : '?'}`) + sysBar(p.cpu_pct);
+}
+async function sysPoll(){
+  let d;
+  try { d = await fetch('/sys').then(r => r.json()); } catch(e){ return; }
+  if(!d || !d.pi){ $('sy-pi').innerHTML = sysStat('Pi', d && d.error ? sysEsc(d.error) : 'starting — first numbers in 2 s'); return; }
+  const pi = d.pi;
+  let o = sysMachine(pi, 'Pi');
+  const th = pi.throttle;
+  if(th) o += sysStat('Power', th.undervolt_now ? 'UNDER-VOLTAGE now' : th.throttled_now ? 'throttled now'
+                       : th.undervolt_since_boot ? 'ok now · under-voltage since boot' : 'ok',
+                       (th.undervolt_now || th.throttled_now) ? 'bad' : th.undervolt_since_boot ? '' : 'ok');
+  o += sysProc(pi, 'web_nav.py (everything)');
+  $('sy-pi').innerHTML = o;
+  const per = 100 / ((pi.host && pi.host.cores) || 4);
+  $('sy-threads').innerHTML = (pi.threads || []).filter(t => t.cpu_pct >= 0.1).slice(0, 14).map(t =>
+    sysStat(t.name + (t.n > 1 ? ` ×${t.n}` : ''), `${t.cpu_pct.toFixed(1)} %`) + sysBar(t.cpu_pct, per)).join('')
+    || sysStat('threads', 'all idle');
+  const pc = d.pc || {};
+  const det = pc.detect;
+  if(!det){ $('sy-det').innerHTML = sysStat('server', 'none set (Vision tab → Objects → server URL)'); $('sy-det-note').textContent = ''; }
+  else if(!det.ok){ $('sy-det').innerHTML = sysStat('server', 'UNREACHABLE', 'bad') + sysStat('error', sysEsc(det.error)); $('sy-det-note').textContent = det.url; }
+  else {
+    $('sy-det-note').textContent = `${det.url} · ${det.ping_ms} ms round trip`;
+    let q = '';
+    if(det.person_model) q += sysStat(`People · ${det.person_model}`, `${det.person_fps != null ? det.person_fps + ' /s' : '…'} · ${det.person_last_ms} ms each`);
+    q += sysStat(`Objects · ${det.model} (${det.device})`, `${det.fps != null ? det.fps + ' /s' : '…'} · ${det.last_ms} ms each`);
+    if(det.stats){ q += sysProc(det.stats, 'detect container'); q += sysMachine(det.stats, 'Docker VM'); }
+    else q += sysStat('container CPU', 'rebuild the image to see it');
+    $('sy-det').innerHTML = q;
+  }
+  const ol = pc.ollama;
+  if(!ol){ $('sy-oll').innerHTML = sysStat('Ollama', 'assistant has no URL'); }
+  else if(!ol.ok){ $('sy-oll').innerHTML = sysStat('Ollama', 'UNREACHABLE', 'bad') + sysStat('error', sysEsc(ol.error)); $('sy-oll-note').textContent = ol.url; }
+  else {
+    $('sy-oll-note').textContent = `${ol.url} · ${ol.ping_ms} ms`;
+    $('sy-oll').innerHTML = (ol.models || []).map(m => {
+      const g = m.size_mb ? Math.round(100 * m.vram_mb / m.size_mb) : 0;
+      const left = m.expires ? Math.max(0, Math.round((Date.parse(m.expires) - Date.now()) / 60000)) : null;
+      return sysStat(m.name, `${(m.size_mb/1024).toFixed(1)} GB · ${g}% on GPU` + (left != null ? ` · unloads in ${left} min` : ''), g < 100 ? '' : 'ok')
+             + sysBar(g);
+    }).join('') || sysStat('models', 'none loaded (loads on the first question)');
+  }
+  const ts = pc.tts;
+  if(!ts){ $('sy-tts').innerHTML = sysStat('server', 'none — speech runs on the Pi'); }
+  else if(!ts.ok){ $('sy-tts').innerHTML = sysStat('server', 'UNREACHABLE', 'bad') + sysStat('error', sysEsc(ts.error)); $('sy-tts-note').textContent = ts.url; }
+  else {
+    $('sy-tts-note').textContent = `${ts.url} · ${ts.ping_ms} ms`;
+    $('sy-tts').innerHTML = sysStat('voices loaded', sysEsc((ts.voices || []).join(', ') || 'none'))
+      + (ts.stats ? sysProc(ts.stats, 'tts container') : sysStat('container CPU', 'rebuild the image to see it'));
+  }
+}
+setInterval(() => { if(tab === 'system') sysPoll(); }, 2000);
+
 function showTab(name){
   tab = name;
   document.querySelectorAll('.tab').forEach(b =>
@@ -4371,6 +4658,7 @@ function showTab(name){
   try { localStorage.setItem('nav.tab', name); } catch(e) {}
   if(name === 'audio'){ audioPoll(); ttsPoll(); }
   if(name === 'sensors') refreshLcd();
+  if(name === 'system') sysPoll();
   // The canvases were display:none a moment ago, so clientWidth was 0 and
   // any draw during that time was a no-op. Redraw now they have a size.
   requestAnimationFrame(() => { draw(); drawMap(); drawCompass(); drawHorizon(); });
@@ -5075,6 +5363,13 @@ def index():
 _last_survey = [0.0]
 
 
+@app.route("/sys")
+def sys_stats():
+    """The System tab's numbers (SysMonitor). The first call after the tab
+    opens starts the polling, so it may come back empty for one period."""
+    return jsonify(sysmon.snapshot())
+
+
 @app.route("/state")
 def state():
     # The page polls this at ~7 Hz. Surveying sweeps ~200 points three times,
@@ -5114,6 +5409,7 @@ def state():
         cliff=cliff.state,
         detect=detector.state,
         person=tracker.state,
+        follow=follower.status if follower is not None else None,
         audio=speaker.brief if speaker else None,
         display=screen.state if screen else None,
         tts=talker.brief if talker else None,
@@ -5419,6 +5715,25 @@ def labels_photo(name):
     return send_from_directory(_detect.ASK_DIR, name, mimetype="image/jpeg")
 
 
+@app.route("/follow", methods=["POST"])
+def follow_ctl():
+    """{start: true} locks on to the nearest person in view and follows them;
+    {stop: true} ends it. {enable: true} (the cockpit's button, pressed by a
+    person) also arms the motors; the AI's tool never sends it."""
+    d = request.get_json(force=True, silent=True) or {}
+    if d.get("stop"):
+        follower.stop()
+    elif d.get("start"):
+        if d.get("enable"):
+            robot.enable()
+        if not robot.state.get("enabled"):
+            return jsonify(error="motors are disabled - press ENABLE", **follower.status), 409
+        if explorer.running:
+            explorer.stop("follow mode")
+        follower.start()
+    return jsonify(follower.status)
+
+
 @app.route("/person", methods=["POST"])
 def person_ctl():
     """Person tracker on/off. Measuring only — nothing here drives."""
@@ -5456,6 +5771,8 @@ def slam_ctl():
     d = request.get_json(force=True, silent=True) or {}
     if d.get("reset"):
         explorer.stop("map reset")          # its path is in the old frame
+        if follower is not None:
+            follower.forget("map reset")    # the person's trail is in the old frame too
         slam.slam.reset()
         # Everything else pinned in the old map's coordinates goes with it:
         # objects and rooms would float over walls that no longer exist.
@@ -5514,6 +5831,8 @@ def goto_ctl():
         x, y, name = float(d["x"]), float(d["y"]), name or "a point"
     else:
         return jsonify(error="unknown place: %r" % name), 400
+    if follower is not None and follower.running:
+        follower.stop("sent somewhere else")
     robot.enable()
     explorer.goto(x, y, name)
     return jsonify(explorer.status)
@@ -5533,6 +5852,8 @@ def map_load():
     """Load a saved map. The explorer is stopped first: resuming teleports the
     pose, and a path planned in the old frame is nonsense in the new one."""
     explorer.stop("map reloaded")
+    if follower is not None:
+        follower.forget("map reloaded")
     try:
         blob = slam.slam.load(MAP_FILE)
     except (OSError, ValueError) as e:
@@ -5552,6 +5873,8 @@ def explore_ctl():
     if d.get("stop"):
         explorer.stop()
     elif d.get("start"):
+        if follower is not None and follower.running:
+            follower.stop("mapping started")
         robot.enable()
         explorer.start(calibrate=bool(d.get("calibrate", True)))
     return jsonify(explorer.status)
@@ -5562,8 +5885,11 @@ def drive():
     d = request.get_json(force=True, silent=True) or {}
     # A manual command wins. Two controllers writing to the same motors at
     # once is how a robot ends up doing neither thing.
-    if explorer.running and (d.get("throttle") or d.get("steer")):
-        explorer.stop("manual override")
+    if (d.get("throttle") or d.get("steer")):
+        if follower is not None and follower.running:
+            follower.stop("manual override")
+        if explorer.running:
+            explorer.stop("manual override")
     # Record and return. No guard evaluation, no GPIO, nothing that can block
     # behind the SLAM thread - the control loop picks this up within 20 ms.
     intent.set(d.get("throttle", 0), d.get("steer", 0), "manual")
@@ -5601,6 +5927,10 @@ def enable():
 
 @app.route("/estop", methods=["POST"])
 def estop():
+    if follower is not None and follower.running:
+        follower.stop("emergency stop")
+    if explorer.running:
+        explorer.stop("emergency stop")
     intent.set(0, 0, "stop")
     robot.estop()
     return "", 204
@@ -5608,6 +5938,12 @@ def estop():
 
 @app.route("/stop", methods=["POST"])
 def stop():
+    # STOP means everything that drives: an explorer or follower left running
+    # would simply command the motors again on its next tick.
+    if follower is not None and follower.running:
+        follower.stop("stopped")
+    if explorer.running:
+        explorer.stop("stopped")
     intent.set(0, 0, "stop")
     robot.stop()
     return "", 204
@@ -5674,6 +6010,8 @@ def ai_status():
                "clearance_mm": guard.clear},
         floor_check={"enabled": cliff.enabled, "reason": cliff.reason},
         camera_live=bool(camera.state.get("live")),
+        follow=({k: follower.status[k] for k in ("running", "state", "message", "distance_mm")}
+                if follower is not None else None),
         navigation={"running": ex.get("running"), "state": ex.get("state"),
                     "message": ex.get("message"), "goal": ex.get("goal")},
         places=sorted(load_places()),
@@ -5750,7 +6088,7 @@ def lan_ip():
 
 def main():
     global robot, lidar, imu, slam, explorer, camera, markers, cliff, detector
-    global speaker, screen, http_port, talker, ears, assistant, tracker
+    global speaker, screen, http_port, talker, ears, assistant, tracker, follower
     ap = argparse.ArgumentParser(description="drive + lidar + imu")
     ap.add_argument("-p", "--lidar-port", help="serial port (default: auto-detect)")
     ap.add_argument("-b", "--baud", type=int, default=LIDAR_BAUD)
@@ -5845,6 +6183,12 @@ def main():
     # CPU, and it borrows the detector's server URL and model either way.
     from person import PersonTracker                          # noqa: PLC0415
     tracker = PersonTracker(detector, lambda: body_points(lidar.scan()), slam=slam)
+    # Follow mode drives through the same intent + guard as everything else,
+    # with the autonomous margin, and borrows the explorer's planner for
+    # routes round whatever is between the truck and the person.
+    from follow import Follower                               # noqa: PLC0415
+    follower = Follower(tracker, slam, lambda: body_points(lidar.scan()), guard,
+                        lambda t, s: intent.set(t, s, "follow"), explorer, detector)
 
     # Hand the tuning registry the live objects it points at. After this,
     # every number in docs/TUNING.md is reachable from the Tune tab.

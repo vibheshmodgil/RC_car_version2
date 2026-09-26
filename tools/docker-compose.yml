@@ -36,7 +36,12 @@ services:
     # yolov8s: ~220 ms a frame on a desktop CPU, inside the Pi's ~1 s cycle.
     # The GPU is left to Ollama; on a bigger card add a GPU reservation here
     # and use --device cuda --model yolov8m-worldv2.pt.
-    command: python /app/detect_server.py --model yolov8s-worldv2.pt --device cpu
+    # Person model for follow mode: yolov8n at 320 px. Measured in this
+    # container: ~40 ms a frame against 120-240 ms for yolov8s at 416, and
+    # live the slower one held following at 1-2 detections a second - too few
+    # to keep hold of someone walking. People are COCO's best-trained class,
+    # so the small model loses little on them.
+    command: python /app/detect_server.py --model yolov8s-worldv2.pt --device cpu --person-model yolov8n.pt --person-imgsz 416
     working_dir: /models
     volumes:
       - models:/models
